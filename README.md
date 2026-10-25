@@ -66,6 +66,7 @@ FlowAI locally: `vercel env pull` (short-lived `VERCEL_OIDC_TOKEN`) or `AI_GATEW
 
 1. Database: add **Neon** from the Vercel Marketplace (free plan) to project `flowops` — it injects `DATABASE_URL`.
 2. Env vars (Production): `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL=https://flowopsagent.ai`, `FLOWOPS_OWNER_EMAILS`. Optional: integration vars and `REQUIRE_EMAIL_VERIFICATION` from `.env.example`.
+   - **Email is live in production** (Oct 25, 2026): `RESEND_API_KEY` (sensitive) and `RESEND_FROM_EMAIL=FlowOps <notifications@flowopsagent.ai>` are set for Production only; the `flowopsagent.ai` domain is verified in Resend (DNS records in Cloudflare). Verification, password-reset, invite and booking emails send for real. `REQUIRE_EMAIL_VERIFICATION` is still off.
 3. Migrate: `vercel env pull .env.production.local --environment production` then `npx dotenv -e .env.production.local -- npm run db:migrate` (delete the file afterwards). Neon URLs migrate over Neon's serverless driver (port 443), so this works where port 5432 is blocked. Migrations are additive (`0001_team_invites` adds the `team_invite` table only).
 4. Deploy: `npx vercel deploy --prod --yes --scope flowopsagent`.
 5. Domain `flowopsagent.ai` is already attached.
