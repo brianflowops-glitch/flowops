@@ -17,8 +17,8 @@ export interface ServiceRow {
 }
 
 export interface Me {
-  user: { id: string; name: string; email: string };
-  role: "owner" | "staff";
+  user: { id: string; name: string; email: string; emailVerified: boolean };
+  role: "owner" | "admin" | "staff";
   org: {
     id: string;
     slug: string;
@@ -32,7 +32,7 @@ export interface Me {
   };
   today: { date: string; time: string };
   services: ServiceRow[];
-  integrations: { googleCalendar: boolean; resendEmail: boolean; resendFrom: boolean; twilioSms: boolean };
+  integrations: { googleCalendar: boolean; resendEmail: boolean; resendFrom: boolean; twilioSms: boolean; emailVerificationRequired: boolean };
 }
 
 export interface ClientRunOptions {

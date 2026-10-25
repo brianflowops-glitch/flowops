@@ -88,9 +88,41 @@ function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
 export interface ShellSession {
   name: string;
   email: string;
-  role: "owner" | "staff";
+  role: "owner" | "admin" | "staff";
   orgName: string;
   orgSlug: string;
+  emailVerified: boolean;
+  /** Resend configured → verification emails can actually be sent. */
+  emailLive: boolean;
+}
+
+function VerifyBanner({ session }: { session: ShellSession }) {
+  const [state, setState] = useState<"idle" | "sending" | "sent" | "error">("idle");
+  if (session.emailVerified) return null;
+  return (
+    <div className="relative border-b border-amber-400/20 bg-amber-400/[0.06] px-4 py-2 text-xs text-amber-100 lg:px-8" role="status" data-testid="verify-banner">
+      <span className="font-semibold">Verify your email.</span> {session.email} isn&apos;t verified yet.{" "}
+      {session.emailLive ? (
+        state === "sent" ? (
+          <span>Verification email sent — check your inbox.</span>
+        ) : (
+          <button
+            disabled={state === "sending"}
+            className="underline underline-offset-2 hover:text-white disabled:opacity-50"
+            onClick={async () => {
+              setState("sending");
+              const r = await authClient.sendVerificationEmail({ email: session.email, callbackURL: "/verify-email" });
+              setState(r.error ? "error" : "sent");
+            }}
+          >
+            {state === "error" ? "Couldn't send — try again" : "Send verification email"}
+          </button>
+        )
+      ) : (
+        <span className="text-amber-200/70">Verification emails start once email (Resend) is connected — nothing is blocked until then.</span>
+      )}
+    </div>
+  );
 }
 
 function UserMenu({ session }: { session: ShellSession }) {
@@ -171,6 +203,7 @@ export function AppShell({ children, session }: { children: React.ReactNode; ses
               </button>
             </div>
           </header>
+          <VerifyBanner session={session} />
           <main className="relative mx-auto w-full max-w-[1400px] flex-1 px-4 py-6 lg:px-8">{children}</main>
         </div>
 

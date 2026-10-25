@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { CalendarDays, Link2, Mail, MessageSquare, Plus, Save, Trash2, UserPlus } from "lucide-react";
+import { Ban, CalendarDays, Copy, KeyRound, Link2, Mail, MessageSquare, Plus, RefreshCw, Save, Trash2, UserPlus } from "lucide-react";
 import { useBookings, type ServiceRow } from "@/lib/booking/store";
 import type { DayHours, WeekHoursClient } from "@/lib/booking/types";
 import { Card, LiveBadge, PageHeader, Pill, Table, Td } from "../ui";
@@ -60,7 +60,7 @@ export function Administration() {
         <OrgCard owner={owner} onSaved={refresh} />
         <HoursCard owner={owner} onSaved={refresh} />
         <ServicesCard owner={owner} services={me.services} onSaved={refresh} />
-        <TeamCard owner={owner} />
+        <TeamCard />
         <IntegrationsCard owner={owner} onSaved={refresh} />
       </div>
       <AdminPlans />
@@ -247,38 +247,111 @@ function ServicesCard({ owner, services, onSaved }: { owner: boolean; services: 
   );
 }
 
-type Team = { members: { id: string; role: string; name: string; email: string; userId: string }[]; invites: { id: string; email: string }[]; me: string };
+type TeamMember = { id: string; role: string; name: string; email: string; userId: string; emailVerified: boolean; canReset: boolean; canRemove: boolean };
+type TeamInvite = { id: string; email: string; role: "admin" | "staff"; status: "pending" | "accepted" | "revoked" | "expired"; expiresAt: string; lastSentAt: string | null };
+type Team = {
+  members: TeamMember[];
+  invites: TeamInvite[];
+  legacyInvites: { id: string; email: string }[];
+  me: string;
+  myRole: string;
+  canManage: boolean;
+  inviteRoles: ("admin" | "staff")[];
+};
 
-function TeamCard({ owner }: { owner: boolean }) {
+const ROLE_LABEL: Record<string, string> = { owner: "Owner", admin: "Admin", staff: "Staff" };
+const INVITE_PILL: Record<TeamInvite["status"], string> = { pending: "planned", accepted: "verified", revoked: "cancelled", expired: "failed" };
+
+/** A one-time secret link shown only to the Owner/Admin who generated it. */
+function LinkBox({ title, link, note, onClose }: { title: string; link: string; note: string; onClose: () => void }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="mt-3 rounded-lg border border-cyan-400/30 bg-cyan-400/[0.05] p-3 text-xs" data-testid="link-box">
+      <div className="flex items-center gap-2">
+        <span className="font-semibold text-cyan-100">{title}</span>
+        <button className="ml-auto text-slate-400 hover:text-white" onClick={onClose} aria-label="Close">
+          ✕
+        </button>
+      </div>
+      <div className="mt-2 flex gap-2">
+        <input readOnly value={link} className={`${inputCls} font-mono text-[11px]`} onFocus={(e) => e.currentTarget.select()} data-testid="link-value" />
+        <button
+          className={btn}
+          onClick={async () => {
+            await navigator.clipboard.writeText(link).catch(() => undefined);
+            setCopied(true);
+          }}
+        >
+          <Copy className="h-3.5 w-3.5" /> {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+      <p className="mt-2 text-slate-400">{note}</p>
+    </div>
+  );
+}
+
+function TeamCard() {
+  const { me } = useBookings();
+  const emailLive = Boolean(me?.integrations.resendEmail);
   const [team, setTeam] = useState<Team | null>(null);
   const [email, setEmail] = useState("");
+  const [role, setRole] = useState<"admin" | "staff">("staff");
   const [m, setM] = useState<{ ok: boolean; text: string } | null>(null);
+  const [shown, setShown] = useState<{ title: string; link: string; note: string } | null>(null);
   const load = useCallback(() => api("/api/admin/staff", "GET").then(setTeam).catch(() => setTeam(null)), []);
   useEffect(() => {
     void load();
   }, [load]);
-  const act = async (fn: () => Promise<unknown>, ok: string) => {
+  const act = async (fn: () => Promise<unknown>, ok: string | null) => {
     try {
       await fn();
       await load();
-      setM({ ok: true, text: ok });
+      setM(ok ? { ok: true, text: ok } : null);
     } catch (e) {
       setM({ ok: false, text: String((e as Error).message) });
     }
   };
+  const manage = Boolean(team?.canManage);
+  const showInvite = (r: { link: string; emailed: boolean; invite: { email: string; expiresAt: string } }) =>
+    setShown({
+      title: `Invite link for ${r.invite.email}`,
+      link: r.link,
+      note: `${r.emailed ? "Also emailed to them. " : "Email isn't connected yet, so send this link yourself (text, chat…). "}Works once, expires ${new Date(r.invite.expiresAt).toLocaleDateString()}. Resend makes a new link and disables this one.`,
+    });
+
   return (
-    <Card title="Team" subtitle="Owner + Staff. Customers don't need accounts.">
+    <Card title="Team" subtitle="Owner, Admins and Staff. Admins manage the team; only the Owner changes settings. Customers don't need accounts.">
       <ul className="space-y-1.5">
         {team?.members.map((u) => (
-          <li key={u.id} className="flex items-center gap-2 rounded-lg border border-white/[0.05] px-3 py-2 text-sm">
+          <li key={u.id} className="flex flex-wrap items-center gap-2 rounded-lg border border-white/[0.05] px-3 py-2 text-sm">
             <span className="text-slate-100">{u.name}</span>
             <span className="font-mono text-xs text-slate-500">{u.email}</span>
+            {!u.emailVerified && <span className="text-[10px] uppercase text-amber-300/70">unverified</span>}
             <span className="ml-auto">
-              <Pill status={u.role === "owner" ? "verified" : "planned"}>{u.role}</Pill>
+              <Pill status={u.role === "owner" ? "verified" : u.role === "admin" ? "active" : "planned"}>{ROLE_LABEL[u.role] ?? u.role}</Pill>
             </span>
-            {owner && u.role !== "owner" && (
+            {u.canReset && (
               <button
-                title="Remove staff member"
+                title="Generate a one-time password reset link"
+                className="rounded-md p-1 text-slate-400 hover:text-cyan-300"
+                data-testid={`reset-link-${u.email}`}
+                onClick={() =>
+                  act(async () => {
+                    const r = await api(`/api/admin/members/${u.id}/reset-link`, "POST");
+                    setShown({
+                      title: `Password reset link for ${r.email}`,
+                      link: r.link,
+                      note: `Share it privately with ${r.email} only. Works once, expires in ${r.ttlHours} hours, and signs them out elsewhere when used.`,
+                    });
+                  }, null)
+                }
+              >
+                <KeyRound className="h-3.5 w-3.5" />
+              </button>
+            )}
+            {u.canRemove && (
+              <button
+                title="Remove member"
                 className="rounded-md p-1 text-slate-400 hover:text-rose-300"
                 onClick={() => confirm(`Remove ${u.email}? Their login is deleted.`) && act(() => api("/api/admin/staff", "DELETE", { memberId: u.id }), "Removed.")}
               >
@@ -288,10 +361,40 @@ function TeamCard({ owner }: { owner: boolean }) {
           </li>
         ))}
         {team?.invites.map((i) => (
+          <li key={i.id} className="flex flex-wrap items-center gap-2 rounded-lg border border-dashed border-white/10 px-3 py-2 text-sm text-slate-400" data-testid={`invite-${i.email}`}>
+            <span className="font-mono text-xs">{i.email}</span>
+            <span className="text-xs">· {ROLE_LABEL[i.role]}</span>
+            <span className="ml-auto flex items-center gap-2 text-[11px]">
+              {i.status === "pending" && <span>expires {new Date(i.expiresAt).toLocaleDateString()}</span>}
+              <Pill status={INVITE_PILL[i.status]}>{i.status}</Pill>
+            </span>
+            {manage && i.status !== "accepted" && (team?.inviteRoles ?? []).includes(i.role) && (
+              <>
+                <button
+                  title="Resend (new link)"
+                  className="rounded-md p-1 text-slate-400 hover:text-cyan-300"
+                  onClick={() => act(async () => showInvite(await api(`/api/admin/invites/${i.id}/resend`, "POST")), null)}
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                </button>
+                {i.status === "pending" && (
+                  <button
+                    title="Revoke invite"
+                    className="rounded-md p-1 text-slate-400 hover:text-rose-300"
+                    onClick={() => act(() => api(`/api/admin/invites/${i.id}`, "DELETE"), "Invite revoked — its link no longer works.")}
+                  >
+                    <Ban className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </>
+            )}
+          </li>
+        ))}
+        {team?.legacyInvites.map((i) => (
           <li key={i.id} className="flex items-center gap-2 rounded-lg border border-dashed border-white/10 px-3 py-2 text-sm text-slate-400">
             <span className="font-mono text-xs">{i.email}</span>
-            <span className="ml-auto text-xs">invited · signs up at /sign-up</span>
-            {owner && (
+            <span className="ml-auto text-xs">older invite · joins as Staff on sign-up</span>
+            {manage && (
               <button className="rounded-md p-1 text-slate-400 hover:text-rose-300" onClick={() => act(() => api("/api/admin/staff", "DELETE", { inviteId: i.id }), "Invite removed.")}>
                 <Trash2 className="h-3.5 w-3.5" />
               </button>
@@ -299,23 +402,34 @@ function TeamCard({ owner }: { owner: boolean }) {
           </li>
         ))}
       </ul>
-      {owner && (
+      {manage && (
         <form
-          className="mt-3 flex gap-2"
+          className="mt-3 flex flex-wrap gap-2"
           onSubmit={(e) => {
             e.preventDefault();
             void act(async () => {
-              await api("/api/admin/staff", "POST", { email });
+              showInvite(await api("/api/admin/invites", "POST", { email, role }));
               setEmail("");
-            }, "Invite saved. Ask them to create an account at /sign-up with this email (no email is sent automatically).");
+            }, null);
           }}
         >
-          <input type="email" required placeholder="staff@example.com" className={inputCls} value={email} onChange={(e) => setEmail(e.target.value)} />
+          <input type="email" required placeholder="teammate@example.com" className={`${inputCls} min-w-0 flex-1`} value={email} onChange={(e) => setEmail(e.target.value)} />
+          <select className={`${inputCls} w-28`} value={role} onChange={(e) => setRole(e.target.value as "admin" | "staff")} aria-label="Role">
+            {(team?.inviteRoles ?? []).map((r) => (
+              <option key={r} value={r}>
+                {ROLE_LABEL[r]}
+              </option>
+            ))}
+          </select>
           <button className={btn}>
-            <UserPlus className="h-3.5 w-3.5" /> Invite staff
+            <UserPlus className="h-3.5 w-3.5" /> Invite
           </button>
         </form>
       )}
+      {manage && !emailLive && (
+        <p className="mt-2 text-[11px] text-slate-500">Email isn&apos;t connected yet: invites and reset links are shown here for you to share by hand.</p>
+      )}
+      {shown && <LinkBox {...shown} onClose={() => setShown(null)} />}
       <div className="mt-2">
         <Msg m={m} />
       </div>

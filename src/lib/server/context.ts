@@ -5,9 +5,11 @@ import { getAuth } from "@/lib/auth";
 import { getDb, hasDatabase, schema } from "@/lib/db";
 import { ensureMembership } from "@/lib/tenancy/membership";
 
-export type Role = "owner" | "staff";
+export type Role = "owner" | "admin" | "staff";
+/** Owner and Admin manage the team (invites, reset links). Settings stay Owner-only. */
+export const canManageTeam = (r: Role) => r === "owner" || r === "admin";
 export interface OrgContext {
-  user: { id: string; name: string; email: string };
+  user: { id: string; name: string; email: string; emailVerified: boolean };
   role: Role;
   org: typeof schema.organization.$inferSelect;
 }
@@ -27,7 +29,11 @@ export async function getContextFromHeaders(h: Headers): Promise<OrgContext | nu
   }
   const [org] = await db.select().from(schema.organization).where(eq(schema.organization.id, m.organizationId)).limit(1);
   if (!org) return null;
-  return { user: { id: session.user.id, name: session.user.name, email: session.user.email }, role: m.role, org };
+  return {
+    user: { id: session.user.id, name: session.user.name, email: session.user.email, emailVerified: Boolean(session.user.emailVerified) },
+    role: m.role,
+    org,
+  };
 }
 
 export async function getContext() {
@@ -42,11 +48,12 @@ export function forbidden(message = "Owner role required") {
 }
 
 /** For route handlers: returns the context or a 401 Response. */
-export async function requireApi(req: Request, opts: { owner?: boolean } = {}): Promise<OrgContext | Response> {
+export async function requireApi(req: Request, opts: { owner?: boolean; manager?: boolean } = {}): Promise<OrgContext | Response> {
   if (!hasDatabase()) return Response.json({ error: "Database not configured (DATABASE_URL missing)" }, { status: 503 });
   const ctx = await getContextFromHeaders(req.headers);
   if (!ctx) return unauthorized();
   if (opts.owner && ctx.role !== "owner") return forbidden();
+  if (opts.manager && !canManageTeam(ctx.role)) return forbidden("Owner or Admin role required");
   return ctx;
 }
 

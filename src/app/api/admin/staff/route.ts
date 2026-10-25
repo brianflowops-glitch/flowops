@@ -1,45 +1,48 @@
-import { and, eq } from "drizzle-orm";
+import { and, desc, eq } from "drizzle-orm";
 import { z } from "zod";
 import { getDb, schema } from "@/lib/db";
-import { requireApi } from "@/lib/server/context";
+import { canManageTeam, requireApi, type Role } from "@/lib/server/context";
 import { badRequest, readJson } from "@/lib/server/validation";
+import { inviteStatus } from "@/lib/tenancy/invites";
+import { canInviteRole, canRemove, canResetFor } from "@/lib/tenancy/team-rules";
 
+/** Team overview: members, token invites (with status), legacy email-match invites. */
 export async function GET(req: Request) {
   const ctx = await requireApi(req);
   if (ctx instanceof Response) return ctx;
   const db = getDb();
-  const [members, invites] = await Promise.all([
+  const manage = canManageTeam(ctx.role);
+  const [members, invites, legacyInvites] = await Promise.all([
     db
-      .select({ id: schema.member.id, role: schema.member.role, userId: schema.user.id, name: schema.user.name, email: schema.user.email, since: schema.member.createdAt })
+      .select({ id: schema.member.id, role: schema.member.role, userId: schema.user.id, name: schema.user.name, email: schema.user.email, emailVerified: schema.user.emailVerified, since: schema.member.createdAt })
       .from(schema.member)
       .innerJoin(schema.user, eq(schema.user.id, schema.member.userId))
       .where(eq(schema.member.organizationId, ctx.org.id)),
-    db.select({ id: schema.staffInvite.id, email: schema.staffInvite.email, at: schema.staffInvite.createdAt }).from(schema.staffInvite).where(eq(schema.staffInvite.organizationId, ctx.org.id)),
+    manage
+      ? db.select().from(schema.teamInvite).where(eq(schema.teamInvite.organizationId, ctx.org.id)).orderBy(desc(schema.teamInvite.createdAt)).limit(50)
+      : Promise.resolve([]),
+    manage
+      ? db.select({ id: schema.staffInvite.id, email: schema.staffInvite.email, at: schema.staffInvite.createdAt }).from(schema.staffInvite).where(eq(schema.staffInvite.organizationId, ctx.org.id))
+      : Promise.resolve([]),
   ]);
-  return Response.json({ members, invites, me: ctx.user.id });
+  const actor = { id: ctx.user.id, role: ctx.role };
+  return Response.json(
+    {
+      me: ctx.user.id,
+      myRole: ctx.role,
+      canManage: manage,
+      inviteRoles: (["admin", "staff"] as const).filter((r) => canInviteRole(ctx.role, r)),
+      members: members.map((m) => ({ ...m, canReset: canResetFor(actor, { userId: m.userId, role: m.role as Role }), canRemove: canRemove(actor, { userId: m.userId, role: m.role as Role }) })),
+      invites: invites.map((i) => ({ id: i.id, email: i.email, role: i.role, status: inviteStatus(i), createdAt: i.createdAt, expiresAt: i.expiresAt, lastSentAt: i.lastSentAt, acceptedAt: i.acceptedAt, revokedAt: i.revokedAt })),
+      legacyInvites,
+    },
+    { headers: { "Cache-Control": "no-store" } },
+  );
 }
 
-/** Owner invites a staff member by email. They become Staff when they sign up with that email. */
-export async function POST(req: Request) {
-  const ctx = await requireApi(req, { owner: true });
-  if (ctx instanceof Response) return ctx;
-  const parsed = z.object({ email: z.string().trim().toLowerCase().email() }).safeParse(await readJson(req));
-  if (!parsed.success) return badRequest(parsed.error);
-  const db = getDb();
-  const [existingUser] = await db.select({ id: schema.user.id }).from(schema.user).where(eq(schema.user.email, parsed.data.email)).limit(1);
-  if (existingUser) return badRequest("That email already has a FlowOps account (accounts belong to one organization)");
-  const inserted = await db
-    .insert(schema.staffInvite)
-    .values({ id: `inv_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`, organizationId: ctx.org.id, email: parsed.data.email, invitedBy: ctx.user.id })
-    .onConflictDoNothing()
-    .returning();
-  if (!inserted.length) return badRequest("That email already has a pending invite");
-  return Response.json({ invite: inserted[0] });
-}
-
-/** Remove a pending invite ({inviteId}) or a staff member ({memberId}). Owners can't remove owners. */
+/** Remove a legacy invite ({inviteId}) or a member ({memberId}). Owners can't be removed. */
 export async function DELETE(req: Request) {
-  const ctx = await requireApi(req, { owner: true });
+  const ctx = await requireApi(req, { manager: true });
   if (ctx instanceof Response) return ctx;
   const parsed = z.object({ inviteId: z.string().optional(), memberId: z.string().optional() }).safeParse(await readJson(req));
   if (!parsed.success) return badRequest(parsed.error);
@@ -53,8 +56,9 @@ export async function DELETE(req: Request) {
       .where(and(eq(schema.member.id, parsed.data.memberId), eq(schema.member.organizationId, ctx.org.id)))
       .limit(1);
     if (!m) return Response.json({ error: "Member not found" }, { status: 404 });
-    if (m.role === "owner") return badRequest("Owners can't be removed here");
-    // Removing staff deletes their login (accounts belong to one organization).
+    if (!canRemove({ id: ctx.user.id, role: ctx.role }, { userId: m.userId, role: m.role }))
+      return Response.json({ error: m.role === "owner" ? "Owners can't be removed here" : "You can't remove this member" }, { status: 403 });
+    // Removing a member deletes their login (accounts belong to one organization).
     await db.delete(schema.user).where(eq(schema.user.id, m.userId));
   }
   return Response.json({ ok: true });

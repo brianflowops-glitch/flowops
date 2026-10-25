@@ -3,7 +3,8 @@
  * with `npm run db:migrate`.
  *
  * - Better Auth core tables: user, session, account, verification, rate_limit
- * - Tenancy: organization (tenant), member (user ↔ org, role owner|staff), staff_invite
+ * - Tenancy: organization (tenant), member (user ↔ org, role owner|admin|staff),
+ *   team_invite (token invites, v2.1), staff_invite (legacy email-match invites)
  * - Booking data, all scoped by organization_id: service, booking, audit_entry, notification
  */
 import { relations } from "drizzle-orm";
@@ -112,7 +113,8 @@ export const member = pgTable(
     userId: text("user_id")
       .notNull()
       .references(() => user.id, { onDelete: "cascade" }),
-    role: text("role", { enum: ["owner", "staff"] }).notNull(),
+    /** owner | admin | staff. Plain text column (no DB enum), so adding "admin" needed no migration. */
+    role: text("role", { enum: ["owner", "admin", "staff"] }).notNull(),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   (t) => [uniqueIndex("member_user_unique").on(t.userId), index("member_org_idx").on(t.organizationId)],
@@ -130,6 +132,32 @@ export const staffInvite = pgTable(
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   (t) => [uniqueIndex("staff_invite_email_unique").on(t.email)],
+);
+
+/**
+ * Token invites (v2.1). Only a SHA-256 hash of the token is stored; the raw token
+ * exists only in the link shown to the inviter / emailed to the invitee.
+ * Single-use (accepted_at), revocable (revoked_at), expiring (expires_at), scoped to one org.
+ */
+export const teamInvite = pgTable(
+  "team_invite",
+  {
+    id: text("id").primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organization.id, { onDelete: "cascade" }),
+    email: text("email").notNull(),
+    role: text("role", { enum: ["admin", "staff"] }).notNull(),
+    tokenHash: text("token_hash").notNull(),
+    invitedBy: text("invited_by").references(() => user.id, { onDelete: "set null" }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    lastSentAt: timestamp("last_sent_at", { withTimezone: true }),
+    acceptedAt: timestamp("accepted_at", { withTimezone: true }),
+    acceptedBy: text("accepted_by").references(() => user.id, { onDelete: "set null" }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  },
+  (t) => [uniqueIndex("team_invite_token_hash_unique").on(t.tokenHash), index("team_invite_org_idx").on(t.organizationId, t.email)],
 );
 
 // ───────────────────────────── Booking data ─────────────────────────────
