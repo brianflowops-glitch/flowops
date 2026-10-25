@@ -12,7 +12,7 @@ export const INTEGRATIONS: { name: string; category: string; module: string; sta
   { name: "Jira / ServiceNow / Asana", category: "ITSM", module: "FlowConnect", status: "planned", note: "Tickets from incidents" },
   { name: "CrowdStrike / SentinelOne", category: "EDR", module: "FlowSec", status: "planned", note: "Endpoint threat feeds" },
   { name: "Datadog / Grafana / Zabbix", category: "Observability", module: "FlowPulse", status: "planned", note: "Metrics & alert ingestion" },
-  { name: "OpenAI", category: "LLM", module: "FlowAI", status: "planned", note: "AI Assistant — enabled when OPENAI_API_KEY is set" },
+  { name: "Vercel AI Gateway", category: "LLM", module: "FlowAI", status: "deploy-target", note: "Powers the FlowAI Assistant (OIDC, no stored key)" },
   { name: "Postgres", category: "Database", module: "FLOWOPS Core", status: "planned", note: "Replace in-browser booking store" },
   { name: "Vercel", category: "Hosting", module: "Platform", status: "deploy-target", note: "Team Flowops (flowopsagent)" },
 ];

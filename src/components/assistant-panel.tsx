@@ -48,8 +48,25 @@ export function AssistantPanel({ open, onClose }: { open: boolean; onClose: () =
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ messages: next, context }),
       });
-      const data = await res.json();
-      setMessages([...next, { role: "assistant", content: data.reply ?? data.error ?? "No response." }]);
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => ({}));
+        setMessages([...next, { role: "assistant", content: data.error ?? `Request failed (${res.status}).` }]);
+        return;
+      }
+      // Stream the reply token-by-token.
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let reply = "";
+      setBusy(false);
+      setMessages([...next, { role: "assistant", content: "" }]);
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        reply += decoder.decode(value, { stream: true });
+        setMessages([...next, { role: "assistant", content: reply }]);
+      }
+      reply += decoder.decode();
+      setMessages([...next, { role: "assistant", content: reply.trim() || "No response." }]);
     } catch (e) {
       setMessages([...next, { role: "assistant", content: `Request failed: ${String(e)}` }]);
     } finally {
@@ -89,9 +106,10 @@ export function AssistantPanel({ open, onClose }: { open: boolean; onClose: () =
                 <AlertTriangle className="h-4 w-4" /> AI backend isn&apos;t connected yet
               </div>
               <p className="text-amber-100/80">
-                The FlowAI Assistant needs an OpenAI API key. Add <code className="rounded bg-black/30 px-1 font-mono text-xs">OPENAI_API_KEY</code> to the
-                Vercel project&apos;s environment variables (or <code className="rounded bg-black/30 px-1 font-mono text-xs">.env.local</code> locally) and
-                redeploy. Everything else in FlowOps works without it.
+                FlowAI runs on Vercel AI Gateway. It connects automatically when deployed on Vercel; locally, run{" "}
+                <code className="rounded bg-black/30 px-1 font-mono text-xs">vercel env pull</code> or set{" "}
+                <code className="rounded bg-black/30 px-1 font-mono text-xs">AI_GATEWAY_API_KEY</code> in{" "}
+                <code className="rounded bg-black/30 px-1 font-mono text-xs">.env.local</code>. Everything else in FlowOps works without it.
               </p>
             </div>
           )}
@@ -127,7 +145,7 @@ export function AssistantPanel({ open, onClose }: { open: boolean; onClose: () =
               value={input}
               onChange={(e) => setInput(e.target.value)}
               disabled={!status?.configured || busy}
-              placeholder={status?.configured ? "Ask FlowAI…" : "Assistant offline — add OPENAI_API_KEY"}
+              placeholder={status?.configured ? "Ask FlowAI…" : "Assistant offline — AI Gateway not connected"}
               className="flex-1 bg-transparent text-sm text-white placeholder:text-slate-600 focus:outline-none disabled:cursor-not-allowed"
             />
             <button type="submit" disabled={!status?.configured || busy || !input.trim()} className="rounded-lg bg-cyan-500 p-1.5 text-white disabled:opacity-30" aria-label="Send">

@@ -10,7 +10,7 @@ FLOWOPS is an ops dashboard built around the **FLOWOPS Agent Matrix**. The modul
 | **Testing Lab** | Runs simulation tests FL-001 to FL-007 against the real pipeline in the browser and shows pass/fail per assertion |
 | **Analytics** | Live booking charts from this browser, plus one sample trend chart (labelled) |
 | Automation, Network, Security, Integrations, Administration | Planned features shown with **sample data (labelled "Sample data — not connected")** and the integrations the plan calls for |
-| **FlowAI Assistant** (slide-out panel) | Calls OpenAI through `/api/assistant` when `OPENAI_API_KEY` is set. Otherwise it says the backend isn't connected |
+| **FlowAI Assistant** (slide-out panel) | Streams answers from Vercel AI Gateway (AI SDK) through `/api/assistant`. Auth is the deployment's OIDC token on Vercel, so no key is stored |
 
 ### What is real and what is simulated
 
@@ -28,7 +28,7 @@ npm test           # FL-001 … FL-007 simulation suite in Node
 npm run build && npm start   # production build
 ```
 
-Optional: copy `.env.example` to `.env.local` and set `OPENAI_API_KEY` (and `OPENAI_MODEL`, default `gpt-4o-mini`) to turn on the assistant.
+To use the assistant locally, run `vercel link` then `vercel env pull` (provides a short-lived `VERCEL_OIDC_TOKEN`), or set `AI_GATEWAY_API_KEY` in `.env.local`. Optional `AI_GATEWAY_MODEL` overrides the default `openai/gpt-4.1-mini`.
 
 ## Deploy to Vercel
 
@@ -37,7 +37,7 @@ The app needs **no environment variables** to deploy.
 1. Push this repo to GitHub (e.g. `brianflowops-glitch/flowops`).
 2. In Vercel, go to team **Flowops** (`flowopsagent`), choose **Add New → Project**, import the repo and keep the defaults (framework: Next.js).
    Or use the CLI: `npx vercel --scope flowopsagent` for a preview, then `npx vercel --prod`.
-3. Optional: in Project → Settings → Environment Variables, add `OPENAI_API_KEY` and redeploy.
+3. The FlowAI Assistant uses Vercel AI Gateway with OIDC automatically; usage is billed to the team. Optional: set `AI_GATEWAY_MODEL`.
 4. Domain: add `flowopsagent.ai` under Project → Settings → Domains. Then, in Cloudflare DNS, create the records Vercel shows (usually `A @ 76.76.21.21` and `CNAME www cname.vercel-dns.com`) with the proxy set to **DNS only**.
 
 ## Project structure
