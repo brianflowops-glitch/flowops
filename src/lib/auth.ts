@@ -6,7 +6,7 @@ import { getDb, schema } from "@/lib/db";
 import { ensureMembership } from "@/lib/tenancy/membership";
 
 function trustedOrigins() {
-  const list = ["https://flowopsagent.ai", "https://www.flowopsagent.ai"];
+  const list = ["https://flowopsagent.ai", "https://www.flowopsagent.ai", "https://flowops-blue.vercel.app"];
   if (process.env.VERCEL_URL) list.push(`https://${process.env.VERCEL_URL}`);
   if (process.env.VERCEL_PROJECT_PRODUCTION_URL) list.push(`https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`);
   if (process.env.VERCEL_BRANCH_URL) list.push(`https://${process.env.VERCEL_BRANCH_URL}`);
