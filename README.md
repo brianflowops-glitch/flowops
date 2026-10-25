@@ -1,14 +1,16 @@
-# FLOWOPS — Unified Operations Intelligence Platform (v2.1 beta)
+# FLOWOPS — Unified Operations Intelligence Platform (v2.2 beta)
 
 FLOWOPS is an ops dashboard built around the **FLOWOPS Agent Matrix** (FLOWOPS Core, FlowNet, FlowSec, FlowBiz, FlowAI, FlowConnect, FlowPulse). v2 adds a real backend: accounts, a Postgres database, per-business data, a public booking page and FlowAI tools that act on bookings.
 
 | Page | What it does |
 | --- | --- |
+| **Landing page** (`/` signed out → renders `/home`) | Public marketing page: booking page, calendar sync, email confirmations, FlowAI, team roles, how it works, "Founding pilot program" CTA (mailto brian.flowops@gmail.com). **No prices** until pricing is approved. The proxy *rewrites* `/` to `/home` when there is no session cookie, so the URL stays `flowopsagent.ai/` and signed-in users still get the Command Center at `/` |
+| **Terms / Privacy** (`/terms`, `/privacy`) | Public, marked **"Draft — not legal advice, pending review"**. Privacy covers accounts, bookings, end-customer contact info, Google `calendar.events` (with Limited Use statement), Resend, AI Gateway/model providers, Vercel, Neon, Twilio, Cloudflare. Linked from the landing footer and sign-up form; these are the homepage + privacy URLs for Google OAuth verification. Also `/robots.txt`, `/sitemap.xml` |
 | **Sign up / Sign in** (`/sign-up`, `/sign-in`) | Email + password (Better Auth, sessions in Postgres). Every dashboard page requires sign-in |
 | **Forgot / reset password** (`/forgot-password`, `/reset-password`) | Request a reset link (same answer whether or not the email exists; link expires in 1 h, works once, signs out other sessions). While email is simulated, an Owner/Admin generates the link in Administration → Team |
 | **Verify email** (`/verify-email`) | Landing page for the verification link. Unverified users see a banner; nothing is blocked unless `REQUIRE_EMAIL_VERIFICATION=true` |
 | **Team invite** (`/invite/<token>`) | Invitee creates an account (or, if signed in with the invited email, joins) with the invited role |
-| **Command Center** | Live booking stats for your org, sample ops KPIs (labelled), schedule and module status |
+| **Command Center** | **Getting-started checklist** for Owners of new workspaces (business name & hours, services, share booking link, connect Google Calendar, invite team) — auto-detected where possible, hides when all done or dismissed (remembered per workspace in the browser). Live booking stats for your org, sample ops KPIs (labelled), schedule and module status |
 | **Booking Center** | **Working feature.** Pipeline Intent → Booking → Availability → Calendar → Notification → Audit → VERIFIED, saved in Postgres per org. Create / reschedule / cancel, conflicts, fault injection, audit log (with actor), notifications outbox |
 | **Public booking page** (`/book/<org-slug>`) | Customers (no account) pick a service, date and open time, enter name/email/phone. Same pipeline + conflict checks; shows up in the dashboard with source "public" |
 | **Administration** | Owner: business name, booking-page slug and on/off, opening hours, services (duration, resource), integrations (Google Calendar connect). Owner + Admin: **Team** — invite by email with a role, list / resend / revoke invites, one-time password-reset links, remove members |
@@ -38,6 +40,22 @@ FLOWOPS is an ops dashboard built around the **FLOWOPS Agent Matrix** (FLOWOPS C
 - Verification emails go out on sign-up when Resend is configured (link valid 24 h → `/verify-email`). Unverified users see a "Verify your email" banner (with a *Send verification email* button once Resend is live).
 - `REQUIRE_EMAIL_VERIFICATION=true` (default off) blocks sign-in until verified — **only once Resend is configured**, so nobody is locked out while email is simulated. Existing users signed up unverified; turning it on later means they verify on their next sign-in (a fresh link is emailed automatically).
 - Sessions use a 5-minute cookie cache, so a revoked session (password reset, removed member) can linger up to 5 minutes.
+
+### Rate limits (v2.2)
+
+All stored in the Postgres `rate_limit` table (shared with Better Auth; FlowOps keys are prefixed `flowops:`), keyed by client IP from `x-vercel-forwarded-for` / `x-real-ip`. Helper: `src/lib/server/rate-limit.ts` (fails open on DB errors).
+
+| Endpoint | Limit |
+| --- | --- |
+| `/api/auth/sign-up/*` | 5 / 10 min per IP (+ Better Auth's 3 / 10 s) |
+| `/api/auth/sign-in/*` | 10 / min per IP |
+| Password-reset / verification emails | 3 / min per IP (Better Auth default) |
+| Other auth endpoints | 60 / min per IP |
+| `POST /api/public/<slug>/book` | 8 / 10 min per IP per booking page, 20 / hour per IP overall (plus the existing 5 bookings / email / day) |
+| `GET /api/public/<slug>/availability` | 60 / min per IP |
+| `POST /api/assistant` (FlowAI) | 6 / min per user, 40 / hour per workspace |
+
+FlowAI turns AI Gateway errors into friendly messages (`src/lib/server/ai-errors.ts`): rate limit → "wait about a minute", out of credit, auth, other. 429s return JSON `{ error, retryAfter }` with `Retry-After`.
 
 ### What is real and what is simulated
 
@@ -76,6 +94,7 @@ FlowAI locally: `vercel env pull` (short-lived `VERCEL_OIDC_TOKEN`) or `AI_GATEW
 ```
 src/
   app/
+    (marketing)/             # public: home (landing), terms, privacy
     (dashboard)/             # signed-in app: layout (session gate), Command Center + module pages
     sign-in/ sign-up/        # auth pages
     forgot-password/ reset-password/ verify-email/
@@ -88,7 +107,7 @@ src/
     api/public/[slug]/*      # public info, availability, book
     api/integrations/google  # OAuth connect/callback/disconnect
     api/assistant            # FlowAI (AI Gateway + tools)
-  proxy.ts                   # redirects signed-out users to /sign-in
+  proxy.ts                   # signed out: "/" → rewrite to /home; other app pages → /sign-in
   components/
     app-shell.tsx  assistant-panel.tsx  pipeline.tsx  ui.tsx
     views/                   # page bodies (client components where interactive)
@@ -132,6 +151,8 @@ Next platform work:
 - [~] **Google Calendar** — code ready; needs OAuth client credentials
 - [~] Real **Notification Agent** — Resend/Twilio code ready; needs API keys
 - [x] Email verification, password reset and token team invites (v2.1 — emails go out once Resend is configured)
+- [x] Public landing page, draft Terms/Privacy, onboarding checklist, rate limits (v2.2)
+- [ ] Lawyer review of Terms/Privacy; Google OAuth verification (homepage `/`, privacy `/privacy`)
 - [ ] Billing / plans for selling FlowOps
 - [ ] Event bus (NATS/Kafka/RabbitMQ) for agent-to-agent messaging
 - [ ] Durable workflows (Temporal/Prefect) for the Automation Center
