@@ -20,6 +20,8 @@ export interface BookingRequest {
   time: string; // HH:MM (24h)
   durationMin: number;
   notes?: string;
+  /** Optional customer phone (used for SMS notifications when Twilio is configured). */
+  phone?: string;
 }
 
 export interface Booking extends BookingRequest {
@@ -63,6 +65,7 @@ export interface AuditEntry {
   agent: PipelineAgent;
   outcome: "success" | "conflict" | "invalid" | "failed" | "not_found";
   detail: string;
+  actor?: string;
 }
 
 export interface NotificationRecord {
@@ -70,9 +73,10 @@ export interface NotificationRecord {
   at: string;
   bookingId: string;
   recipient: string;
-  channel: "email (simulated)";
+  channel: "email (simulated)" | "sms (simulated)" | "email" | "sms";
   subject: string;
-  deliveryStatus: "simulated-sent";
+  deliveryStatus: "simulated-sent" | "sent" | "failed";
+  detail?: string;
 }
 
 export interface EngineState {
@@ -81,7 +85,33 @@ export interface EngineState {
   notifications: NotificationRecord[];
 }
 
+/** Opening hours for one day, HH:MM 24h. `null` = closed. */
+export type DayHours = { open: string; close: string } | null;
+
+/** Real Calendar Agent backend (e.g. Google Calendar). Absent = simulated. */
+export interface CalendarAdapter {
+  label: string;
+  create(b: Booking): Promise<string>;
+  update(b: Booking): Promise<string>;
+  remove(eventId: string): Promise<void>;
+}
+
+/** Real Notification Agent backend (e.g. Resend email, Twilio SMS). Absent = simulated. */
+export interface NotifierAdapter {
+  /** Channels that are real; any channel not listed stays simulated. */
+  channels: { email: boolean; sms: boolean };
+  send(b: Booking, subject: string, body: string, channel: "email" | "sms"): Promise<{ ok: boolean; detail?: string }>;
+}
+
 export interface RunOptions {
+  /** Business hours lookup for a date (YYYY-MM-DD). Default: 07:00–22:00 every day. */
+  hoursFor?: (date: string) => DayHours;
+  /** IANA time zone used for the "in the past" check. Default: the process' local time. */
+  timeZone?: string;
+  calendar?: CalendarAdapter;
+  notifier?: NotifierAdapter;
+  /** Recorded on audit entries (who triggered the run). */
+  actor?: string;
   /** Force this agent to throw, to exercise failure handling (FL-006). */
   failAgent?: PipelineAgent;
   /** Artificial delay per step so the UI can animate progress. */
@@ -91,3 +121,6 @@ export interface RunOptions {
   /** Override "now" (used by tests). */
   now?: Date;
 }
+
+/** Business hours by weekday, "0" = Sunday … "6" = Saturday. */
+export type WeekHoursClient = Record<"0" | "1" | "2" | "3" | "4" | "5" | "6", DayHours>;

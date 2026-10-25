@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { CalendarClock, Play, RotateCcw, Trash2, Wand2, XCircle } from "lucide-react";
+import { CalendarClock, Play, Trash2, Wand2, XCircle } from "lucide-react";
 import { useBookings } from "@/lib/booking/store";
 import { PIPELINE } from "@/lib/booking/engine";
 import type { AgentStep, BookingRequest, PipelineAgent, PipelineResult, ServiceCategory } from "@/lib/booking/types";
@@ -37,8 +37,12 @@ function Field({ label, children, className }: { label: string; children: React.
   );
 }
 
+const CUSTOM = "__custom__";
+
 export function BookingCenter() {
-  const { state, create, reschedule, cancel, reset, hydrated } = useBookings();
+  const { state, me, create, reschedule, cancel, hydrated, error } = useBookings();
+  const services = (me?.services ?? []).filter((s) => s.active);
+  const [serviceId, setServiceId] = useState<string>("");
   const [form, setForm] = useState<BookingRequest>({
     customer: "",
     email: "",
@@ -62,6 +66,19 @@ export function BookingCenter() {
   }, []);
 
   const cat = CATEGORIES.find((c) => c.key === form.category)!;
+  const custom = serviceId === CUSTOM || services.length === 0;
+
+  function pickService(id: string) {
+    setServiceId(id);
+    const svc = services.find((s) => s.id === id);
+    if (svc) setForm((f) => ({ ...f, category: svc.category, service: svc.name, resource: svc.resource, durationMin: svc.durationMin }));
+  }
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- default to the first configured service once loaded
+    if (!serviceId && services.length) pickService(services[0].id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [services.length]);
   const set = <K extends keyof BookingRequest>(k: K, v: BookingRequest[K]) => setForm((f) => ({ ...f, [k]: v }));
 
   async function exec(fn: (opts: { stepDelayMs: number; onStep: (s: AgentStep[]) => void; failAgent?: PipelineAgent }) => Promise<PipelineResult>) {
@@ -77,16 +94,25 @@ export function BookingCenter() {
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     const r = await exec((o) => create(form, o));
-    if (r.ok) setForm((f) => ({ ...f, customer: "", email: "", notes: "" }));
+    if (r.ok) setForm((f) => ({ ...f, customer: "", email: "", phone: "", notes: "" }));
   }
 
   async function seedDemo() {
     const day = tomorrow();
-    const demo: BookingRequest[] = [
-      { customer: "Demo — Acme Corp", email: "ops@acme.example", category: "appointment", service: "Onboarding call", resource: "Room A", date: day, time: "09:00", durationMin: 60 },
-      { customer: "Demo — J. Rivera", email: "j.rivera@example.com", category: "restaurant", service: "Client dinner", resource: "Private Room", date: day, time: "19:00", durationMin: 120 },
-      { customer: "Demo — Field Ops", email: "field@example.com", category: "workforce", service: "Technician dispatch", resource: "Technician — Alex", date: day, time: "13:30", durationMin: 90 },
-    ];
+    const pick = services.slice(0, 3);
+    const names = ["Demo — Acme Corp", "Demo — J. Rivera", "Demo — Field Ops"];
+    const times = ["09:00", "11:00", "13:30"];
+    const demo: BookingRequest[] = pick.map((s, i) => ({
+      customer: names[i],
+      email: `demo${i + 1}@example.com`,
+      category: s.category,
+      service: s.name,
+      resource: s.resource,
+      date: day,
+      time: times[i],
+      durationMin: s.durationMin,
+      notes: "DEMO DATA",
+    }));
     setRunning(true);
     for (const d of demo) {
       const r = await create(d, { stepDelayMs: 60, onStep: setSteps });
@@ -103,29 +129,40 @@ export function BookingCenter() {
       <PageHeader
         kicker="FlowBiz · Booking Engine 4.0"
         title="Booking Center"
-        description="Every request runs the FLOWOPS booking pipeline: Intent → Booking → Availability → Calendar → Notification → Audit. Bookings are stored in this browser only; Calendar and Notification agents are simulated."
+        description={`Every request runs the FLOWOPS booking pipeline on the server: Intent → Booking → Availability → Calendar → Notification → Audit. Bookings are saved in the database for ${me?.org.name ?? "your organization"}. ${me?.org.googleConnected && me.integrations.googleCalendar ? "Calendar: Google Calendar." : "Calendar: simulated."} ${me?.integrations.resendEmail ? "Email: Resend." : "Email: simulated."} ${me?.integrations.twilioSms ? "SMS: Twilio." : "SMS: simulated."}`}
       >
         <LiveBadge />
-        <button onClick={seedDemo} disabled={running} className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/5 disabled:opacity-40">
+        <button onClick={seedDemo} disabled={running || services.length === 0} className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/5 disabled:opacity-40">
           <Wand2 className="h-3.5 w-3.5" /> Add 3 demo bookings
-        </button>
-        <button
-          onClick={() => {
-            if (confirm("Clear all bookings, audit entries and notifications stored in this browser?")) {
-              reset();
-              setSteps(idleSteps());
-              setResult(null);
-            }
-          }}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-300 hover:bg-white/5"
-        >
-          <RotateCcw className="h-3.5 w-3.5" /> Reset
         </button>
       </PageHeader>
 
       <div className="grid gap-5 xl:grid-cols-[380px_1fr]">
         <Card title="New booking request" subtitle="Submitted to FLOWOPS Core">
           <form onSubmit={submit} className="space-y-3">
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Customer">
+                <input className={inputCls} value={form.customer} onChange={(e) => set("customer", e.target.value)} placeholder="Jane Doe" />
+              </Field>
+              <Field label="Recipient email">
+                <input className={inputCls} value={form.email} onChange={(e) => set("email", e.target.value)} placeholder="jane@example.com" />
+              </Field>
+            </div>
+            <Field label="Phone (optional — SMS)">
+              <input className={inputCls} value={form.phone ?? ""} onChange={(e) => set("phone", e.target.value)} placeholder="+1 555 123 4567" />
+            </Field>
+            <Field label="Service">
+              <select className={inputCls} value={custom ? CUSTOM : serviceId} onChange={(e) => pickService(e.target.value)}>
+                {services.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name} · {s.durationMin}m · {s.resource}
+                  </option>
+                ))}
+                <option value={CUSTOM}>Custom…</option>
+              </select>
+            </Field>
+            {custom && (
+              <>
             <div className="grid grid-cols-4 gap-1 rounded-lg bg-black/30 p-1">
               {CATEGORIES.map((c) => (
                 <button
@@ -137,14 +174,6 @@ export function BookingCenter() {
                   {c.label}
                 </button>
               ))}
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="Customer">
-                <input className={inputCls} value={form.customer} onChange={(e) => set("customer", e.target.value)} placeholder="Jane Doe" />
-              </Field>
-              <Field label="Recipient email">
-                <input className={inputCls} value={form.email} onChange={(e) => set("email", e.target.value)} placeholder="jane@example.com" />
-              </Field>
             </div>
             <Field label="Service">
               <input className={inputCls} list="services" value={form.service} onChange={(e) => set("service", e.target.value)} />
@@ -161,6 +190,8 @@ export function BookingCenter() {
                 ))}
               </select>
             </Field>
+              </>
+            )}
             <div className="grid grid-cols-3 gap-3">
               <Field label="Date">
                 <input type="date" className={inputCls} value={form.date} onChange={(e) => set("date", e.target.value)} />
@@ -169,8 +200,8 @@ export function BookingCenter() {
                 <input type="time" step={900} className={inputCls} value={form.time} onChange={(e) => set("time", e.target.value)} />
               </Field>
               <Field label="Minutes">
-                <select className={inputCls} value={form.durationMin} onChange={(e) => set("durationMin", Number(e.target.value))}>
-                  {[15, 30, 45, 60, 90, 120, 180, 240].map((m) => (
+                <select className={inputCls} disabled={!custom} value={form.durationMin} onChange={(e) => set("durationMin", Number(e.target.value))}>
+                  {Array.from(new Set([15, 30, 45, 60, 90, 120, 180, 240, form.durationMin])).sort((a, b) => a - b).map((m) => (
                     <option key={m} value={m}>
                       {m}
                     </option>
@@ -260,7 +291,7 @@ export function BookingCenter() {
             ))}
           </div>
         }
-        action={<span className="font-mono text-[10.5px] text-slate-500">stored in this browser (localStorage)</span>}
+        action={<span className="font-mono text-[10.5px] text-slate-500">{error ? `error: ${error}` : `saved in Postgres · ${me?.org.name ?? "…"}`}</span>}
       >
         {tab === "bookings" &&
           (state.bookings.length === 0 ? (
@@ -269,10 +300,14 @@ export function BookingCenter() {
             <Table head={["ID", "Customer", "Service", "Resource", "When", "Calendar", "Status", ""]}>
               {state.bookings.map((b) => (
                 <tr key={b.id} className={b.status === "cancelled" ? "opacity-50" : ""}>
-                  <Td className="font-mono text-xs text-cyan-300">{b.id}</Td>
+                  <Td className="font-mono text-xs text-cyan-300">
+                    {b.id}
+                    {state.sources?.[b.id] && <div className="text-[10px] uppercase text-slate-500">via {state.sources[b.id]}</div>}
+                  </Td>
                   <Td>
                     <div className="text-slate-100">{b.customer}</div>
                     <div className="text-xs text-slate-500">{b.email}</div>
+                    {b.phone && <div className="text-xs text-slate-500">{b.phone}</div>}
                   </Td>
                   <Td>
                     {b.service}
@@ -296,7 +331,7 @@ export function BookingCenter() {
                     {b.calendarEventId ?? "—"}
                     {b.calendarEventId && (
                       <div className="mt-0.5">
-                        <SimBadge />
+                        {b.calendarEventId.startsWith("SIMCAL") ? <SimBadge /> : <Pill status="verified">google</Pill>}
                       </div>
                     )}
                   </Td>
@@ -326,7 +361,12 @@ export function BookingCenter() {
                           <button title="Reschedule" disabled={running} onClick={() => setEditing({ id: b.id, date: b.date, time: b.time })} className="rounded-md p-1.5 text-slate-400 hover:bg-white/5 hover:text-cyan-300">
                             <CalendarClock className="h-4 w-4" />
                           </button>
-                          <button title="Cancel" disabled={running} onClick={() => exec((o) => cancel(b.id, o))} className="rounded-md p-1.5 text-slate-400 hover:bg-white/5 hover:text-rose-300">
+                          <button
+                            title="Cancel"
+                            disabled={running}
+                            onClick={() => {
+                              if (confirm(`Cancel booking ${b.id} for ${b.customer}? The customer is notified.`)) void exec((o) => cancel(b.id, o));
+                            }} className="rounded-md p-1.5 text-slate-400 hover:bg-white/5 hover:text-rose-300">
                             <Trash2 className="h-4 w-4" />
                           </button>
                         </div>
@@ -340,7 +380,7 @@ export function BookingCenter() {
           (state.audit.length === 0 ? (
             <Empty text="The Audit Agent records every action, conflict and failure here." />
           ) : (
-            <Table head={["Time", "Action", "Booking", "Agent", "Outcome", "Detail"]}>
+            <Table head={["Time", "Action", "Booking", "Agent", "Outcome", "Detail", "By"]}>
               {state.audit.map((a) => (
                 <tr key={a.id}>
                   <Td className="whitespace-nowrap font-mono text-xs text-slate-500">{new Date(a.at).toLocaleString()}</Td>
@@ -353,23 +393,26 @@ export function BookingCenter() {
                     <Pill status={a.outcome} />
                   </Td>
                   <Td className="text-xs text-slate-400">{a.detail}</Td>
+                  <Td className="text-xs text-slate-500">{a.actor ?? "—"}</Td>
                 </tr>
               ))}
             </Table>
           ))}
         {tab === "notifications" &&
           (state.notifications.length === 0 ? (
-            <Empty text="Simulated notifications appear here. Nothing is actually emailed." />
+            <Empty text="Notifications appear here. Channels marked (simulated) were not actually sent." />
           ) : (
-            <Table head={["Time", "Booking", "Recipient", "Subject", "Delivery"]}>
+            <Table head={["Time", "Booking", "Channel", "Recipient", "Subject", "Delivery"]}>
               {state.notifications.map((n) => (
                 <tr key={n.id}>
                   <Td className="whitespace-nowrap font-mono text-xs text-slate-500">{new Date(n.at).toLocaleString()}</Td>
                   <Td className="font-mono text-xs text-cyan-300">{n.bookingId}</Td>
+                  <Td className="text-xs">{n.channel}</Td>
                   <Td className="text-xs">{n.recipient}</Td>
                   <Td className="text-xs">{n.subject}</Td>
                   <Td>
-                    <Pill status="simulated">simulated-sent</Pill>
+                    <Pill status={n.deliveryStatus === "sent" ? "verified" : n.deliveryStatus === "failed" ? "failed" : "simulated"}>{n.deliveryStatus}</Pill>
+                    {n.detail && <div className="mt-0.5 max-w-[16rem] truncate text-[10px] text-slate-500">{n.detail}</div>}
                   </Td>
                 </tr>
               ))}

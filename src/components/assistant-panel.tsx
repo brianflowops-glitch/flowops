@@ -1,22 +1,37 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, Send, Sparkles, X } from "lucide-react";
+import { useChat } from "@ai-sdk/react";
+import { DefaultChatTransport, isToolUIPart, getToolName, lastAssistantMessageIsCompleteWithApprovalResponses } from "ai";
+import { AlertTriangle, CalendarCheck, Send, Sparkles, X } from "lucide-react";
 import { useBookings } from "@/lib/booking/store";
 import { clsx } from "./clsx";
 
-type Msg = { role: "user" | "assistant"; content: string };
 type Status = { configured: boolean; model?: string } | null;
 
-const SUGGESTIONS = ["Summarize today's bookings", "Explain the booking pipeline", "What's on the roadmap?"];
+const SUGGESTIONS = ["What's booked tomorrow?", "Is Room A free tomorrow afternoon?", "Book a consultation for Jane Doe (jane@example.com) tomorrow at 10:00"];
+const TOOL_LABEL: Record<string, string> = {
+  listServices: "Listing services",
+  listBookings: "Looking up bookings",
+  checkAvailability: "Checking availability",
+  createBooking: "Creating booking",
+  rescheduleBooking: "Rescheduling booking",
+  cancelBooking: "Cancel booking",
+};
+
+type ToolOut = { ok?: boolean; outcome?: string; error?: string; booking?: { id: string; date: string; time: string; service: string } | null };
 
 export function AssistantPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { state } = useBookings();
+  const { refresh } = useBookings();
   const [status, setStatus] = useState<Status>(null);
-  const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const { messages, sendMessage, status: chatStatus, error, addToolApprovalResponse } = useChat({
+    transport: new DefaultChatTransport({ api: "/api/assistant" }),
+    sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithApprovalResponses,
+    onFinish: () => void refresh(),
+  });
+  const busy = chatStatus === "submitted" || chatStatus === "streaming";
 
   useEffect(() => {
     if (!open || status) return;
@@ -30,48 +45,11 @@ export function AssistantPanel({ open, onClose }: { open: boolean; onClose: () =
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, busy]);
 
-  async function send(text: string) {
+  function send(text: string) {
     const content = text.trim();
     if (!content || busy || !status?.configured) return;
-    const next: Msg[] = [...messages, { role: "user", content }];
-    setMessages(next);
     setInput("");
-    setBusy(true);
-    try {
-      const confirmed = state.bookings.filter((b) => b.status === "confirmed");
-      const context = {
-        bookings: confirmed.slice(0, 20).map((b) => ({ id: b.id, service: b.service, resource: b.resource, date: b.date, time: b.time, customer: b.customer })),
-        totals: { confirmed: confirmed.length, cancelled: state.bookings.length - confirmed.length, auditEntries: state.audit.length },
-      };
-      const res = await fetch("/api/assistant", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: next, context }),
-      });
-      if (!res.ok || !res.body) {
-        const data = await res.json().catch(() => ({}));
-        setMessages([...next, { role: "assistant", content: data.error ?? `Request failed (${res.status}).` }]);
-        return;
-      }
-      // Stream the reply token-by-token.
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let reply = "";
-      setBusy(false);
-      setMessages([...next, { role: "assistant", content: "" }]);
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        reply += decoder.decode(value, { stream: true });
-        setMessages([...next, { role: "assistant", content: reply }]);
-      }
-      reply += decoder.decode();
-      setMessages([...next, { role: "assistant", content: reply.trim() || "No response." }]);
-    } catch (e) {
-      setMessages([...next, { role: "assistant", content: `Request failed: ${String(e)}` }]);
-    } finally {
-      setBusy(false);
-    }
+    void sendMessage({ text: content });
   }
 
   return (
@@ -91,7 +69,7 @@ export function AssistantPanel({ open, onClose }: { open: boolean; onClose: () =
           <div>
             <p className="text-sm font-semibold text-white">FlowAI Assistant</p>
             <p className="font-mono text-[10.5px] text-slate-500">
-              {status === null ? "checking backend…" : status.configured ? `connected · ${status.model}` : "backend not connected"}
+              {status === null ? "checking backend…" : status.configured ? `connected · ${status.model} · booking tools on` : "backend not connected"}
             </p>
           </div>
           <button onClick={onClose} className="ml-auto rounded-md p-1.5 text-slate-400 hover:bg-white/5" aria-label="Close assistant">
@@ -108,29 +86,84 @@ export function AssistantPanel({ open, onClose }: { open: boolean; onClose: () =
               <p className="text-amber-100/80">
                 FlowAI runs on Vercel AI Gateway. It connects automatically when deployed on Vercel; locally, run{" "}
                 <code className="rounded bg-black/30 px-1 font-mono text-xs">vercel env pull</code> or set{" "}
-                <code className="rounded bg-black/30 px-1 font-mono text-xs">AI_GATEWAY_API_KEY</code> in{" "}
-                <code className="rounded bg-black/30 px-1 font-mono text-xs">.env.local</code>. Everything else in FlowOps works without it.
+                <code className="rounded bg-black/30 px-1 font-mono text-xs">AI_GATEWAY_API_KEY</code>.
               </p>
             </div>
           )}
           {status?.configured && messages.length === 0 && (
             <div className="space-y-3">
-              <p className="text-sm text-slate-400">Ask about the FLOWOPS platform, the Agent Matrix, or the bookings in this browser.</p>
+              <p className="text-sm text-slate-400">
+                Ask FlowAI to check availability, list, create, reschedule or cancel bookings. Every change runs the same pipeline as the Booking Center and is audit-logged under your name.
+              </p>
               <div className="flex flex-wrap gap-2">
                 {SUGGESTIONS.map((s) => (
-                  <button key={s} onClick={() => send(s)} className="rounded-full border border-white/10 px-3 py-1 text-xs text-slate-300 hover:border-cyan-400/40 hover:text-white">
+                  <button key={s} onClick={() => send(s)} className="rounded-full border border-white/10 px-3 py-1 text-left text-xs text-slate-300 hover:border-cyan-400/40 hover:text-white">
                     {s}
                   </button>
                 ))}
               </div>
             </div>
           )}
-          {messages.map((m, i) => (
-            <div key={i} className={clsx("max-w-[90%] whitespace-pre-wrap rounded-xl px-3.5 py-2.5 text-sm", m.role === "user" ? "ml-auto bg-cyan-500/15 text-cyan-50" : "bg-white/[0.04] text-slate-200")}>
-              {m.content}
+          {messages.map((m) => (
+            <div key={m.id} className={clsx("space-y-2", m.role === "user" && "flex flex-col items-end")}>
+              {m.parts.map((part, i) => {
+                if (part.type === "text") {
+                  if (!part.text.trim()) return null;
+                  return (
+                    <div key={i} className={clsx("max-w-[90%] whitespace-pre-wrap rounded-xl px-3.5 py-2.5 text-sm", m.role === "user" ? "bg-cyan-500/15 text-cyan-50" : "bg-white/[0.04] text-slate-200")}>
+                      {part.text}
+                    </div>
+                  );
+                }
+                if (!isToolUIPart(part)) return null;
+                const name = getToolName(part);
+                const label = TOOL_LABEL[name] ?? name;
+                const input = (part.input ?? {}) as Record<string, string>;
+                if (part.state === "approval-requested") {
+                  return (
+                    <div key={i} className="max-w-[90%] rounded-xl border border-rose-400/30 bg-rose-400/[0.06] p-3 text-sm text-rose-100">
+                      <p className="font-medium">Confirm: cancel booking {input.bookingId}?</p>
+                      <p className="mt-0.5 text-xs text-rose-100/70">The customer will be notified and the calendar event removed.</p>
+                      <div className="mt-2 flex gap-2">
+                        <button
+                          onClick={() => addToolApprovalResponse({ id: part.approval.id, approved: true })}
+                          className="rounded-md bg-rose-500/80 px-3 py-1 text-xs font-medium text-white hover:bg-rose-500"
+                        >
+                          Yes, cancel it
+                        </button>
+                        <button
+                          onClick={() => addToolApprovalResponse({ id: part.approval.id, approved: false, reason: "User declined the cancellation" })}
+                          className="rounded-md border border-white/15 px-3 py-1 text-xs text-slate-200 hover:bg-white/5"
+                        >
+                          Keep booking
+                        </button>
+                      </div>
+                    </div>
+                  );
+                }
+                const out = (part.state === "output-available" ? part.output : null) as ToolOut | null;
+                const text =
+                  part.state === "output-denied"
+                    ? `${label}: declined — nothing changed`
+                    : part.state === "output-error"
+                      ? `${label}: error — ${part.errorText}`
+                      : part.state === "output-available"
+                        ? out?.booking && out.ok !== false
+                          ? `${label} ✓ ${out.booking.id} · ${out.booking.service} · ${out.booking.date} ${out.booking.time}`
+                          : out?.ok === false
+                            ? `${label}: ${out.outcome ?? "failed"} — ${out.error ?? ""}`
+                            : `${label} ✓`
+                        : `${label}…`;
+                return (
+                  <div key={i} className="flex max-w-[90%] items-center gap-2 rounded-lg border border-white/[0.06] bg-black/20 px-2.5 py-1.5 font-mono text-[11px] text-slate-400">
+                    <CalendarCheck className="h-3.5 w-3.5 shrink-0 text-cyan-300" /> {text}
+                  </div>
+                );
+              })}
             </div>
           ))}
-          {busy && <div className="w-16 animate-pulse rounded-xl bg-white/[0.04] px-3.5 py-2.5 text-sm text-slate-400">…</div>}
+          {chatStatus === "submitted" && <div className="w-16 animate-pulse rounded-xl bg-white/[0.04] px-3.5 py-2.5 text-sm text-slate-400">…</div>}
+          {error && <div className="rounded-lg border border-rose-400/30 bg-rose-400/[0.06] p-3 text-xs text-rose-200">FlowAI request failed: {error.message}</div>}
         </div>
 
         <form
@@ -145,7 +178,7 @@ export function AssistantPanel({ open, onClose }: { open: boolean; onClose: () =
               value={input}
               onChange={(e) => setInput(e.target.value)}
               disabled={!status?.configured || busy}
-              placeholder={status?.configured ? "Ask FlowAI…" : "Assistant offline — AI Gateway not connected"}
+              placeholder={status?.configured ? "Ask FlowAI to book, move or cancel…" : "Assistant offline — AI Gateway not connected"}
               className="flex-1 bg-transparent text-sm text-white placeholder:text-slate-600 focus:outline-none disabled:cursor-not-allowed"
             />
             <button type="submit" disabled={!status?.configured || busy || !input.trim()} className="rounded-lg bg-cyan-500 p-1.5 text-white disabled:opacity-30" aria-label="Send">

@@ -41,8 +41,8 @@ export const AGENTS: AgentDef[] = [
   { name: "IntentAgent", module: "biz", role: "Parses and validates booking intent", status: "active", fromNotes: true },
   { name: "BookingAgent", module: "biz", role: "Issues booking ID and status", status: "active", fromNotes: true },
   { name: "AvailabilityAgent", module: "biz", role: "Resource availability & conflict detection", status: "active", fromNotes: true },
-  { name: "CalendarAgent", module: "connect", role: "Calendar event create/update/delete", status: "simulated", fromNotes: true },
-  { name: "NotificationAgent", module: "connect", role: "Booking notifications to recipients", status: "simulated", fromNotes: true },
+  { name: "CalendarAgent", module: "connect", role: "Calendar event create/update/delete (Google Calendar once connected; simulated until then)", status: "simulated", fromNotes: true },
+  { name: "NotificationAgent", module: "connect", role: "Booking notifications (Resend email / Twilio SMS once configured; simulated until then)", status: "simulated", fromNotes: true },
   { name: "AuditAgent", module: "core", role: "Immutable audit trail", status: "active", fromNotes: true },
   // Placeholder names to fill the proposed 24-agent matrix (not named in the notes)
   { name: "RouteAgent", module: "net", role: "Routing table and path optimisation", status: "planned", fromNotes: false },

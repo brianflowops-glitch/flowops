@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useState } from "react";
 import {
   BarChart3,
@@ -10,6 +10,7 @@ import {
   FlaskConical,
   Grid3x3,
   LayoutDashboard,
+  LogOut,
   Menu,
   Network,
   Plug,
@@ -21,6 +22,7 @@ import {
 } from "lucide-react";
 import { NAV } from "@/lib/data/platform";
 import { BookingProvider } from "@/lib/booking/store";
+import { authClient } from "@/lib/auth-client";
 import { AssistantPanel } from "./assistant-panel";
 import { clsx } from "./clsx";
 
@@ -76,14 +78,49 @@ function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
         );
       })}
       <div className="mt-auto rounded-lg border border-white/[0.06] bg-white/[0.02] p-3 text-[11px] leading-relaxed text-slate-500">
-        <p className="font-mono text-slate-400">v1.0 · prototype</p>
-        <p>Booking Engine runs in your browser. Calendar &amp; notifications are simulated.</p>
+        <p className="font-mono text-slate-400">v2.0 · beta</p>
+        <p>Bookings are saved in Postgres per organization. Calendar, email &amp; SMS stay simulated until connected in Administration.</p>
       </div>
     </nav>
   );
 }
 
-export function AppShell({ children }: { children: React.ReactNode }) {
+export interface ShellSession {
+  name: string;
+  email: string;
+  role: "owner" | "staff";
+  orgName: string;
+  orgSlug: string;
+}
+
+function UserMenu({ session }: { session: ShellSession }) {
+  const router = useRouter();
+  const [busy, setBusy] = useState(false);
+  return (
+    <div className="flex items-center gap-2">
+      <div className="hidden text-right leading-tight md:block">
+        <p className="text-xs text-slate-200">{session.name}</p>
+        <p className="font-mono text-[10px] uppercase text-slate-500">{session.role}</p>
+      </div>
+      <button
+        title="Sign out"
+        disabled={busy}
+        onClick={async () => {
+          setBusy(true);
+          await authClient.signOut();
+          router.push("/sign-in");
+          router.refresh();
+        }}
+        className="rounded-md p-1.5 text-slate-400 hover:bg-white/5 hover:text-white disabled:opacity-40"
+        aria-label="Sign out"
+      >
+        <LogOut className="h-4 w-4" />
+      </button>
+    </div>
+  );
+}
+
+export function AppShell({ children, session }: { children: React.ReactNode; session: ShellSession }) {
   const [assistantOpen, setAssistantOpen] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
 
@@ -114,12 +151,17 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <div className="hidden items-center gap-2 font-mono text-[11px] text-slate-500 sm:flex">
               <span className="text-slate-400">Unified Operations Intelligence Platform</span>
               <span className="text-slate-700">/</span>
-              <span>tenant: FlowOps</span>
+              <span>org: {session.orgName}</span>
+              <span className="text-slate-700">/</span>
+              <a href={`/book/${session.orgSlug}`} target="_blank" className="text-cyan-400/80 hover:text-cyan-300">
+                public booking page ↗
+              </a>
             </div>
             <div className="ml-auto flex items-center gap-2">
               <span className="hidden items-center gap-1.5 rounded-full border border-white/[0.08] px-2.5 py-1 text-[11px] text-slate-400 md:inline-flex">
-                <Bot className="h-3.5 w-3.5 text-cyan-300" /> FLOWOPS Core · prototype
+                <Bot className="h-3.5 w-3.5 text-cyan-300" /> FLOWOPS Core · beta
               </span>
+              <UserMenu session={session} />
               <button
                 onClick={() => setAssistantOpen((v) => !v)}
                 className="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-cyan-500 to-violet-500 px-3 py-1.5 text-sm font-medium text-white shadow-[0_0_20px_-6px_rgba(34,211,238,0.8)] transition hover:brightness-110"

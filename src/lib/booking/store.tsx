@@ -1,78 +1,158 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
-import { BookingEngine, emptyState } from "./engine";
-import type { BookingRequest, EngineState, RunOptions } from "./types";
+import { useRouter } from "next/navigation";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { emptyState } from "./engine";
+import type { AgentStep, BookingRequest, EngineState, PipelineAgent, PipelineResult, WeekHoursClient } from "./types";
 
-const STORAGE_KEY = "flowops.booking-engine.v1";
+export interface ServiceRow {
+  id: string;
+  name: string;
+  category: BookingRequest["category"];
+  durationMin: number;
+  resource: string;
+  description: string | null;
+  active: boolean;
+  sortOrder: number;
+}
+
+export interface Me {
+  user: { id: string; name: string; email: string };
+  role: "owner" | "staff";
+  org: {
+    id: string;
+    slug: string;
+    name: string;
+    timeZone: string;
+    hours: WeekHoursClient;
+    publicBooking: boolean;
+    isDemo: boolean;
+    googleConnected: boolean;
+    googleAccountEmail: string | null;
+  };
+  today: { date: string; time: string };
+  services: ServiceRow[];
+  integrations: { googleCalendar: boolean; resendEmail: boolean; resendFrom: boolean; twilioSms: boolean };
+}
+
+export interface ClientRunOptions {
+  /** Delay per step when replaying the server's pipeline steps (UI animation). */
+  stepDelayMs?: number;
+  onStep?: (steps: AgentStep[]) => void;
+  failAgent?: PipelineAgent;
+}
 
 interface BookingStore {
-  state: EngineState;
+  state: EngineState & { sources?: Record<string, "dashboard" | "assistant" | "public"> };
+  me: Me | null;
   hydrated: boolean;
-  create: (req: BookingRequest, opts?: RunOptions) => ReturnType<BookingEngine["create"]>;
-  reschedule: (id: string, date: string, time: string, opts?: RunOptions) => ReturnType<BookingEngine["reschedule"]>;
-  cancel: (id: string, opts?: RunOptions) => ReturnType<BookingEngine["cancel"]>;
-  reset: () => void;
+  error: string | null;
+  refresh: () => Promise<void>;
+  create: (req: BookingRequest, opts?: ClientRunOptions) => Promise<PipelineResult>;
+  reschedule: (id: string, date: string, time: string, opts?: ClientRunOptions) => Promise<PipelineResult>;
+  cancel: (id: string, opts?: ClientRunOptions) => Promise<PipelineResult>;
 }
 
 const Ctx = createContext<BookingStore | null>(null);
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-export function BookingProvider({ children }: { children: React.ReactNode }) {
-  const engineRef = useRef<BookingEngine | null>(null);
-  if (engineRef.current == null) {
-    engineRef.current = new BookingEngine();
+async function replay(final: AgentStep[], opts?: ClientRunOptions) {
+  if (!opts?.onStep) return;
+  const delay = opts.stepDelayMs ?? 0;
+  for (let i = 0; i < final.length && delay > 0; i++) {
+    opts.onStep(
+      final.map((s, j) =>
+        j < i ? s : j === i ? { ...s, status: "running", message: "Running…" } : { ...s, status: "pending", message: "Waiting" },
+      ),
+    );
+    await sleep(delay);
   }
-  const [state, setState] = useState<EngineState>(emptyState);
+  opts.onStep(final);
+}
+
+/** Bookings, audit log and notifications live in Postgres; this provider reads/writes them via the API. */
+export function BookingProvider({ children }: { children: React.ReactNode }) {
+  const [state, setState] = useState<BookingStore["state"]>(emptyState);
+  const [me, setMe] = useState<Me | null>(null);
   const [hydrated, setHydrated] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const router = useRouter();
+
+  const refresh = useCallback(async () => {
+    try {
+      const res = await fetch("/api/state", { cache: "no-store" });
+      if (res.status === 401) {
+        router.push("/sign-in");
+        return;
+      }
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+      setState(data.state);
+      setMe({ user: data.user, role: data.role, org: data.org, today: data.today, services: data.services, integrations: data.integrations });
+      setError(null);
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setHydrated(true);
+    }
+  }, [router]);
 
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        engineRef.current = new BookingEngine(JSON.parse(raw) as EngineState);
-        setState(engineRef.current.snapshot());
-      }
-    } catch {
-      /* ignore corrupt storage */
-    }
-    setHydrated(true);
-  }, []);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial load from the API
+    void refresh();
+  }, [refresh]);
 
-  const sync = useCallback(() => {
-    const snap = engineRef.current!.snapshot();
-    setState(snap);
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(snap));
-    } catch {
-      /* storage full / disabled */
-    }
-  }, []);
+  const run = useCallback(
+    async (body: Record<string, unknown>, opts?: ClientRunOptions): Promise<PipelineResult> => {
+      opts?.onStep?.(
+        (["IntentAgent", "BookingAgent", "AvailabilityAgent", "CalendarAgent", "NotificationAgent", "AuditAgent"] as PipelineAgent[]).map((agent, i) => ({
+          agent,
+          status: i === 0 ? "running" : "pending",
+          message: i === 0 ? "Running on FLOWOPS Core…" : "Waiting",
+          simulated: false,
+          durationMs: 0,
+        })),
+      );
+      let result: PipelineResult;
+      try {
+        const res = await fetch("/api/bookings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...body, ...(opts?.failAgent ? { failAgent: opts.failAgent } : {}) }),
+        });
+        const data = await res.json();
+        if (!res.ok || !Array.isArray(data.steps)) throw new Error(data.error ?? `HTTP ${res.status}`);
+        result = data;
+      } catch (e) {
+        result = {
+          action: body.action as PipelineResult["action"],
+          ok: false,
+          verified: false,
+          outcome: "invalid",
+          booking: null,
+          steps: [],
+          error: String(e instanceof Error ? e.message : e),
+        };
+      }
+      await replay(result.steps, opts);
+      await refresh();
+      return result;
+    },
+    [refresh],
+  );
 
   const value = useMemo<BookingStore>(
     () => ({
       state,
+      me,
       hydrated,
-      create: async (req, opts) => {
-        const r = await engineRef.current!.create(req, opts);
-        sync();
-        return r;
-      },
-      reschedule: async (id, date, time, opts) => {
-        const r = await engineRef.current!.reschedule(id, date, time, opts);
-        sync();
-        return r;
-      },
-      cancel: async (id, opts) => {
-        const r = await engineRef.current!.cancel(id, opts);
-        sync();
-        return r;
-      },
-      reset: () => {
-        engineRef.current!.reset();
-        sync();
-      },
+      error,
+      refresh,
+      create: (req, opts) => run({ action: "create", req }, opts),
+      reschedule: (bookingId, date, time, opts) => run({ action: "reschedule", bookingId, date, time }, opts),
+      cancel: (bookingId, opts) => run({ action: "cancel", bookingId }, opts),
     }),
-    [state, hydrated, sync],
+    [state, me, hydrated, error, refresh, run],
   );
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

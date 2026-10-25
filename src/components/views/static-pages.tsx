@@ -1,13 +1,11 @@
-import { Cpu, GitBranch, Lock, Plug, Server, ShieldAlert, Users, Workflow } from "lucide-react";
+import { Cpu, GitBranch, Lock, Plug, Server, ShieldAlert, Workflow } from "lucide-react";
 import { INTEGRATIONS } from "@/lib/data/integrations";
 import { MODULES, ROADMAP } from "@/lib/data/platform";
 import {
   SAMPLE_ALERTS,
   SAMPLE_DEVICES,
   SAMPLE_POLICIES,
-  SAMPLE_TENANTS,
   SAMPLE_TRAFFIC,
-  SAMPLE_USERS,
   SAMPLE_VPN,
   SAMPLE_WORKFLOWS,
 } from "@/lib/data/sample";
@@ -237,42 +235,11 @@ const TIERS = [
   { name: "MSP Edition", for: "Managed service providers", features: ["Multi-tenant console", "Per-tenant billing", "White-label"] },
 ];
 
-export function Administration() {
+/** Plans + roadmap (sample / planning content) shown under the real Administration settings. */
+export function AdminPlans() {
   return (
-    <div>
-      <PageHeader kicker="FLOWOPS Core" title="Administration" description="Users, permissions and tenants. Authentication is not implemented in v1 — everything below is a sample of the planned model.">
-        <SampleBadge />
-      </PageHeader>
+    <div className="mt-5">
       <div className="grid gap-5 xl:grid-cols-3">
-        <Card className="xl:col-span-2" title="Users" subtitle="Sample — no auth yet">
-          <Table head={["Name", "Email", "Role", "Tenant"]}>
-            {SAMPLE_USERS.map((u) => (
-              <tr key={u.name}>
-                <Td>
-                  <span className="flex items-center gap-2 text-slate-100">
-                    <Users className="h-3.5 w-3.5 text-slate-500" />
-                    {u.name}
-                  </span>
-                </Td>
-                <Td className="font-mono text-xs text-slate-500">{u.email}</Td>
-                <Td className="text-xs">{u.role}</Td>
-                <Td className="text-xs">{u.tenant}</Td>
-              </tr>
-            ))}
-          </Table>
-        </Card>
-        <Card title="Tenants" subtitle="Sample">
-          <ul className="space-y-2">
-            {SAMPLE_TENANTS.map((t) => (
-              <li key={t.name} className="flex items-center justify-between rounded-lg border border-white/[0.05] px-3 py-2 text-sm">
-                <span className="text-slate-200">{t.name}</span>
-                <span className="text-xs text-slate-500">
-                  {t.plan} · {t.seats} seats
-                </span>
-              </li>
-            ))}
-          </ul>
-        </Card>
         <Card className="xl:col-span-3" title="Plans" subtitle="Usage + seat hybrid pricing (from the business plan; prices not set)">
           <div className="grid gap-3 md:grid-cols-4">
             {TIERS.map((t) => (
