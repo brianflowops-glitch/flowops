@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
 import { CalendarCheck, CheckCircle2 } from "lucide-react";
 import { clsx } from "./clsx";
+import { SMS_CONSENT_TEXT, toE164 } from "@/lib/phone";
 
 type Info = {
   org: { slug: string; name: string; timeZone: string; hours: Record<string, { open: string; close: string } | null> };
@@ -89,6 +90,11 @@ export function PublicBooking() {
     setBusy(true);
     setError(null);
     const f = new FormData(e.currentTarget);
+    const smsConsent = f.get("smsConsent") === "on";
+    if (smsConsent && !toE164(String(f.get("phone") ?? ""))) {
+      setBusy(false);
+      return setError("To get text updates, enter a valid US mobile number (e.g. 610-555-1234), or untick the text box.");
+    }
     const res = await fetch(`/api/public/${encodeURIComponent(orgSlug)}/book`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -99,6 +105,7 @@ export function PublicBooking() {
         name: f.get("name"),
         email: f.get("email"),
         phone: f.get("phone"),
+        smsConsent,
         notes: f.get("notes") || undefined,
         website: f.get("website"),
       }),
@@ -230,6 +237,10 @@ export function PublicBooking() {
               <input name="email" type="email" required placeholder="Email" autoComplete="email" className={inputCls} />
               <input name="phone" type="tel" placeholder="Phone (optional)" autoComplete="tel" className={inputCls} />
             </div>
+            <label className="flex items-start gap-2 text-xs leading-relaxed text-slate-400">
+              <input name="smsConsent" type="checkbox" defaultChecked={false} className="mt-0.5 h-4 w-4 shrink-0 accent-cyan-400" />
+              <span>{SMS_CONSENT_TEXT}</span>
+            </label>
             <textarea name="notes" rows={2} placeholder="Anything we should know? (optional)" className={inputCls} />
             <input name="website" tabIndex={-1} autoComplete="off" className="hidden" aria-hidden />
           </section>

@@ -2,6 +2,7 @@ import { and, eq, gte, sql } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
 import { orgBySlug } from "@/lib/server/public-org";
 import { runPipeline } from "@/lib/server/pipeline";
+import { toE164 } from "@/lib/phone";
 import { badRequest, publicBook, readJson } from "@/lib/server/validation";
 import { clientIp, rateLimit, tooManyRequests } from "@/lib/server/rate-limit";
 
@@ -19,6 +20,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ slug: s
   if (!parsed.success) return badRequest(parsed.error);
   const p = parsed.data;
   if (p.website) return badRequest("Rejected");
+  if (p.smsConsent && !toE164(p.phone)) return badRequest("To get text updates, enter a valid US mobile number (e.g. 610-555-1234).");
   const db = getDb();
   const [svc] = await db
     .select()
@@ -49,6 +51,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ slug: s
         customer: p.name,
         email: p.email,
         ...(p.phone ? { phone: p.phone } : {}),
+        ...(p.smsConsent && p.phone ? { smsConsent: true } : {}),
         category: svc.category,
         service: svc.name,
         resource: svc.resource,

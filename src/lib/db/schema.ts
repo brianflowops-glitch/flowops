@@ -191,6 +191,9 @@ export const booking = pgTable(
     customer: text("customer").notNull(),
     email: text("email").notNull(),
     phone: text("phone"),
+    /** Customer opted in to appointment texts (A2P 10DLC consent record). */
+    smsConsent: boolean("sms_consent").notNull().default(false),
+    smsConsentAt: timestamp("sms_consent_at", { withTimezone: true }),
     category: text("category", { enum: ["appointment", "travel", "restaurant", "workforce"] }).notNull(),
     service: text("service").notNull(),
     resource: text("resource").notNull(),

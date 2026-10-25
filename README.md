@@ -1,4 +1,4 @@
-# FLOWOPS — Unified Operations Intelligence Platform (v2.2 beta)
+# FLOWOPS — Unified Operations Intelligence Platform (v2.3 beta)
 
 FLOWOPS is an ops dashboard built around the **FLOWOPS Agent Matrix** (FLOWOPS Core, FlowNet, FlowSec, FlowBiz, FlowAI, FlowConnect, FlowPulse). v2 adds a real backend: accounts, a Postgres database, per-business data, a public booking page and FlowAI tools that act on bookings.
 
@@ -12,7 +12,7 @@ FLOWOPS is an ops dashboard built around the **FLOWOPS Agent Matrix** (FLOWOPS C
 | **Team invite** (`/invite/<token>`) | Invitee creates an account (or, if signed in with the invited email, joins) with the invited role |
 | **Command Center** | **Getting-started checklist** for Owners of new workspaces (business name & hours, services, share booking link, connect Google Calendar, invite team) — auto-detected where possible, hides when all done or dismissed (remembered per workspace in the browser). Live booking stats for your org, sample ops KPIs (labelled), schedule and module status |
 | **Booking Center** | **Working feature.** Pipeline Intent → Booking → Availability → Calendar → Notification → Audit → VERIFIED, saved in Postgres per org. Create / reschedule / cancel, conflicts, fault injection, audit log (with actor), notifications outbox |
-| **Public booking page** (`/book/<org-slug>`) | Customers (no account) pick a service, date and open time, enter name/email/phone. Same pipeline + conflict checks; shows up in the dashboard with source "public" |
+| **Public booking page** (`/book/<org-slug>`) | Customers (no account) pick a service, date and open time, enter name/email/phone and an **unchecked SMS opt-in** ("Text me about this appointment. Msg & data rates may apply. Reply STOP to opt out."). Same pipeline + conflict checks; shows up in the dashboard with source "public" |
 | **Administration** | Owner: business name, booking-page slug and on/off, opening hours, services (duration, resource), integrations (Google Calendar connect). Owner + Admin: **Team** — invite by email with a role, list / resend / revoke invites, one-time password-reset links, remove members |
 | **Testing Lab** | Simulation tests FL-001 … FL-007 against the pipeline in the browser |
 | **FlowAI Assistant** (slide-out) | Vercel AI Gateway (AI SDK v6). Tools: list services, list bookings, check availability, create, reschedule, cancel (cancel asks you to confirm in the panel). Every tool action runs through the same pipeline and is audited as `flowai:<email>` |
@@ -61,7 +61,16 @@ FlowAI turns AI Gateway errors into friendly messages (`src/lib/server/ai-errors
 
 - **Real:** accounts/sessions, organizations, bookings, audit log, notifications outbox, services and hours — all in Postgres, isolated per org. Pipeline runs are transactional (row-locked per org); if any agent fails nothing is saved and the failure is audited (FL-006).
 - **Calendar Agent** — real Google Calendar once `GOOGLE_CLIENT_ID/SECRET` are set **and** the Owner connects a calendar; otherwise **simulated** (`SIMCAL-…` IDs, labelled).
-- **Notification Agent** — real email via Resend when `RESEND_API_KEY` (+ `RESEND_FROM_EMAIL`) is set, real SMS via Twilio when `TWILIO_*` is set; otherwise **simulated** ("email (simulated)", nothing sent).
+- **Notification Agent** — real email via Resend when `RESEND_API_KEY` (+ `RESEND_FROM_EMAIL`) is set, real SMS via Twilio when `TWILIO_ACCOUNT_SID` + `TWILIO_AUTH_TOKEN` + `TWILIO_FROM_NUMBER` (or `TWILIO_MESSAGING_SERVICE_SID`) are set; otherwise **simulated** ("email (simulated)", nothing sent).
+
+### SMS (Twilio, v2.3)
+
+- Texts go out for **create / reschedule / cancel** only when the booking has a phone **and** `sms_consent = true` (public form checkbox, the staff "Customer agreed to get texts" box, or FlowAI's `smsConsent` when the user says the customer agreed). Consent + time are stored on the booking (`booking.sms_consent`, `booking.sms_consent_at`, migration `0002_booking_sms_consent`, additive) as the A2P 10DLC opt-in record.
+- Phones are normalized to E.164 (`src/lib/phone.ts`, US-first: 10 digits → `+1…`, `1`+10 → `+1…`, explicit `+cc` kept). Opt-in with an invalid number is rejected; without opt-in the number is stored as entered if it can't be normalized.
+- Message: `<Business>: Booking confirmed: … Ref BK-…. Reply STOP to opt out.` Twilio handles STOP/HELP on the number itself.
+- Failures never block the booking: the notification is recorded as `failed` with the Twilio code (e.g. 21608 trial/unverified, 21610 opted out) and logged as `[twilio] sms BK-… to •••1234 failed — …` (masked number, no secrets).
+- Administration → Integrations shows SMS as **configured** (full account + number), **trial** (trial account — texts only reach verified numbers), **needs number** (credentials set, no `TWILIO_FROM_NUMBER`), **not set**, or **error** (account check failed). The account type comes from a read-only Twilio Accounts API call cached 10 min.
+- Production (Oct 25, 2026): `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` (sensitive) set for Production; trial account, **no number yet** → status "needs number", SMS still simulated. To go live: `vercel env add TWILIO_FROM_NUMBER production` (E.164, e.g. `+16105550100`) and redeploy. Before texting real customers: upgrade the account and complete A2P 10DLC registration (the opt-in checkbox + `/privacy` SMS section are the evidence).
 - **Account emails** (verification, password reset, invites) — real via Resend when configured; otherwise simulated: nothing is sent and links are only shown to Owners/Admins in Team.
 - Network, Security, Automation and the "Operations" KPIs are **sample data**, labelled.
 
@@ -72,7 +81,7 @@ npm install
 cp .env.example .env.development.local   # fill DATABASE_URL, BETTER_AUTH_SECRET, BETTER_AUTH_URL
 npm run db:migrate:local   # applies drizzle/ migrations + seeds demo org "flowops-demo"
 npm run dev                # http://localhost:3000 → sign up first to become Owner
-npm test                   # FL-001 … FL-007 simulation suite in Node
+npm test                   # FL-001 … FL-008 simulation suite in Node
 npm run lint && npm run build
 ```
 
@@ -85,7 +94,7 @@ FlowAI locally: `vercel env pull` (short-lived `VERCEL_OIDC_TOKEN`) or `AI_GATEW
 1. Database: add **Neon** from the Vercel Marketplace (free plan) to project `flowops` — it injects `DATABASE_URL`.
 2. Env vars (Production): `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL=https://flowopsagent.ai`, `FLOWOPS_OWNER_EMAILS`. Optional: integration vars and `REQUIRE_EMAIL_VERIFICATION` from `.env.example`.
    - **Email is live in production** (Oct 25, 2026): `RESEND_API_KEY` (sensitive) and `RESEND_FROM_EMAIL=FlowOps <notifications@flowopsagent.ai>` are set for Production only; the `flowopsagent.ai` domain is verified in Resend (DNS records in Cloudflare). Verification, password-reset, invite and booking emails send for real. `REQUIRE_EMAIL_VERIFICATION` is still off.
-3. Migrate: `vercel env pull .env.production.local --environment production` then `npx dotenv -e .env.production.local -- npm run db:migrate` (delete the file afterwards). Neon URLs migrate over Neon's serverless driver (port 443), so this works where port 5432 is blocked. Migrations are additive (`0001_team_invites` adds the `team_invite` table only).
+3. Migrate: `vercel env pull .env.production.local --environment production` then `npx dotenv -e .env.production.local -- npm run db:migrate` (delete the file afterwards). Neon URLs migrate over Neon's serverless driver (port 443), so this works where port 5432 is blocked. Migrations are additive (`0001_team_invites` adds the `team_invite` table only; `0002_booking_sms_consent` adds two booking columns).
 4. Deploy: `npx vercel deploy --prod --yes --scope flowopsagent`.
 5. Domain `flowopsagent.ai` is already attached.
 
@@ -149,7 +158,7 @@ Next platform work:
 - [x] **Backend API** with per-org data (v2)
 - [x] **Authentication, roles and tenants** (v2)
 - [~] **Google Calendar** — code ready; needs OAuth client credentials
-- [~] Real **Notification Agent** — Resend/Twilio code ready; needs API keys
+- [~] Real **Notification Agent** — Resend email live; Twilio SMS wired with opt-in (v2.3), waiting on a sending number + A2P 10DLC
 - [x] Email verification, password reset and token team invites (v2.1 — emails go out once Resend is configured)
 - [x] Public landing page, draft Terms/Privacy, onboarding checklist, rate limits (v2.2)
 - [ ] Lawyer review of Terms/Privacy; Google OAuth verification (homepage `/`, privacy `/privacy`)

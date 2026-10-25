@@ -34,7 +34,10 @@ export interface Me {
   team?: { members: number; invites: number };
   today: { date: string; time: string };
   services: ServiceRow[];
-  integrations: { googleCalendar: boolean; resendEmail: boolean; resendFrom: boolean; twilioSms: boolean; emailVerificationRequired: boolean };
+  integrations: {
+    smsMode: "live" | "trial" | "needs_number" | "not_set" | "error";
+    smsFrom: string | null;
+    googleCalendar: boolean; resendEmail: boolean; resendFrom: boolean; twilioSms: boolean; emailVerificationRequired: boolean };
 }
 
 export interface ClientRunOptions {

@@ -94,7 +94,7 @@ export function BookingCenter() {
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     const r = await exec((o) => create(form, o));
-    if (r.ok) setForm((f) => ({ ...f, customer: "", email: "", phone: "", notes: "" }));
+    if (r.ok) setForm((f) => ({ ...f, customer: "", email: "", phone: "", smsConsent: false, notes: "" }));
   }
 
   async function seedDemo() {
@@ -151,6 +151,12 @@ export function BookingCenter() {
             <Field label="Phone (optional — SMS)">
               <input className={inputCls} value={form.phone ?? ""} onChange={(e) => set("phone", e.target.value)} placeholder="+1 555 123 4567" />
             </Field>
+            {!!form.phone?.trim() && (
+              <label className="flex items-start gap-2 text-xs text-slate-400">
+                <input type="checkbox" checked={!!form.smsConsent} onChange={(e) => set("smsConsent", e.target.checked)} className="mt-0.5 h-4 w-4 accent-cyan-400" />
+                <span>Customer agreed to get texts about this appointment (they can reply STOP to opt out). Leave unticked unless they said yes.</span>
+              </label>
+            )}
             <Field label="Service">
               <select className={inputCls} value={custom ? CUSTOM : serviceId} onChange={(e) => pickService(e.target.value)}>
                 {services.map((s) => (
@@ -307,7 +313,12 @@ export function BookingCenter() {
                   <Td>
                     <div className="text-slate-100">{b.customer}</div>
                     <div className="text-xs text-slate-500">{b.email}</div>
-                    {b.phone && <div className="text-xs text-slate-500">{b.phone}</div>}
+                    {b.phone && (
+                      <div className="text-xs text-slate-500">
+                        {b.phone}
+                        {b.smsConsent ? " · texts OK" : ""}
+                      </div>
+                    )}
                   </Td>
                   <Td>
                     {b.service}

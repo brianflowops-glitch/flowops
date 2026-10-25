@@ -490,13 +490,27 @@ function IntegrationsCard({ owner, onSaved }: { owner: boolean; onSaved: () => P
           i.resendFrom ? "Confirmation emails are sent for real." : "Live, but RESEND_FROM_EMAIL isn't set — using Resend's test sender (only delivers to your Resend account email).",
           "Not configured: needs RESEND_API_KEY (+ RESEND_FROM_EMAIL on a verified domain). Emails are logged as simulated.",
         )}
-        {row(
-          <MessageSquare className="h-4 w-4 text-cyan-300" />,
-          "SMS (Twilio)",
-          i.twilioSms,
-          "Text confirmations are sent when the customer gives a phone number.",
-          "Not configured: needs TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER. SMS is logged as simulated.",
-        )}
+        <li className="rounded-lg border border-white/[0.05] px-3 py-2.5">
+          <div className="flex items-center gap-2 text-sm text-slate-100">
+            <MessageSquare className="h-4 w-4 text-cyan-300" /> SMS (Twilio)
+            <span className="ml-auto">
+              <Pill status={i.smsMode === "live" ? "verified" : i.smsMode === "error" ? "failed" : i.smsMode === "not_set" ? "simulated" : "monitor"}>
+                {{ live: "configured", trial: "trial", needs_number: "needs number", not_set: "not set", error: "error" }[i.smsMode ?? (i.twilioSms ? "live" : "not_set")]}
+              </Pill>
+            </span>
+          </div>
+          <p className="mt-1 text-xs text-slate-500">
+            {i.smsMode === "live"
+              ? `Live from ${i.smsFrom ?? "your Messaging Service"}. Texts go out only when a customer gives a phone number and ticks the text opt-in.`
+              : i.smsMode === "trial"
+                ? `Trial account, sending from ${i.smsFrom ?? "your Messaging Service"}: texts only reach phone numbers verified in Twilio, and start with "Sent from your Twilio trial account". Upgrade and register for A2P 10DLC before texting real customers.`
+                : i.smsMode === "needs_number"
+                  ? "Twilio account connected, but there's no sending number yet: set TWILIO_FROM_NUMBER (or TWILIO_MESSAGING_SERVICE_SID). SMS is logged as simulated."
+                  : i.smsMode === "error"
+                    ? "Twilio credentials are set but the account check failed (wrong SID/token or account suspended). SMS is logged as simulated until fixed."
+                    : "Not configured: needs TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER. SMS is logged as simulated."}
+          </p>
+        </li>
       </ul>
       <div className="mt-2">
         <Msg m={m} />

@@ -9,6 +9,7 @@ export const bookingRequest = z.object({
   customer: z.string().trim().min(1).max(120),
   email: z.string().trim().max(200),
   phone: z.string().trim().max(40).optional(),
+  smsConsent: z.boolean().optional(),
   category: CATEGORY,
   service: z.string().trim().min(1).max(120),
   resource: z.string().trim().min(1).max(120),
@@ -68,6 +69,7 @@ export const publicBook = z.object({
   name: z.string().trim().min(1).max(120),
   email: z.string().trim().email().max(200),
   phone: z.string().trim().max(40).optional().or(z.literal("")),
+  smsConsent: z.boolean().optional(),
   notes: z.string().trim().max(500).optional(),
   website: z.string().optional(), // honeypot
 });

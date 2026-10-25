@@ -20,7 +20,7 @@ async function teamCounts(orgId: string) {
 export async function GET(req: Request) {
   const ctx = await requireApi(req);
   if (ctx instanceof Response) return ctx;
-  const [state, services, team] = await Promise.all([loadState(ctx.org.id), listServices(ctx.org.id), teamCounts(ctx.org.id)]);
+  const [state, services, team, integrations] = await Promise.all([loadState(ctx.org.id), listServices(ctx.org.id), teamCounts(ctx.org.id), integrationStatus()]);
   return Response.json(
     {
       user: ctx.user,
@@ -30,7 +30,7 @@ export async function GET(req: Request) {
       state,
       services,
       team,
-      integrations: integrationStatus(),
+      integrations,
     },
     { headers: { "Cache-Control": "no-store" } },
   );

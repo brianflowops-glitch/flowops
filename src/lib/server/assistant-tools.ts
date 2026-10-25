@@ -104,6 +104,10 @@ export function assistantTools(ctx: OrgContext) {
         customer: z.string().min(1),
         email: z.string().describe("Customer email"),
         phone: z.string().optional(),
+        smsConsent: z
+          .boolean()
+          .optional()
+          .describe("Set true ONLY if the user says the customer explicitly agreed to receive appointment texts. Otherwise omit; no texts are sent."),
         service: z.string().describe("Service name (see listServices)"),
         date,
         time,
@@ -120,6 +124,7 @@ export function assistantTools(ctx: OrgContext) {
               customer: i.customer,
               email: i.email,
               ...(i.phone ? { phone: i.phone } : {}),
+              ...(i.phone && i.smsConsent ? { smsConsent: true } : {}),
               category: svc.category,
               service: svc.name,
               resource: svc.resource,

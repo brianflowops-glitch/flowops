@@ -1,5 +1,6 @@
 // Applies Drizzle migrations in ./drizzle and seeds the demo org (idempotent).
 //   npm run db:migrate            (reads DATABASE_URL; use dotenv: `npx dotenv -e .env.development.local -- npm run db:migrate`)
+//   MIGRATE_ONLY=1 skips the demo seed (use on production).
 // Neon URLs use Neon's serverless driver (WebSocket over 443), which also works where port 5432 is blocked.
 import { Pool as PgPool } from "pg";
 import { Pool as NeonPool, neonConfig } from "@neondatabase/serverless";
@@ -32,6 +33,11 @@ import { DEMO_ORG_ID, DEMO_ORG_SLUG, DEMO_SERVICES, defaultHours } from "../src/
     await migratePg(db, { migrationsFolder: "./drizzle" });
   }
   console.log("migrations applied");
+  if (process.env.MIGRATE_ONLY === "1") {
+    // Schema only — never re-seed demo rows into a live database.
+    await pool.end();
+    return;
+  }
 
   await db
     .insert(schema.organization)

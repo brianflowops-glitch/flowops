@@ -27,6 +27,7 @@ import type {
   PipelineResult,
   RunOptions,
 } from "./types";
+import { toE164 } from "../phone";
 
 export const PIPELINE: PipelineAgent[] = [
   "IntentAgent",
@@ -255,6 +256,8 @@ export class BookingEngine {
           if (missing.length) throw new AgentError("IntentAgent", `Missing fields: ${missing.join(", ")}`, "invalid");
           if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(r.email))
             throw new AgentError("IntentAgent", "Recipient email is not valid", "invalid");
+          if (r.smsConsent && !toE164(r.phone))
+            throw new AgentError("IntentAgent", "To get text updates, enter a valid US mobile number (e.g. 610-555-1234)", "invalid");
           const err = validateSlot(r.date, r.time, r.durationMin, now, opts);
           if (err) throw new AgentError("IntentAgent", err, "invalid");
           return { message: `Intent: create_booking (${r.category})`, output: { intent: "create_booking", category: r.category } };
@@ -279,7 +282,9 @@ export class BookingEngine {
             ...r,
             customer: r.customer.trim(),
             email: r.email.trim(),
-            ...(r.phone?.trim() ? { phone: r.phone.trim() } : {}),
+            ...(r.phone?.trim() ? { phone: toE164(r.phone) ?? r.phone.trim() } : {}),
+            smsConsent: !!(r.smsConsent && toE164(r.phone)),
+            ...(r.smsConsent && toE164(r.phone) ? { smsConsentAt: ts } : {}),
             id: shortId("BK"),
             status: "confirmed",
             calendarEventId: null,
@@ -365,7 +370,9 @@ export class BookingEngine {
               : `Booking cancelled: ${b.service} on ${b.date}`;
         const body = `Hi ${b.customer},\n\n${subject}.\nReference: ${b.id}${b.resource ? ` · ${b.resource}` : ""}\n\n— Sent by FLOWOPS`;
         const sent: string[] = [];
-        const channels: ("email" | "sms")[] = b.phone ? ["email", "sms"] : ["email"];
+        // SMS only with an explicit opt-in and a dialable number; otherwise email only.
+        const textable = !!(b.phone && b.smsConsent && toE164(b.phone));
+        const channels: ("email" | "sms")[] = textable ? ["email", "sms"] : ["email"];
         for (const ch of channels) {
           const real = !!notifier?.channels[ch];
           const rec: NotificationRecord = {
@@ -387,6 +394,7 @@ export class BookingEngine {
           }
           draft.notifications.unshift(rec);
         }
+        if (b.phone && !textable) sent.push(b.smsConsent ? "SMS skipped — phone number isn't textable" : "SMS skipped — customer didn't opt in to texts");
         return { message: sent.join(" · "), output: { channels } };
       });
 

@@ -1,10 +1,11 @@
 /**
- * FLOWOPS simulation test suite FL-001 … FL-007 (Testing strategy C, phase 1:
+ * FLOWOPS simulation test suite FL-001 … FL-008 (Testing strategy C, phase 1:
  * simulation first). Each test runs against a fresh, isolated BookingEngine so
  * it never touches the user's bookings.
  */
 import { BookingEngine } from "./engine";
-import type { BookingRequest } from "./types";
+import type { BookingRequest, NotifierAdapter } from "./types";
+import { toE164 } from "../phone";
 
 export interface Assertion {
   label: string;
@@ -186,6 +187,38 @@ export const TEST_CASES: TestCase[] = [
         check("Conflict rejection also audited", s.audit.some((x) => x.outcome === "conflict")),
         check("Entries are timestamped", s.audit.every((x) => !Number.isNaN(Date.parse(x.at)))),
         check("Booking carries its own history (3 events)", b?.history.length === 3, `${b?.history.length}`),
+      ];
+    },
+  },
+  {
+    id: "FL-008",
+    name: "SMS opt-in and phone normalization",
+    description: "Texts go out only with a phone AND opt-in (create, reschedule, cancel); US numbers become E.164; a failed text never blocks the booking.",
+    run: async () => {
+      const texts: { to: string; subject: string }[] = [];
+      let failSms = false;
+      const notifier: NotifierAdapter = {
+        channels: { email: false, sms: true },
+        async send(b, subject, _body, ch) {
+          if (ch === "sms") texts.push({ to: b.phone!, subject });
+          return ch === "sms" && failSms ? { ok: false, detail: "Twilio 400 code 21608" } : { ok: true };
+        },
+      };
+      const e = new BookingEngine();
+      const noConsent = await e.create(req({ phone: "(610) 555-0134" }), { notifier });
+      const yes = await e.create(req({ customer: "Opted In", time: "13:00", phone: "610.555.0199", smsConsent: true }), { notifier });
+      await e.reschedule(yes.booking!.id, futureDate(4), "11:00", { notifier });
+      failSms = true;
+      const cancelled = await e.cancel(yes.booking!.id, { notifier });
+      const bad = await e.create(req({ customer: "Bad Phone", time: "15:00", phone: "12345", smsConsent: true }), { notifier });
+      return [
+        check("No text without opt-in", texts.every((t) => t.to !== noConsent.booking?.phone) && noConsent.ok),
+        check("Phone stored as E.164", yes.booking?.phone === "+16105550199" && noConsent.booking?.phone === "+16105550134", `${yes.booking?.phone}, ${noConsent.booking?.phone}`),
+        check("Consent recorded with timestamp", !!yes.booking?.smsConsent && !!yes.booking?.smsConsentAt),
+        check("Texts for confirm, reschedule and cancel", texts.length === 3 && /confirmed/.test(texts[0].subject) && /rescheduled/.test(texts[1].subject) && /cancelled/.test(texts[2].subject), texts.map((t) => t.subject.split(":")[0]).join(", ")),
+        check("Failed text doesn't block the cancel", cancelled.ok && e.snapshot().notifications.some((n) => n.channel === "sms" && n.deliveryStatus === "failed")),
+        check("Opt-in with an invalid number is rejected", !bad.ok && bad.outcome === "invalid", bad.error),
+        check("E.164 helper", toE164("610-555-0134") === "+16105550134" && toE164("+1 610 555 0134") === "+16105550134" && toE164("1 (610) 555-0134") === "+16105550134" && toE164("555-0134") === null && toE164("+44 20 7946 0958") === "+442079460958"),
       ];
     },
   },

@@ -31,7 +31,15 @@ export default function PrivacyPage() {
       <p>
         <strong className="text-white">Bookings and end-customer contact information.</strong> For each booking: the end customer&apos;s name, email address, optional
         phone number, optional notes, the service, date and time, and its status. Bookings can be made by end customers on a public booking page, by workspace users
-        in the dashboard, or by FlowAI on a user&apos;s request.
+        in the dashboard, or by FlowAI on a user&apos;s request. If the customer opts in to text messages, we also store that choice and when it was made.
+      </p>
+      <p>
+        <strong className="text-white">Text messages (SMS).</strong> Appointment texts (confirmations, reschedules and cancellations) are sent only when the end
+        customer gives a mobile number <em>and</em> ticks the opt-in box on the booking form (&ldquo;Text me about this appointment. Msg &amp; data rates may apply.
+        Reply STOP to opt out.&rdquo;), or tells the business they agree. The box is never pre-ticked and texting is not required to book. Message frequency
+        depends on your bookings. Reply <strong className="text-white">STOP</strong> to any text to opt out (you&apos;ll get one confirmation and no further texts)
+        or <strong className="text-white">HELP</strong> for help. Message and data rates may apply. Mobile numbers and SMS opt-in information are never sold or shared
+        with third parties or affiliates for marketing or promotional purposes; they are shared only with our SMS provider (Twilio) to deliver the messages.
       </p>
       <p>
         <strong className="text-white">Activity and audit records.</strong> A log of booking actions (created, rescheduled, cancelled, conflicts, failures) with the
@@ -104,7 +112,7 @@ export default function PrivacyPage() {
         <li><strong className="text-white">Resend</strong> — delivers our emails (verification, password reset, invites and booking notifications).</li>
         <li><strong className="text-white">Google</strong> — Google Calendar, only for workspaces that connect it.</li>
         <li><strong className="text-white">AI model providers</strong> (currently OpenAI, via Vercel AI Gateway) — generate FlowAI replies.</li>
-        <li><strong className="text-white">Twilio</strong> — if and when text-message notifications are turned on, to deliver SMS to the phone number on a booking.</li>
+        <li><strong className="text-white">Twilio</strong> — delivers appointment text messages to customers who opted in, and handles STOP/HELP replies.</li>
         <li><strong className="text-white">Cloudflare</strong> — DNS for our domain.</li>
       </UL>
       <p>We may also disclose information if required by law, to protect the rights and safety of users or the public, or as part of a merger or sale of the business.</p>

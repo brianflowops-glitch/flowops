@@ -22,6 +22,8 @@ export interface BookingRequest {
   notes?: string;
   /** Optional customer phone (used for SMS notifications when Twilio is configured). */
   phone?: string;
+  /** Customer opted in to appointment texts (public booking checkbox / staff-confirmed). SMS is only sent when true. */
+  smsConsent?: boolean;
 }
 
 export interface Booking extends BookingRequest {
@@ -31,6 +33,8 @@ export interface Booking extends BookingRequest {
   createdAt: string;
   updatedAt: string;
   history: { at: string; action: string; detail: string }[];
+  /** When the customer opted in to texts (ISO), kept as the consent record for carrier (A2P 10DLC) compliance. */
+  smsConsentAt?: string;
 }
 
 export type StepStatus = "pending" | "running" | "success" | "failed" | "skipped";
