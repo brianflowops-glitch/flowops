@@ -73,7 +73,21 @@ function createAuth() {
       },
     },
     session: { cookieCache: { enabled: true, maxAge: 5 * 60 } },
-    rateLimit: { enabled: true, storage: "database", window: 60, max: 60 },
+    // Per-IP limits stored in Postgres (works across serverless instances). Defaults already cap
+    // /sign-in/* and /sign-up/* at 3 per 10 s and reset/verification emails at 3 per minute;
+    // account creation is additionally capped at 5 per 10 minutes per IP.
+    rateLimit: {
+      enabled: true,
+      storage: "database",
+      window: 60,
+      max: 60,
+      customRules: {
+        "/sign-up/*": { window: 600, max: 5 },
+        "/sign-in/*": { window: 60, max: 10 },
+      },
+    },
+    // Vercel sets x-vercel-forwarded-for / x-real-ip to the real client IP.
+    advanced: { ipAddress: { ipAddressHeaders: ["x-vercel-forwarded-for", "x-real-ip", "x-forwarded-for"] } },
     trustedOrigins: trustedOrigins(),
     databaseHooks: {
       user: {

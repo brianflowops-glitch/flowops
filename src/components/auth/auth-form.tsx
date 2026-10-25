@@ -14,7 +14,7 @@ export function AuthCard({ title, subtitle, children }: { title: string; subtitl
     <div className="grid min-h-screen place-items-center bg-[#060a14] px-4 text-slate-200">
       <div className="pointer-events-none fixed inset-0 bg-[radial-gradient(ellipse_at_top_left,rgba(34,211,238,0.08),transparent_45%),radial-gradient(ellipse_at_bottom_right,rgba(139,92,246,0.08),transparent_45%)]" />
       <div className="relative w-full max-w-sm rounded-2xl border border-white/[0.08] bg-[#080e1c]/90 p-6 shadow-2xl">
-        <p className="font-mono text-sm font-bold tracking-[0.18em] text-white">FLOWOPS</p>
+        <Link href="/" className="font-mono text-sm font-bold tracking-[0.18em] text-white">FLOWOPS</Link>
         <h1 className="mt-3 text-xl font-semibold text-white">{title}</h1>
         {subtitle && <p className="mt-1 text-sm text-slate-400">{subtitle}</p>}
         {children}
@@ -153,6 +153,13 @@ export function AuthForm({ mode, invite }: { mode: "sign-in" | "sign-up"; invite
           </p>
         )}
         <ErrorNote text={error} />
+        {mode === "sign-up" && (
+          <p className="text-xs leading-5 text-slate-500">
+            By creating an account you agree to the{" "}
+            <Link href="/terms" className="text-cyan-300 hover:underline">Terms of Service</Link> and{" "}
+            <Link href="/privacy" className="text-cyan-300 hover:underline">Privacy Policy</Link>.
+          </p>
+        )}
         <button disabled={busy} className={primaryBtn}>
           {busy ? "Please wait…" : invite ? "Create account & join" : mode === "sign-up" ? "Create account" : "Sign in"}
         </button>

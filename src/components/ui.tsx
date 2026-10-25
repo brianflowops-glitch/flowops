@@ -1,8 +1,8 @@
 import { clsx } from "./clsx";
 
-export function Card({ className, children, title, action, subtitle }: { className?: string; children: React.ReactNode; title?: React.ReactNode; subtitle?: React.ReactNode; action?: React.ReactNode }) {
+export function Card({ id, className, children, title, action, subtitle }: { id?: string; className?: string; children: React.ReactNode; title?: React.ReactNode; subtitle?: React.ReactNode; action?: React.ReactNode }) {
   return (
-    <section className={clsx("min-w-0 rounded-xl border border-white/[0.07] bg-[#0d1424]/80 shadow-[0_0_0_1px_rgba(255,255,255,0.01)] backdrop-blur", className)}>
+    <section id={id} className={clsx("scroll-mt-20 min-w-0 rounded-xl border border-white/[0.07] bg-[#0d1424]/80 shadow-[0_0_0_1px_rgba(255,255,255,0.01)] backdrop-blur", className)}>
       {(title || action) && (
         <header className="flex items-start justify-between gap-3 border-b border-white/[0.06] px-4 py-3">
           <div>

@@ -74,7 +74,7 @@ function OrgCard({ owner, onSaved }: { owner: boolean; onSaved: () => Promise<vo
   const [m, setM] = useState<{ ok: boolean; text: string } | null>(null);
   const link = typeof window === "undefined" ? `/book/${me!.org.slug}` : `${window.location.origin}/book/${me!.org.slug}`;
   return (
-    <Card title="Organization" subtitle="Name, booking link and time zone">
+    <Card id="org" title="Organization" subtitle="Name, booking link and time zone">
       <div className="space-y-3">
         <label className="block space-y-1 text-xs text-slate-500">
           Business name
@@ -128,7 +128,7 @@ function HoursCard({ owner, onSaved }: { owner: boolean; onSaved: () => Promise<
   const [m, setM] = useState<{ ok: boolean; text: string } | null>(null);
   const setDay = (d: string, v: DayHours) => setH((x) => ({ ...x, [d]: v }));
   return (
-    <Card title="Business hours" subtitle={`Bookings outside these hours are rejected (${me!.org.timeZone})`}>
+    <Card id="hours" title="Business hours" subtitle={`Bookings outside these hours are rejected (${me!.org.timeZone})`}>
       <div className="space-y-1.5">
         {DAYS.map((name, i) => {
           const k = String(i) as keyof WeekHoursClient;
@@ -182,7 +182,7 @@ function ServicesCard({ owner, services, onSaved }: { owner: boolean; services: 
     }
   };
   return (
-    <Card className="xl:col-span-2" title="Services" subtitle="What customers can book. Each service books one resource (room, person, vehicle…) — two bookings can't overlap on the same resource.">
+    <Card id="services" className="xl:col-span-2" title="Services" subtitle="What customers can book. Each service books one resource (room, person, vehicle…) — two bookings can't overlap on the same resource.">
       <Table head={["Service", "Category", "Minutes", "Resource", "Online", ""]}>
         {services.map((s) => (
           <tr key={s.id}>
@@ -320,7 +320,7 @@ function TeamCard() {
     });
 
   return (
-    <Card title="Team" subtitle="Owner, Admins and Staff. Admins manage the team; only the Owner changes settings. Customers don't need accounts.">
+    <Card id="team" title="Team" subtitle="Owner, Admins and Staff. Admins manage the team; only the Owner changes settings. Customers don't need accounts.">
       <ul className="space-y-1.5">
         {team?.members.map((u) => (
           <li key={u.id} className="flex flex-wrap items-center gap-2 rounded-lg border border-white/[0.05] px-3 py-2 text-sm">
@@ -454,7 +454,7 @@ function IntegrationsCard({ owner, onSaved }: { owner: boolean; onSaved: () => P
     </li>
   );
   return (
-    <Card title="Integrations" subtitle="Each one turns on when its credentials are set on the server; until then the pipeline step stays simulated.">
+    <Card id="integrations" title="Integrations" subtitle="Each one turns on when its credentials are set on the server; until then the pipeline step stays simulated.">
       <ul className="space-y-2">
         {row(
           <CalendarDays className="h-4 w-4 text-cyan-300" />,

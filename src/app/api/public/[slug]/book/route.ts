@@ -3,9 +3,16 @@ import { getDb, schema } from "@/lib/db";
 import { orgBySlug } from "@/lib/server/public-org";
 import { runPipeline } from "@/lib/server/pipeline";
 import { badRequest, publicBook, readJson } from "@/lib/server/validation";
+import { clientIp, rateLimit, tooManyRequests } from "@/lib/server/rate-limit";
 
 export async function POST(req: Request, { params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
+  // Per-IP limits (before any other DB work): 8 booking attempts / 10 min per page, 20 / hour overall.
+  const ip = clientIp(req);
+  for (const [key, max, win] of [[`book:${slug}:${ip}`, 8, 600], [`book:*:${ip}`, 20, 3600]] as const) {
+    const rl = await rateLimit(key, max, win);
+    if (!rl.ok) return tooManyRequests("Too many booking attempts from your connection — please wait a few minutes and try again.", rl.retryAfter);
+  }
   const org = await orgBySlug(slug);
   if (!org) return Response.json({ error: "Booking page not found" }, { status: 404 });
   const parsed = publicBook.safeParse(await readJson(req));

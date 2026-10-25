@@ -29,7 +29,9 @@ export interface Me {
     isDemo: boolean;
     googleConnected: boolean;
     googleAccountEmail: string | null;
+    createdAt?: string;
   };
+  team?: { members: number; invites: number };
   today: { date: string; time: string };
   services: ServiceRow[];
   integrations: { googleCalendar: boolean; resendEmail: boolean; resendFrom: boolean; twilioSms: boolean; emailVerificationRequired: boolean };
@@ -88,7 +90,7 @@ export function BookingProvider({ children }: { children: React.ReactNode }) {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
       setState(data.state);
-      setMe({ user: data.user, role: data.role, org: data.org, today: data.today, services: data.services, integrations: data.integrations });
+      setMe({ user: data.user, role: data.role, org: data.org, today: data.today, services: data.services, team: data.team, integrations: data.integrations });
       setError(null);
     } catch (e) {
       setError(String(e instanceof Error ? e.message : e));

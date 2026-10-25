@@ -19,6 +19,17 @@ const TOOL_LABEL: Record<string, string> = {
   cancelBooking: "Cancel booking",
 };
 
+/** HTTP errors arrive as the raw JSON body; streamed errors are already friendly text. */
+function errorText(e: Error) {
+  const raw = e.message ?? "";
+  try {
+    const j = JSON.parse(raw) as { error?: string };
+    if (j?.error) return j.error;
+  } catch {}
+  if (/rate.?limit|too many requests|429/i.test(raw)) return "FlowAI is getting a lot of requests right now. Please wait about a minute and try again — nothing was changed.";
+  return raw || "FlowAI couldn't answer right now. Please try again.";
+}
+
 type ToolOut = { ok?: boolean; outcome?: string; error?: string; booking?: { id: string; date: string; time: string; service: string } | null };
 
 export function AssistantPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
@@ -163,7 +174,7 @@ export function AssistantPanel({ open, onClose }: { open: boolean; onClose: () =
             </div>
           ))}
           {chatStatus === "submitted" && <div className="w-16 animate-pulse rounded-xl bg-white/[0.04] px-3.5 py-2.5 text-sm text-slate-400">…</div>}
-          {error && <div className="rounded-lg border border-rose-400/30 bg-rose-400/[0.06] p-3 text-xs text-rose-200">FlowAI request failed: {error.message}</div>}
+          {error && <div role="alert" className="rounded-lg border border-amber-400/30 bg-amber-400/[0.06] p-3 text-xs text-amber-100">{errorText(error)}</div>}
         </div>
 
         <form

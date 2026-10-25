@@ -68,8 +68,12 @@ export function PublicBooking() {
     setSlots(null);
     setTime("");
     fetch(`/api/public/${encodeURIComponent(orgSlug)}/availability?serviceId=${encodeURIComponent(serviceId)}&date=${date}`, { cache: "no-store" })
-      .then((r) => r.json())
-      .then((d) => live && setSlots(d.slots ?? []))
+      .then(async (r) => ({ status: r.status, d: await r.json() }))
+      .then(({ status, d }) => {
+        if (!live) return;
+        if (status === 429) setError(d.error ?? "Too many requests — please wait a moment.");
+        setSlots(d.slots ?? []);
+      })
       .catch(() => live && setSlots([]));
     return () => {
       live = false;
@@ -104,6 +108,7 @@ export function PublicBooking() {
     if (d.ok && d.booking) setDone({ ...d.booking, notifications: d.notifications });
     else {
       setError(d.error ?? "Booking failed — please try again.");
+      if (res.status === 429) return; // rate limited: keep the chosen slot
       // refresh slots after a conflict
       setDate((x) => x);
       setSlots((s) => s?.filter((t) => t !== time) ?? null);

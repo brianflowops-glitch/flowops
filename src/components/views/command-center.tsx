@@ -9,6 +9,7 @@ import { SAMPLE_OPS_KPIS } from "@/lib/data/sample";
 import { Card, LiveBadge, PageHeader, Pill, SampleBadge, Stat } from "../ui";
 import { PipelineView, idleSteps } from "../pipeline";
 import { clsx } from "../clsx";
+import { OnboardingChecklist } from "./onboarding-checklist";
 
 const MODULE_STATUS: Record<ModuleKey, { status: string; label: string }> = {
   core: { status: "active", label: "prototype" },
@@ -45,6 +46,8 @@ export function CommandCenter() {
         title="Command Center"
         description="Unified Operations Intelligence Platform — one view across FLOWOPS Core, FlowNet, FlowSec, FlowBiz, FlowAI, FlowConnect and FlowPulse."
       />
+
+      <OnboardingChecklist />
 
       <div className="mb-2 flex items-center gap-2">
         <h2 className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Booking Engine</h2>

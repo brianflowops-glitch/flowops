@@ -2,9 +2,12 @@ import { and, eq } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
 import { orgBySlug } from "@/lib/server/public-org";
 import { availability } from "@/lib/server/pipeline";
+import { clientIp, rateLimit, tooManyRequests } from "@/lib/server/rate-limit";
 
 export async function GET(req: Request, { params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
+  const rl = await rateLimit(`avail:${clientIp(req)}`, 60, 60);
+  if (!rl.ok) return tooManyRequests("Too many requests — please wait a moment and try again.", rl.retryAfter);
   const org = await orgBySlug(slug);
   if (!org) return Response.json({ error: "Booking page not found" }, { status: 404 });
   const url = new URL(req.url);

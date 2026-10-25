@@ -4,6 +4,8 @@ import { convertToModelMessages, safeValidateUIMessages, stepCountIs, streamText
 import { requireApi } from "@/lib/server/context";
 import { assistantTools } from "@/lib/server/assistant-tools";
 import { listServices, orgToday } from "@/lib/server/pipeline";
+import { AI_MESSAGES, friendlyAiError } from "@/lib/server/ai-errors";
+import { rateLimit, tooManyRequests } from "@/lib/server/rate-limit";
 
 /**
  * FlowAI Assistant backend — Vercel AI Gateway via the AI SDK, with booking tools.
@@ -33,6 +35,11 @@ export async function POST(req: Request) {
   const { configured, model } = config();
   if (!configured) {
     return Response.json({ error: "The AI backend isn't connected. Run `vercel env pull` (OIDC) or set AI_GATEWAY_API_KEY." }, { status: 503 });
+  }
+  // Protect the shared AI Gateway quota: 6 FlowAI messages per minute per user, 40 per hour per workspace.
+  for (const [key, max, win] of [[`ai:user:${ctx.user.id}`, 6, 60], [`ai:org:${ctx.org.id}`, 40, 3600]] as const) {
+    const rl = await rateLimit(key, max, win);
+    if (!rl.ok) return tooManyRequests(win === 60 ? AI_MESSAGES.rate_limit : "FlowAI has hit this workspace's hourly limit. Please try again a bit later — your bookings are unaffected.", rl.retryAfter);
   }
   const body = (await req.json().catch(() => null)) as { messages?: unknown } | null;
   const tools = assistantTools(ctx);
@@ -69,9 +76,6 @@ Other FLOWOPS pages (Network, Security, Automation, Analytics samples) show samp
   });
   return result.toUIMessageStreamResponse({
     originalMessages: validated.data,
-    onError: (error) =>
-      /rate limit/i.test(String((error as Error)?.message ?? error))
-        ? "FlowAI is busy (AI usage limit reached for this minute). Please wait about a minute and try again."
-        : "FlowAI couldn't answer right now (AI service error). Please try again.",
+    onError: (error) => friendlyAiError(error),
   });
 }
