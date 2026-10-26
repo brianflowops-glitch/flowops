@@ -48,8 +48,13 @@ describe("assistantTools authorization", () => {
     for (const [name, t] of Object.entries(tools)) expect(t.needsApproval, name).toBe(flowAiNeedsApproval(name));
   });
 
-  it("staff get the same booking tools as on the dashboard (parity with /api/bookings)", () => {
-    expect(Object.keys(assistantTools(staffCtx)).sort()).toEqual(Object.keys(FLOWAI_POLICY).sort());
+  it("staff get every booking tool except cancel; owners and admins can cancel", () => {
+    const staffTools = Object.keys(assistantTools(staffCtx));
+    expect(staffTools).not.toContain("cancelBooking");
+    expect(staffTools.sort()).toEqual(Object.keys(FLOWAI_POLICY).filter((t) => t !== "cancelBooking").sort());
+    expect(canUseFlowAiTool("staff", "cancelBooking")).toBe(false);
+    expect(canUseFlowAiTool("admin", "cancelBooking")).toBe(true);
+    expect(canUseFlowAiTool("owner", "cancelBooking")).toBe(true);
   });
 
   it("a role outside the policy gets no tools at all", () => {

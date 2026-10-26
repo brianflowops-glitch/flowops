@@ -4,8 +4,9 @@ import type { Role } from "@/lib/server/context";
  * FlowAI authorization policy: which roles may use each assistant tool, and whether the
  * signed-in user must approve the call in the UI before it runs.
  *
- * Kept in line with the dashboard API (every member may manage bookings; settings, services and
- * team management are Owner/Admin-only and are deliberately NOT exposed to FlowAI at all).
+ * Every member may view, create and reschedule bookings through FlowAI. Cancelling through FlowAI is
+ * Owner/Admin-only (founder decision, 2026-10-26). Settings, services and team management are
+ * Owner/Admin-only and are deliberately NOT exposed to FlowAI at all.
  * Any tool missing from this table is denied for everyone (default-deny), so a new FlowAI
  * action can't ship without an explicit role + approval decision.
  */
@@ -18,6 +19,7 @@ export interface ToolPolicy {
 }
 
 const ALL: readonly Role[] = ["owner", "admin", "staff"];
+const MANAGERS: readonly Role[] = ["owner", "admin"];
 
 export const FLOWAI_POLICY = {
   listServices: { kind: "read", roles: ALL, needsApproval: false },
@@ -25,7 +27,7 @@ export const FLOWAI_POLICY = {
   checkAvailability: { kind: "read", roles: ALL, needsApproval: false },
   createBooking: { kind: "write", roles: ALL, needsApproval: true },
   rescheduleBooking: { kind: "write", roles: ALL, needsApproval: true },
-  cancelBooking: { kind: "destructive", roles: ALL, needsApproval: true },
+  cancelBooking: { kind: "destructive", roles: MANAGERS, needsApproval: true },
 } as const satisfies Record<string, ToolPolicy>;
 
 export type FlowAiTool = keyof typeof FLOWAI_POLICY;
