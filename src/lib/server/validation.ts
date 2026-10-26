@@ -62,6 +62,21 @@ export const serviceInput = z.object({
   sortOrder: z.coerce.number().int().default(0),
 });
 
+// For PATCH: every field optional and no defaults, so a partial update
+// (e.g. toggling `active`) never resets category or sortOrder.
+// (zod v4 still applies .default() inside .partial().)
+export const serviceUpdate = z
+  .object({
+    name: z.string().trim().min(1).max(120),
+    category: CATEGORY,
+    durationMin: z.coerce.number().int().min(15).max(480),
+    resource: z.string().trim().min(1).max(120),
+    description: z.string().trim().max(500).nullable(),
+    active: z.boolean(),
+    sortOrder: z.coerce.number().int(),
+  })
+  .partial();
+
 export const publicBook = z.object({
   serviceId: z.string().min(1),
   date,
