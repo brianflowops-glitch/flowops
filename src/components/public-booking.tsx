@@ -239,7 +239,11 @@ export function PublicBooking() {
             </div>
             <label className="flex items-start gap-2 text-xs leading-relaxed text-slate-400">
               <input name="smsConsent" type="checkbox" defaultChecked={false} className="mt-0.5 h-4 w-4 shrink-0 accent-cyan-400" />
-              <span>{SMS_CONSENT_TEXT}</span>
+              <span>
+                {SMS_CONSENT_TEXT} See our{" "}
+                <a href="/terms" target="_blank" rel="noopener" className="text-cyan-300 hover:underline">Terms</a> and{" "}
+                <a href="/privacy" target="_blank" rel="noopener" className="text-cyan-300 hover:underline">Privacy Policy</a>.
+              </span>
             </label>
             <textarea name="notes" rows={2} placeholder="Anything we should know? (optional)" className={inputCls} />
             <input name="website" tabIndex={-1} autoComplete="off" className="hidden" aria-hidden />

@@ -1,18 +1,19 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { CONTACT_EMAIL, H2, LegalPage, UL } from "@/components/marketing/site-chrome";
+import { COMPANY_ADDRESS, COMPANY_NAME, CONTACT_EMAIL, H2, LegalPage, UL } from "@/components/marketing/site-chrome";
 
 export const metadata: Metadata = {
-  title: { absolute: "Terms of Service (draft) · FlowOps" },
-  description: "The terms for using FlowOps. Draft pending review.",
+  title: { absolute: "Terms of Service · FlowOps" },
+  description: "The terms for using FlowOps, including our SMS / text messaging terms.",
   alternates: { canonical: "https://flowopsagent.ai/terms" },
 };
 
 export default function TermsPage() {
   return (
-    <LegalPage title="Terms of Service" updated="October 25, 2026">
+    <LegalPage title="Terms of Service" updated="October 26, 2026">
       <p>
-        These terms govern your use of FlowOps, the booking and operations service at flowopsagent.ai (the &quot;Service&quot;). By creating an account or using the
+        These Terms of Service (&quot;Terms&quot;) are an agreement between you and {COMPANY_NAME} (&quot;FlowOps&quot;, &quot;we&quot;, &quot;us&quot;), and govern your
+        use of FlowOps, the booking and operations service at flowopsagent.ai (the &quot;Service&quot;). By creating an account or using the
         Service you agree to them. If you use FlowOps on behalf of a business, you agree for that business and confirm you are authorized to do so.
       </p>
 
@@ -62,49 +63,97 @@ export default function TermsPage() {
         Usage limits apply and FlowAI may be temporarily unavailable.
       </p>
 
-      <H2>7. Third-party services</H2>
+      <H2>7. SMS / Text Messaging Terms</H2>
       <p>
-        Some features depend on other providers, such as Google Calendar, Resend (email), Twilio (text messages, when enabled), Vercel and Neon. Their availability and
+        <strong className="text-white">Program name:</strong> FlowOps texts. The program is operated by {COMPANY_NAME} from our FlowOps phone number.
+      </p>
+      <p>
+        <strong className="text-white">What messages we send:</strong>
+      </p>
+      <UL>
+        <li>
+          <strong className="text-white">Appointment messages</strong> — booking confirmations, reschedule notices, cancellation notices and appointment reminders,
+          sent to people who give a mobile number and tick the text-message opt-in box when booking on a FlowOps booking page (for example{" "}
+          <a className="text-cyan-300 hover:underline" href="https://flowopsagent.ai/book/flowops-demo">flowopsagent.ai/book/flowops-demo</a>), or who otherwise agree
+          to receive appointment texts.
+        </li>
+        <li>
+          <strong className="text-white">Replies to people who text us</strong> — when you text our number first with questions about FlowOps, its features, pricing
+          or sales, we reply to your questions in that conversation.
+        </li>
+      </UL>
+      <UL>
+        <li><strong className="text-white">Consent is not a condition of purchase.</strong> You do not have to agree to receive texts to book an appointment or buy any product or service.</li>
+        <li><strong className="text-white">Message frequency varies</strong> depending on your bookings and conversations with us.</li>
+        <li><strong className="text-white">Msg &amp; data rates may apply.</strong> Check with your mobile carrier for details about your plan.</li>
+        <li>
+          <strong className="text-white">Opt out:</strong> reply <strong className="text-white">STOP</strong> to any message at any time to stop receiving texts.
+          You will receive one final message confirming you have been unsubscribed, and no further messages will be sent. Reply{" "}
+          <strong className="text-white">START</strong> to resubscribe.
+        </li>
+        <li>
+          <strong className="text-white">Help:</strong> reply <strong className="text-white">HELP</strong> to any message for help, or email{" "}
+          <a className="text-cyan-300 hover:underline" href={`mailto:${CONTACT_EMAIL}`}>{CONTACT_EMAIL}</a>.
+        </li>
+        <li>
+          <strong className="text-white">Carriers are not liable for delayed or undelivered messages.</strong> Delivery of text messages is not guaranteed.
+        </li>
+        <li>
+          <strong className="text-white">Privacy:</strong> how we handle your mobile number and messaging data is described in our{" "}
+          <Link href="/privacy" className="text-cyan-300 hover:underline">Privacy Policy</Link>. We do not sell or share mobile numbers or text-messaging opt-in
+          data with third parties for their marketing purposes.
+        </li>
+        <li>
+          <strong className="text-white">Support:</strong> {COMPANY_NAME}, {COMPANY_ADDRESS} ·{" "}
+          <a className="text-cyan-300 hover:underline" href={`mailto:${CONTACT_EMAIL}`}>{CONTACT_EMAIL}</a> ·{" "}
+          <a className="text-cyan-300 hover:underline" href="https://flowopsagent.ai">flowopsagent.ai</a>
+        </li>
+      </UL>
+
+      <H2>8. Third-party services</H2>
+      <p>
+        Some features depend on other providers, such as Google Calendar, Resend (email), Twilio (text messages), Vercel and Neon. Their availability and
         terms are outside our control, and your use of a connected service such as Google Calendar is also subject to that provider&apos;s terms.
       </p>
 
-      <H2>8. Fees</H2>
+      <H2>9. Fees</H2>
       <p>
         The Service is free during the pilot. If we introduce paid plans, prices and billing terms will be shown before you choose a plan, and these terms will be
         updated.
       </p>
 
-      <H2>9. Ending your use</H2>
+      <H2>10. Ending your use</H2>
       <p>
         You can stop using FlowOps at any time and ask us to delete your workspace by emailing {CONTACT_EMAIL}. We may end or suspend the Service, or your access, with
         reasonable notice where possible (or immediately for serious misuse). On request before deletion, we will help you export your bookings.
       </p>
 
-      <H2>10. Disclaimers</H2>
+      <H2>11. Disclaimers</H2>
       <p>
         The Service is provided &quot;as is&quot; and &quot;as available&quot;, without warranties of any kind, including fitness for a particular purpose, accuracy or
         uninterrupted availability. You are responsible for keeping your own records of important appointments.
       </p>
 
-      <H2>11. Limitation of liability</H2>
+      <H2>12. Limitation of liability</H2>
       <p>
         To the fullest extent the law allows, FlowOps will not be liable for indirect, incidental, special, consequential or punitive damages, or for lost profits,
         revenue, data or business, and our total liability for any claim relating to the Service is limited to the greater of the amount you paid us for the Service
         in the 12 months before the claim or US $100.
       </p>
 
-      <H2>12. Changes to these terms</H2>
+      <H2>13. Changes to these terms</H2>
       <p>
         We may update these terms. We will change the &quot;Last updated&quot; date and, for material changes, notify workspace owners by email or in the app before
         they take effect. Continuing to use the Service after that means you accept the updated terms.
       </p>
 
-      <H2>13. Governing law</H2>
+      <H2>14. Governing law</H2>
       <p>These terms are governed by the laws of the Commonwealth of Pennsylvania, USA, without regard to conflict-of-law rules.</p>
 
-      <H2>14. Contact</H2>
+      <H2>15. Contact</H2>
       <p>
-        Questions about these terms: <a className="text-cyan-300 hover:underline" href={`mailto:${CONTACT_EMAIL}`}>{CONTACT_EMAIL}</a>.
+        Questions about these terms: {COMPANY_NAME}, {COMPANY_ADDRESS} ·{" "}
+        <a className="text-cyan-300 hover:underline" href={`mailto:${CONTACT_EMAIL}`}>{CONTACT_EMAIL}</a>.
       </p>
     </LegalPage>
   );
