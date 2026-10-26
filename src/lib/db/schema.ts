@@ -6,6 +6,7 @@
  * - Tenancy: organization (tenant), member (user ↔ org, role owner|admin|staff),
  *   team_invite (token invites, v2.1), staff_invite (legacy email-match invites)
  * - Booking data, all scoped by organization_id: service, booking, audit_entry, notification
+ * - Reliability: notification_failure (final send failures after retries; redacted)
  */
 import { relations } from "drizzle-orm";
 import { bigint, boolean, index, integer, jsonb, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
@@ -245,6 +246,27 @@ export const notification = pgTable(
     detail: text("detail"),
   },
   (t) => [index("notification_org_at_idx").on(t.organizationId, t.at)],
+);
+
+/**
+ * Final outbound-notification failures (after retries), v2.4. Additive only.
+ * Never stores message bodies, links or full contact details: `target` is masked (•••1234 / j•••@example.com)
+ * and `detail` is scrubbed of links, emails and phone numbers. organization_id is null for account emails.
+ */
+export const notificationFailure = pgTable(
+  "notification_failure",
+  {
+    id: text("id").primaryKey(),
+    organizationId: text("organization_id").references(() => organization.id, { onDelete: "cascade" }),
+    channel: text("channel").notNull(), // "sms" | "email"
+    tag: text("tag").notNull(), // e.g. "booking:BK-123", "account_email"
+    target: text("target").notNull(), // redacted
+    failureKind: text("failure_kind").notNull(), // "permanent" | "transient_exhausted" | "ambiguous"
+    detail: text("detail"),
+    attempts: integer("attempts").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("notification_failure_org_created_idx").on(t.organizationId, t.createdAt), index("notification_failure_created_idx").on(t.createdAt)],
 );
 
 // Relations (used by Better Auth joins and Drizzle relational queries)
