@@ -2,7 +2,7 @@ import "server-only";
 import { and, desc, eq, gte, or, sql } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
 import { BookingEngine, freeSlots, localStamp } from "@/lib/booking/engine";
-import type { Booking, BookingRequest, DayHours, EngineState, PipelineAgent, PipelineResult, RunOptions } from "@/lib/booking/types";
+import type { Booking, BookingRequest, CalendarAdapter, DayHours, EngineState, NotifierAdapter, PipelineAgent, PipelineResult, RunOptions } from "@/lib/booking/types";
 import type { WeekHours } from "@/lib/db/schema";
 import { googleCalendarAdapter } from "./integrations/google";
 import { notifierAdapter } from "./integrations/notify";
@@ -69,10 +69,62 @@ export type PipelineCommand =
   | { action: "reschedule"; bookingId: string; date: string; time: string }
   | { action: "cancel"; bookingId: string };
 
+/** Calendar ID placeholder used while the real calendar call is deferred until after commit. */
+const PENDING_CAL = "PENDINGCAL";
+const QUEUED = "queued: sends after the booking is saved";
+
+/** External side effects captured during the transaction and run only after it commits. */
+interface SideEffects {
+  calendar?: { op: "create" } | { op: "update"; eventId: string } | { op: "remove"; eventId: string };
+  sends: { subject: string; body: string; channel: "email" | "sms" }[];
+}
+
+/** Records the Calendar Agent's intent instead of calling Google inside the transaction. */
+function deferredCalendar(real: CalendarAdapter, fx: SideEffects): CalendarAdapter {
+  return {
+    label: real.label,
+    async create() {
+      fx.calendar = { op: "create" };
+      return PENDING_CAL;
+    },
+    async update(b) {
+      if (!b.calendarEventId || b.calendarEventId === PENDING_CAL) {
+        fx.calendar = { op: "create" };
+        return PENDING_CAL;
+      }
+      fx.calendar = { op: "update", eventId: b.calendarEventId };
+      return b.calendarEventId;
+    },
+    async remove(eventId) {
+      // Engine compensation for an event this run "created": nothing real exists yet.
+      if (eventId === PENDING_CAL) {
+        if (fx.calendar?.op === "create") fx.calendar = undefined;
+        return;
+      }
+      fx.calendar = { op: "remove", eventId };
+    },
+  };
+}
+
+/** Records the Notification Agent's sends instead of calling Resend/Twilio inside the transaction. */
+function deferredNotifier(real: NotifierAdapter, fx: SideEffects): NotifierAdapter {
+  return {
+    channels: real.channels,
+    async send(_b, subject, body, channel) {
+      fx.sends.push({ subject, body, channel });
+      return { ok: true, detail: QUEUED };
+    },
+  };
+}
+
 /**
  * Run the 6-agent pipeline server-side for one org, serialized per org with a
  * Postgres advisory lock (so two concurrent requests can't double-book), and persist
- * the booking + audit + notifications in the same transaction.
+ * the booking + audit + notification records in one transaction.
+ *
+ * Email, SMS and Google Calendar calls are NOT made inside the transaction: they are
+ * captured during the run and executed only after the commit succeeds, so a failed save
+ * never notifies the customer and no DB connection is held during network calls.
  */
 export async function runPipeline(
   org: Org,
@@ -80,15 +132,20 @@ export async function runPipeline(
   ctx: { actor: string; source: Source; failAgent?: PipelineAgent },
 ): Promise<PipelineResult> {
   const db = getDb();
-  return db.transaction(async (tx) => {
+  const realCalendar = googleCalendarAdapter(org);
+  const realNotifier = notifierAdapter({ businessName: org.name });
+  const fx: SideEffects = { sends: [] };
+  const queuedIds: { id: string; channel: "email" | "sms" }[] = [];
+
+  const result = await db.transaction(async (tx) => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${"flowops:org:" + org.id}))`);
     const bookings = await loadWorkingSet(tx, org, cmd.action === "create" ? undefined : cmd.bookingId);
     const engine = new BookingEngine({ bookings, audit: [], notifications: [] } satisfies EngineState);
     const opts: RunOptions = {
       hoursFor: hoursFor(org.hours),
       timeZone: org.timeZone,
-      calendar: googleCalendarAdapter(org),
-      notifier: notifierAdapter({ businessName: org.name }),
+      calendar: realCalendar ? deferredCalendar(realCalendar, fx) : undefined,
+      notifier: realNotifier ? deferredNotifier(realNotifier, fx) : undefined,
       actor: ctx.actor,
       failAgent: ctx.failAgent,
     };
@@ -116,7 +173,8 @@ export async function runPipeline(
         durationMin: b.durationMin,
         notes: b.notes ?? null,
         status: b.status,
-        calendarEventId: b.calendarEventId,
+        // The real event ID is written after commit, once the calendar call succeeds.
+        calendarEventId: b.calendarEventId === PENDING_CAL ? null : b.calendarEventId,
         history: b.history,
         updatedAt: new Date(b.updatedAt),
       };
@@ -146,21 +204,110 @@ export async function runPipeline(
     }
     if (result.ok && snap.notifications.length) {
       await tx.insert(schema.notification).values(
-        snap.notifications.map((n) => ({
-          id: n.id,
-          organizationId: org.id,
-          at: new Date(n.at),
-          bookingId: n.bookingId,
-          recipient: n.recipient,
-          channel: n.channel,
-          subject: n.subject,
-          deliveryStatus: n.deliveryStatus,
-          detail: n.detail ?? null,
-        })),
+        snap.notifications.map((n) => {
+          const queued = n.detail === QUEUED && (n.channel === "email" || n.channel === "sms");
+          if (queued) queuedIds.push({ id: n.id, channel: n.channel as "email" | "sms" });
+          return {
+            id: n.id,
+            organizationId: org.id,
+            at: new Date(n.at),
+            bookingId: n.bookingId,
+            recipient: n.recipient,
+            channel: n.channel,
+            subject: n.subject,
+            deliveryStatus: queued ? "queued" : n.deliveryStatus,
+            detail: n.detail ?? null,
+          };
+        }),
       );
     }
     return result;
   });
+
+  // Transaction committed (or the run failed and nothing was saved). Only now touch the outside world.
+  if (!result.ok || !result.booking) return result;
+  await runSideEffects(org, result, fx, queuedIds, realCalendar, realNotifier, ctx.actor);
+  return result;
+}
+
+/** Executes deferred calendar + notification calls after commit and records their real outcome. Never throws. */
+async function runSideEffects(
+  org: Org,
+  result: PipelineResult,
+  fx: SideEffects,
+  queuedIds: { id: string; channel: "email" | "sms" }[],
+  calendar: CalendarAdapter | undefined,
+  notifier: NotifierAdapter | undefined,
+  actor: string,
+) {
+  const db = getDb();
+  const b = result.booking as Booking;
+  const warnings: string[] = [];
+  const step = (agent: PipelineAgent) => result.steps.find((s) => s.agent === agent);
+
+  if (calendar && fx.calendar) {
+    const c = fx.calendar;
+    try {
+      let eventId: string | null = b.calendarEventId;
+      if (c.op === "create") eventId = await calendar.create(b);
+      else if (c.op === "update") eventId = await calendar.update({ ...b, calendarEventId: c.eventId });
+      else {
+        await calendar.remove(c.eventId);
+        eventId = null;
+      }
+      b.calendarEventId = eventId;
+      const s = step("CalendarAgent");
+      if (s) s.message = `${calendar.label}: ${c.op === "remove" ? "deleted" : c.op === "update" ? "updated" : "created"} event ${c.op === "remove" ? c.eventId : eventId}`;
+    } catch (e) {
+      if (c.op === "create") b.calendarEventId = null;
+      warnings.push(`calendar ${c.op} failed after save: ${String(e).slice(0, 200)}`);
+      const s = step("CalendarAgent");
+      if (s) s.message = `${calendar.label}: ${c.op} FAILED after booking was saved`;
+    }
+    await db
+      .update(schema.booking)
+      .set({ calendarEventId: b.calendarEventId })
+      .where(and(eq(schema.booking.id, b.id), eq(schema.booking.organizationId, org.id)))
+      .catch((e: unknown) => warnings.push(`could not store calendar event id: ${String(e).slice(0, 200)}`));
+  }
+
+  if (notifier && fx.sends.length) {
+    const outcomes: string[] = [];
+    for (const send of fx.sends) {
+      const idx = queuedIds.findIndex((q) => q.channel === send.channel);
+      const rowId = idx >= 0 ? queuedIds.splice(idx, 1)[0].id : null;
+      const res = await notifier.send(b, send.subject, send.body, send.channel).catch((e: unknown) => ({ ok: false, detail: String(e) }));
+      const recipient = send.channel === "email" ? b.email : b.phone;
+      outcomes.push(`${send.channel} ${res.ok ? "sent" : "FAILED"} to ${recipient}`);
+      if (!res.ok) warnings.push(`${send.channel} to ${recipient} failed`);
+      if (rowId) {
+        await db
+          .update(schema.notification)
+          .set({ deliveryStatus: res.ok ? "sent" : "failed", detail: res.detail ? res.detail.slice(0, 300) : null })
+          .where(and(eq(schema.notification.id, rowId), eq(schema.notification.organizationId, org.id)))
+          .catch((e: unknown) => warnings.push(`could not update notification ${rowId}: ${String(e).slice(0, 200)}`));
+      }
+    }
+    const s = step("NotificationAgent");
+    if (s) s.message = outcomes.join(" · ");
+  }
+
+  if (warnings.length) {
+    await db
+      .insert(schema.auditEntry)
+      .values({
+        id: `AU-${crypto.randomUUID().slice(0, 8).toUpperCase()}`,
+        organizationId: org.id,
+        at: new Date(),
+        action: result.action,
+        bookingId: b.id,
+        agent: "AuditAgent",
+        outcome: "failed",
+        detail: `post-save side effects for ${b.id}: ${warnings.join(" · ")}`.slice(0, 1000),
+        actor,
+      })
+      .catch((e: unknown) => console.error("[pipeline] could not record side-effect warnings", e));
+  }
 }
 
 /** Free start times for a resource/date (org hours, conflicts, past). */
