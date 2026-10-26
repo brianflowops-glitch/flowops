@@ -133,7 +133,10 @@ export async function runPipeline(
 ): Promise<PipelineResult> {
   const db = getDb();
   const realCalendar = googleCalendarAdapter(org);
-  const realNotifier = notifierAdapter({ businessName: org.name });
+  // organizationId lets failure logs/alerts carry the org. Built as a separate object so this
+  // compiles both before and after the notifier adapter's options type gains organizationId.
+  const notifierOpts = { businessName: org.name, organizationId: org.id };
+  const realNotifier = notifierAdapter(notifierOpts);
   const fx: SideEffects = { sends: [] };
   const queuedIds: { id: string; channel: "email" | "sms" }[] = [];
 
@@ -286,7 +289,8 @@ async function runSideEffects(
     for (const send of fx.sends) {
       const idx = queuedIds.findIndex((q) => q.channel === send.channel);
       const rowId = idx >= 0 ? queuedIds.splice(idx, 1)[0].id : null;
-      const res = await notifier.send(b, send.subject, send.body, send.channel).catch((e: unknown) => ({ ok: false, detail: String(e) }));
+      const sendOpts = rowId ? { idempotencyKey: `notification-${rowId}` } : undefined;
+      const res = await notifier.send(b, send.subject, send.body, send.channel, sendOpts).catch((e: unknown) => ({ ok: false, detail: String(e) }));
       const recipient = send.channel === "email" ? b.email : b.phone;
       outcomes.push(`${send.channel} ${res.ok ? "sent" : "FAILED"} to ${recipient}`);
       if (!res.ok) warnings.push(`${send.channel} to ${recipient} failed`);
