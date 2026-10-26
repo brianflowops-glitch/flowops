@@ -18,43 +18,85 @@ export const HANDLED_EVENTS = [
 const rid = (p: string) => `${p}_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
 const idOf = (v: string | { id: string } | null | undefined) => (v == null ? null : typeof v === "string" ? v : v.id);
 
-export type WebhookResult = { status: "processed" | "duplicate" | "ignored"; eventId: string; type: string };
+/** Fetches the CURRENT subscription from Stripe. Injected so tests run offline. */
+export type SubscriptionFetcher = (subscriptionId: string) => Promise<Stripe.Subscription>;
+
+export interface ProcessOptions {
+  db?: Db;
+  /** Required for subscription.* / invoice.* events that reference a subscription. */
+  fetchSubscription?: SubscriptionFetcher;
+}
+
+export type WebhookResult = {
+  /** stale = the subscription row already reflects a strictly newer event (or is canceled); nothing written. */
+  status: "processed" | "duplicate" | "ignored" | "stale";
+  eventId: string;
+  type: string;
+};
+
+/** Subscription id an event refers to (subscription.* object id, or the invoice's subscription). */
+export function subscriptionIdForEvent(event: Stripe.Event): string | null {
+  switch (event.type) {
+    case "customer.subscription.created":
+    case "customer.subscription.updated":
+    case "customer.subscription.deleted":
+      return event.data.object.id;
+    case "invoice.paid":
+    case "invoice.payment_failed":
+      return idOf(event.data.object.parent?.subscription_details?.subscription ?? null);
+    default:
+      return null;
+  }
+}
 
 /**
- * Process one verified Stripe event exactly once. The stripe_event insert and the
- * state changes share one transaction: a duplicate delivery hits the primary key and
- * is skipped; a failure rolls everything back so Stripe's retry can process it again.
- * No network calls happen inside the transaction (everything comes from the event payload).
+ * Process one verified Stripe event exactly once.
+ *
+ * Ordering: Stripe does not guarantee delivery order, so subscription.* and invoice.*
+ * events are treated as a *signal*. Before the DB transaction we retrieve the current
+ * subscription from Stripe and write that state, not the (possibly stale) payload.
+ * Backup guard: the row stores the source event's `created`; writes from strictly older
+ * events are skipped (ties: the freshly fetched state wins). Canceled is terminal.
+ *
+ * Idempotency: the stripe_event insert and the state change share one transaction; a
+ * duplicate delivery hits the primary key and is skipped; a failure rolls everything
+ * back so Stripe's retry can process it again. No network calls inside the transaction.
  */
-export async function processStripeEvent(event: Stripe.Event, db: Db = getDb()): Promise<WebhookResult> {
-  if (!(HANDLED_EVENTS as readonly string[]).includes(event.type)) {
-    return { status: "ignored", eventId: event.id, type: event.type };
+export async function processStripeEvent(event: Stripe.Event, opts: ProcessOptions = {}): Promise<WebhookResult> {
+  const db = opts.db ?? getDb();
+  const result = (status: WebhookResult["status"]): WebhookResult => ({ status, eventId: event.id, type: event.type });
+  if (!(HANDLED_EVENTS as readonly string[]).includes(event.type)) return result("ignored");
+
+  // Cheap pre-check so duplicate deliveries don't cost a Stripe API call (the PK insert below is the real guard).
+  const [seen] = await db.select({ id: schema.stripeEvent.id }).from(schema.stripeEvent).where(eq(schema.stripeEvent.id, event.id)).limit(1);
+  if (seen) return result("duplicate");
+
+  // Network call happens here, OUTSIDE the transaction. A failure throws → 500 → Stripe retries.
+  const subId = subscriptionIdForEvent(event);
+  let current: Stripe.Subscription | null = null;
+  if (subId) {
+    if (!opts.fetchSubscription) throw new Error("fetchSubscription is required for subscription/invoice events");
+    current = await opts.fetchSubscription(subId);
   }
+
   return db.transaction(async (tx) => {
     const inserted = await tx
       .insert(schema.stripeEvent)
       .values({ id: event.id, type: event.type })
       .onConflictDoNothing()
       .returning({ id: schema.stripeEvent.id });
-    if (!inserted.length) return { status: "duplicate", eventId: event.id, type: event.type } as const;
+    if (!inserted.length) return result("duplicate");
 
-    switch (event.type) {
-      case "checkout.session.completed":
-        await onCheckoutCompleted(tx, event.data.object);
-        break;
-      case "customer.subscription.created":
-      case "customer.subscription.updated":
-      case "customer.subscription.deleted":
-        await upsertSubscription(tx, event.data.object);
-        break;
-      case "invoice.paid":
-      case "invoice.payment_failed":
-        // Subscription status (active / past_due) arrives via customer.subscription.updated.
-        // Here we only record the event; owner emails / account locking on failure are a
-        // founder decision (docs/BILLING.md → Failed payments) and hook in at this point.
-        break;
+    if (event.type === "checkout.session.completed") {
+      await onCheckoutCompleted(tx, event.data.object);
+      return result("processed");
     }
-    return { status: "processed", eventId: event.id, type: event.type } as const;
+    // invoice.* : status (active / past_due) is written from the fetched subscription.
+    // Owner emails / account locking on failure are a founder decision (docs/BILLING.md → Failed payments)
+    // and hook in here for invoice.payment_failed.
+    if (!current) return result("processed"); // e.g. a one-off invoice with no subscription
+    const wrote = await upsertSubscription(tx, current, new Date(event.created * 1000));
+    return result(wrote ? "processed" : "stale");
   });
 }
 
@@ -104,20 +146,25 @@ export function subscriptionFields(sub: Stripe.Subscription) {
   };
 }
 
-async function upsertSubscription(tx: Tx, sub: Stripe.Subscription) {
+/** Returns false when the write was skipped by the ordering / canceled guard. */
+async function upsertSubscription(tx: Tx, sub: Stripe.Subscription, eventCreated: Date): Promise<boolean> {
   const orgId = await orgForSubscription(tx, sub);
   if (!orgId) throw new Error(`No organization for subscription ${sub.id}; will retry`);
   const customerId = idOf(sub.customer);
   if (customerId) await linkCustomer(tx, orgId, customerId);
   const fields = subscriptionFields(sub);
-  await tx
-    .insert(schema.subscription)
-    .values({ id: rid("sub"), organizationId: orgId, stripeSubscriptionId: sub.id, ...fields })
+  const t = schema.subscription;
+  const rows = await tx
+    .insert(t)
+    .values({ id: rid("sub"), organizationId: orgId, stripeSubscriptionId: sub.id, ...fields, lastEventCreated: eventCreated })
     .onConflictDoUpdate({
-      target: schema.subscription.stripeSubscriptionId,
-      set: { ...fields, updatedAt: sql`now()` },
-      // A canceled Stripe subscription can never become active again, so a late/out-of-order
-      // "updated" event must not resurrect it.
-      setWhere: sql`${schema.subscription.status} <> 'canceled'`,
-    });
+      target: t.stripeSubscriptionId,
+      set: { ...fields, lastEventCreated: eventCreated, updatedAt: sql`now()` },
+      // 1. A canceled Stripe subscription can never become active again.
+      // 2. Skip events strictly older than the one that produced the stored state; on a tie the
+      //    freshly fetched state wins (it is current).
+      setWhere: sql`${t.status} <> 'canceled' and (${t.lastEventCreated} is null or ${t.lastEventCreated} <= ${eventCreated.toISOString()}::timestamptz)`,
+    })
+    .returning({ id: t.id });
+  return rows.length > 0;
 }

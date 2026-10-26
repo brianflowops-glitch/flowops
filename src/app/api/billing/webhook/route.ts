@@ -21,7 +21,8 @@ export async function POST(req: Request) {
   }
 
   try {
-    const result = await processStripeEvent(event);
+    const stripe = getStripe();
+    const result = await processStripeEvent(event, { fetchSubscription: (id) => stripe.subscriptions.retrieve(id) });
     return Response.json({ received: true, ...result });
   } catch (err) {
     console.error("[billing] webhook processing failed", event.id, event.type, err);

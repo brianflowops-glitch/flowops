@@ -1548,6 +1548,12 @@
           "notNull": true,
           "default": false
         },
+        "last_event_created": {
+          "name": "last_event_created",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": false
+        },
         "created_at": {
           "name": "created_at",
           "type": "timestamp with time zone",

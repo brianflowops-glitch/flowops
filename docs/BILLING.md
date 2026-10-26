@@ -51,7 +51,7 @@ Plans are **only** env vars: `STRIPE_PRICE_<PLAN>=price_…` (e.g. `STRIPE_PRICE
 | Table | Columns | Notes |
 | --- | --- | --- |
 | `billing_customer` | `organization_id` PK→organization (cascade), `stripe_customer_id` (unique), `created_at`, `updated_at` | one customer per org |
-| `subscription` | `id` PK, `organization_id`→organization (cascade, indexed), `stripe_subscription_id` (unique), `status` (text), `price_id`, `current_period_end`, `cancel_at_period_end`, `created_at`, `updated_at` | mirror of the Stripe subscription |
+| `subscription` | `id` PK, `organization_id`→organization (cascade, indexed), `stripe_subscription_id` (unique), `status` (text), `price_id`, `current_period_end`, `cancel_at_period_end`, `last_event_created` (`created` of the Stripe event that last wrote the row), `created_at`, `updated_at` | mirror of the Stripe subscription |
 | `stripe_event` | `id` PK (`evt_…`), `type`, `processed_at` | idempotency ledger |
 
 Conventions followed: text ids, text status column without a DB enum (like `member.role`), `timestamp with time zone`, FKs cascade on org delete. The migration only `CREATE`s new tables/indexes and adds FKs **on the new tables**; nothing existing is altered or dropped. Verified against a throwaway local Postgres 17 (not Neon): 0000–0006 apply cleanly in order.
@@ -69,7 +69,7 @@ Note: since Stripe API version 2025-03-31, `current_period_end` lives on subscri
 | `canceled` | ended (terminal; never becomes active again) | no |
 | also stored: `incomplete_expired`, `unpaid`, `paused` | Stripe edge states | no |
 
-`cancel_at_period_end=true` means the owner cancelled in the portal; access continues until `current_period_end`. Unknown future statuses are stored as `incomplete` (fail closed). A `canceled` row is never overwritten by a late, out-of-order `updated` event.
+`cancel_at_period_end=true` means the owner cancelled in the portal; access continues until `current_period_end`. Unknown future statuses are stored as `incomplete` (fail closed). Ordering is handled in §7: state is fetched from Stripe, older events can't overwrite newer ones, and a `canceled` row is never overwritten.
 
 ## 6. Failed payments — options (founder decision)
 
@@ -88,18 +88,22 @@ The hook point is `invoice.payment_failed` in `webhook.ts` and the `pastDueGrace
 
 1. 404 unless `BILLING_ENABLED=true`; 503 if `STRIPE_WEBHOOK_SECRET` or the DB is missing.
 2. Read the **raw** body (`req.text()`) and verify the `Stripe-Signature` header with `stripe.webhooks.constructEventAsync(payload, sig, STRIPE_WEBHOOK_SECRET)` (default 5-minute tolerance, replay-safe). Bad/missing signature → 400.
-3. In **one DB transaction**: `INSERT INTO stripe_event (id, type) ON CONFLICT DO NOTHING`. If no row was inserted, the event is a duplicate → 200 `{status:"duplicate"}`. Otherwise apply the state change.
-4. Any error rolls back the transaction (including the `stripe_event` row) and returns 500, so Stripe's retry gets a clean second attempt. Success → 200.
-5. No network calls inside the transaction (everything comes from the event payload), which keeps the 5-connection pool free.
+3. Quick read of `stripe_event`: already seen → 200 `{status:"duplicate"}` without calling Stripe.
+4. **Event as a signal (ordering):** Stripe does not guarantee delivery order. For `customer.subscription.*` and `invoice.*` events we take the subscription id (the object id, or `invoice.parent.subscription_details.subscription`) and call `stripe.subscriptions.retrieve(id)` **before** opening the transaction, then write that *current* state instead of the event payload. A failed retrieve → 500 → Stripe retries (nothing recorded).
+5. In **one DB transaction**: `INSERT INTO stripe_event (id, type) ON CONFLICT DO NOTHING` (the real dedupe guard; no row → duplicate). Then upsert the subscription with these guards in `ON CONFLICT … DO UPDATE … WHERE`:
+   - **Canceled is terminal:** a `canceled` row is never overwritten.
+   - **Timestamp backup guard:** the row stores the source event's `created` in `last_event_created`; an event strictly older than the stored one is skipped (`{status:"stale"}`, event still recorded as seen). On a tie (same second) the write goes through, because the fetched state is current.
+6. Any error rolls back the transaction (including the `stripe_event` row) and returns 500, so Stripe's retry gets a clean second attempt. Success → 200.
+7. No network calls inside the transaction, which keeps the 5-connection pool free. The Stripe client is injected (`processStripeEvent(event, { fetchSubscription })`) so tests run offline.
 
 Events handled:
 
 | Event | Action |
 | --- | --- |
 | `checkout.session.completed` | link `stripe_customer_id` ↔ org (`client_reference_id`) |
-| `customer.subscription.created` / `.updated` / `.deleted` | upsert `subscription` (status, price, period end, cancel flag); resolve org from subscription metadata, else `billing_customer`; unknown org → 500 so Stripe retries |
-| `invoice.paid` | recorded (status flips via `subscription.updated`); future: receipts/analytics |
-| `invoice.payment_failed` | recorded; hook for the failed-payment policy (§6) |
+| `customer.subscription.created` / `.updated` / `.deleted` | retrieve the subscription from Stripe, upsert its **current** state (status, price, period end, cancel flag) with the ordering guards; resolve org from subscription metadata, else `billing_customer`; unknown org → 500 so Stripe retries |
+| `invoice.paid` | retrieve the invoice's subscription and upsert its current state (e.g. back to `active`); future: receipts/analytics |
+| `invoice.payment_failed` | retrieve the subscription and upsert its current state (e.g. `past_due`); hook for the failed-payment policy (§6) |
 
 Other event types are acknowledged with 200 `{status:"ignored"}` and not stored. Configure the Stripe endpoint to send only the six events above.
 
@@ -119,7 +123,7 @@ No publishable key is needed (hosted Checkout/Portal via redirect).
 
 Automated, no network:
 - `npm run test:billing` — plan config parsing, live-key refusal, status/access rules, signature verification (valid accepted, tampered rejected) with a locally generated header.
-- `DATABASE_URL=<throwaway local postgres> npm run test:billing:db` — runs `processStripeEvent` against a scratch DB after `npm run db:migrate`: checkout links customer, created/updated/deleted upsert, duplicate event skipped, late update can't resurrect a canceled sub, unknown org rolls back (event not recorded). The script refuses hosted DB URLs.
+- `DATABASE_URL=<throwaway local postgres> npm run test:billing:db` — runs `processStripeEvent` against a scratch DB after `npm run db:migrate`, with a **mocked** Stripe client: checkout links customer; the fetched state (not the payload) is written; duplicates skip without a Stripe call; two updates delivered in reverse order → the newer status wins; same-second tie → fetched state wins; canceled stays canceled even for a newer event; unknown org or a failed Stripe retrieve rolls back (event not recorded). The script refuses hosted DB URLs.
 
 Manual with the Stripe CLI (test mode, after the founder provides a test key; Preview deployment or local dev):
 1. `stripe login` (founder's account, test mode) → create test Products/Prices in the dashboard → set `STRIPE_PRICE_*`.

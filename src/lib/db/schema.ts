@@ -363,6 +363,8 @@ export const subscription = pgTable(
     priceId: text("price_id"),
     currentPeriodEnd: timestamp("current_period_end", { withTimezone: true }),
     cancelAtPeriodEnd: boolean("cancel_at_period_end").notNull().default(false),
+    /** `created` of the Stripe event that last wrote this row (out-of-order guard). */
+    lastEventCreated: timestamp("last_event_created", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

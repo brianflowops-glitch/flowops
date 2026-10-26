@@ -19,6 +19,7 @@ CREATE TABLE "subscription" (
 	"price_id" text,
 	"current_period_end" timestamp with time zone,
 	"cancel_at_period_end" boolean DEFAULT false NOT NULL,
+	"last_event_created" timestamp with time zone,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL
 );
