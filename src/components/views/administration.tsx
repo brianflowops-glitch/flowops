@@ -353,7 +353,7 @@ function TeamCard() {
               <button
                 title="Remove member"
                 className="rounded-md p-1 text-slate-400 hover:text-rose-300"
-                onClick={() => confirm(`Remove ${u.email}? Their login is deleted.`) && act(() => api("/api/admin/staff", "DELETE", { memberId: u.id }), "Removed.")}
+                onClick={() => confirm(`Remove ${u.email} from this team? They lose access right away; their account itself is not deleted.`) && act(() => api("/api/admin/staff", "DELETE", { memberId: u.id }), "Removed.")}
               >
                 <Trash2 className="h-3.5 w-3.5" />
               </button>

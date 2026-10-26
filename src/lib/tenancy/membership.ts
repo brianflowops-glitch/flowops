@@ -178,3 +178,45 @@ export async function claimLegacyInviteAfterVerification(u: { id: string; email:
     return m;
   });
 }
+
+export class RemoveMemberError extends Error {}
+
+/**
+ * Remove someone from one organization. Deletes ONLY their membership row in that org (never the
+ * user account, bookings, or anything in other orgs), signs them out, drops any legacy email-match
+ * staff invite for that org (so they aren't auto-re-added on next sign-in), and writes an audit row.
+ * Next sign-in, a user with no membership gets the normal new-account flow (their own empty workspace).
+ */
+export async function removeMemberFromOrg(opts: { orgId: string; memberId: string; actor: string; actorEmail?: string }) {
+  const db = getDb();
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext('flowops:membership'))`);
+    const [m] = await tx
+      .select({ id: schema.member.id, userId: schema.member.userId, role: schema.member.role, email: schema.user.email })
+      .from(schema.member)
+      .innerJoin(schema.user, eq(schema.user.id, schema.member.userId))
+      .where(and(eq(schema.member.id, opts.memberId), eq(schema.member.organizationId, opts.orgId)))
+      .limit(1);
+    if (!m) return null;
+    if (m.role === "owner") throw new RemoveMemberError("Owners can't be removed here");
+
+    await tx.delete(schema.member).where(and(eq(schema.member.id, m.id), eq(schema.member.organizationId, opts.orgId)));
+    // Sign them out everywhere: accounts belong to one organization, so their sessions were for this org.
+    await tx.delete(schema.session).where(eq(schema.session.userId, m.userId));
+    await tx
+      .delete(schema.staffInvite)
+      .where(and(eq(schema.staffInvite.organizationId, opts.orgId), eq(schema.staffInvite.email, m.email.toLowerCase())));
+    await tx.insert(schema.auditEntry).values({
+      id: rid("aud"),
+      organizationId: opts.orgId,
+      at: new Date(),
+      action: "member.removed",
+      bookingId: null,
+      agent: "TeamAdmin",
+      outcome: "success",
+      detail: `Removed ${m.role} ${m.email} (member ${m.id}) from the team`,
+      actor: opts.actor,
+    });
+    return { memberId: m.id, userId: m.userId, role: m.role };
+  });
+}

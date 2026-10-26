@@ -79,7 +79,7 @@ export interface NotificationRecord {
   recipient: string;
   channel: "email (simulated)" | "sms (simulated)" | "email" | "sms";
   subject: string;
-  deliveryStatus: "simulated-sent" | "sent" | "failed";
+  deliveryStatus: "simulated-sent" | "queued" | "sent" | "failed";
   detail?: string;
 }
 
@@ -104,7 +104,17 @@ export interface CalendarAdapter {
 export interface NotifierAdapter {
   /** Channels that are real; any channel not listed stays simulated. */
   channels: { email: boolean; sms: boolean };
-  send(b: Booking, subject: string, body: string, channel: "email" | "sms"): Promise<{ ok: boolean; detail?: string }>;
+  /**
+   * opts.idempotencyKey: stable key for this message (pipeline passes "notification-<row id>")
+   * so a later retry/sweeper re-send of the same row can never deliver twice.
+   */
+  send(
+    b: Booking,
+    subject: string,
+    body: string,
+    channel: "email" | "sms",
+    opts?: { idempotencyKey?: string },
+  ): Promise<{ ok: boolean; detail?: string }>;
 }
 
 export interface RunOptions {

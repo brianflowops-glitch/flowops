@@ -122,10 +122,25 @@ describe("role permissions on the API (one org: owner, admin, staff)", () => {
     expect((await del(staffer, await mem(staffer2))).status).toBe(403);
     expect((await del(admin, await mem(owner))).status).toBe(403);
     expect((await del(owner, await mem(owner))).status).toBe(403);
-    // Admin removes a staff member → their login is deleted.
-    expect((await del(admin, await mem(staffer2))).status).toBe(200);
-    const [gone] = await getDb().select().from(schema.user).where(eq(schema.user.id, staffer2.id));
-    expect(gone).toBeUndefined();
+    // Admin removes a staff member → only the membership goes; the account stays, they're
+    // signed out, and an audit row is written for the org (FO-032).
+    const removedMemberId = await mem(staffer2);
+    const orgId = (await memberOf(staffer2.id)).organizationId;
+    expect((await del(admin, removedMemberId)).status).toBe(200);
+    const db = getDb();
+    const [account] = await db.select().from(schema.user).where(eq(schema.user.id, staffer2.id));
+    expect(account).toBeDefined();
+    const memberRows = await db.select().from(schema.member).where(eq(schema.member.id, removedMemberId));
+    expect(memberRows).toEqual([]);
+    const sessions = await db.select().from(schema.session).where(eq(schema.session.userId, staffer2.id));
+    expect(sessions).toEqual([]);
+    const audits = await db.select().from(schema.auditEntry).where(eq(schema.auditEntry.organizationId, orgId));
+    const entry = audits.find((a) => a.action === "member.removed");
+    expect(entry).toBeDefined();
+    expect(entry!.actor).toBe(`user:${admin.email}`);
+    expect(entry!.detail).toContain(removedMemberId);
+    // Removing the same member again is a clean 404, not an error.
+    expect((await del(admin, removedMemberId)).status).toBe(404);
   });
 
   it("reset links: staff can't; admin can for staff but not the owner", async () => {
