@@ -15,3 +15,15 @@ export function hasPaidAccess(status: SubscriptionStatus | null | undefined, opt
   if (status === "past_due") return opts.pastDueGrace ?? true;
   return false;
 }
+
+/**
+ * Stripe subscription statuses that mean the customer still has a live subscription. While one
+ * exists, a new Checkout would create a second subscription and double-bill: plan changes,
+ * card updates and recovering a past_due/unpaid subscription go through the Customer Portal.
+ * incomplete / incomplete_expired (abandoned first payment) and canceled do not block.
+ */
+export const LIVE_SUBSCRIPTION_STATUSES = ["active", "trialing", "past_due", "unpaid", "paused"] as const;
+
+export function findLiveSubscription<T extends { status: string }>(subs: readonly T[]): T | undefined {
+  return subs.find((s) => (LIVE_SUBSCRIPTION_STATUSES as readonly string[]).includes(s.status));
+}

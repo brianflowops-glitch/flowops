@@ -1,7 +1,7 @@
 // Offline billing checks (no network, no database): `npm run test:billing`
 import Stripe from "stripe";
 import { isLiveKey, planByKey, planByPriceId, plans } from "../src/lib/billing/config";
-import { hasPaidAccess, normalizeStatus } from "../src/lib/billing/status";
+import { findLiveSubscription, hasPaidAccess, normalizeStatus } from "../src/lib/billing/status";
 
 let failed = 0;
 const check = (label: string, ok: boolean) => {
@@ -20,6 +20,16 @@ const check = (label: string, ok: boolean) => {
   check("known status kept", normalizeStatus("past_due") === "past_due");
   check("access: active/trialing yes, canceled no", hasPaidAccess("active") && hasPaidAccess("trialing") && !hasPaidAccess("canceled"));
   check("access: past_due follows grace option", hasPaidAccess("past_due") && !hasPaidAccess("past_due", { pastDueGrace: false }));
+
+  // Checkout guard (one subscription per org): which existing subscriptions block a new Checkout.
+  for (const st of ["active", "trialing", "past_due", "unpaid", "paused"])
+    check(`existing ${st} subscription blocks a new checkout`, findLiveSubscription([{ id: "sub_1", status: st }])?.id === "sub_1");
+  check(
+    "canceled / incomplete / incomplete_expired don't block a new checkout",
+    findLiveSubscription([{ status: "canceled" }, { status: "incomplete" }, { status: "incomplete_expired" }]) === undefined,
+  );
+  check("no subscriptions → no block", findLiveSubscription([]) === undefined);
+  check("live one found among canceled ones", findLiveSubscription([{ id: "a", status: "canceled" }, { id: "b", status: "past_due" }])?.id === "b");
 
   // Signature verification, fully offline (dummy key, locally generated header).
   const stripe = new Stripe("sk_test_dummy_offline");

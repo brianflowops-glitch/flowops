@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { billingConfigured, billingEnabled, planByKey } from "@/lib/billing/config";
-import { getOrCreateCustomer } from "@/lib/billing/checkout";
+import { expireOpenCheckoutSessions, findLiveStripeSubscription, getOrCreateCustomer } from "@/lib/billing/checkout";
 import { getStripe } from "@/lib/billing/stripe";
 import { requireApi } from "@/lib/server/context";
 import { badRequest, readJson } from "@/lib/server/validation";
@@ -20,6 +20,15 @@ export async function POST(req: Request) {
 
   const origin = new URL(req.url).origin;
   const customer = await getOrCreateCustomer(ctx);
+  // One subscription per org: a second Checkout would double-bill. Plan changes go through the portal.
+  // Old open sessions are expired first, so a stale checkout tab can't start a second subscription either.
+  await expireOpenCheckoutSessions(customer);
+  const live = await findLiveStripeSubscription(customer);
+  if (live)
+    return Response.json(
+      { error: "This organization already has a subscription. Use the billing portal to change plan or payment method.", status: live.status },
+      { status: 409 },
+    );
   const session = await getStripe().checkout.sessions.create({
     mode: "subscription",
     customer,

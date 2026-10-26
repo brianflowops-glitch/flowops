@@ -24,6 +24,7 @@ Owner (/admin) ──POST /api/billing/portal──▶ FlowOps ──create Port
 
 - **One Stripe customer per organization** (`billing_customer`, PK = `organization_id`). Created lazily on first checkout/portal call with `metadata.organizationId` and an idempotency key `flowops-customer-<orgId>`, so double clicks can't create two customers.
 - Checkout sessions carry the org three ways: `client_reference_id`, `metadata.organizationId` and `subscription_data.metadata.organizationId`. The last one means subscription events can be matched to the org even if they arrive before `checkout.session.completed`.
+- **One subscription per organization.** Before creating a Checkout session the route asks Stripe (not our table, which can lag the webhook) for the customer's subscriptions; if one is `active`, `trialing`, `past_due`, `unpaid` or `paused` it returns **409** and the owner uses the portal instead (plan change, card update, paying a failed invoice). It also expires the customer's other open Checkout sessions, so an old checkout tab can't be completed later into a second subscription. Found in the sandbox end-to-end run: without this, an org on Pro could check out again and be billed twice.
 - Only `owner` role can start checkout / open the portal (`requireApi(req, { owner: true })`).
 - All routes return **404** unless `BILLING_ENABLED=true`, and **503** if keys are missing.
 
@@ -35,7 +36,7 @@ Owner (/admin) ──POST /api/billing/portal──▶ FlowOps ──create Port
 | `src/lib/billing/stripe.ts` | Lazy Stripe client (build never needs a key) |
 | `src/lib/billing/status.ts` | Status normalization and `hasPaidAccess()` (grace policy hook) |
 | `src/lib/billing/webhook.ts` | `processStripeEvent()` — dedupe + state changes in one transaction |
-| `src/lib/billing/checkout.ts` | `getOrCreateCustomer()` |
+| `src/lib/billing/checkout.ts` | `getOrCreateCustomer()`, `findLiveStripeSubscription()`, `expireOpenCheckoutSessions()` |
 | `src/app/api/billing/{webhook,checkout,portal}/route.ts` | Route handlers |
 | `drizzle/0006_billing.sql` | Additive migration (3 new tables, no changes to existing tables) |
 | `scripts/billing-tests.ts`, `scripts/billing-db-tests.ts` | Offline tests and local-DB webhook tests |
@@ -122,7 +123,7 @@ No publishable key is needed (hosted Checkout/Portal via redirect).
 ## 9. Test plan (test mode only)
 
 Automated, no network:
-- `npm run test:billing` — plan config parsing, live-key refusal, status/access rules, signature verification (valid accepted, tampered rejected) with a locally generated header.
+- `npm run test:billing` — plan config parsing, live-key refusal, status/access rules, which existing subscription statuses block a second checkout, signature verification (valid accepted, tampered rejected) with a locally generated header.
 - `DATABASE_URL=<throwaway local postgres> npm run test:billing:db` — runs `processStripeEvent` against a scratch DB after `npm run db:migrate`, with a **mocked** Stripe client: checkout links customer; the fetched state (not the payload) is written; duplicates skip without a Stripe call; two updates delivered in reverse order → the newer status wins; same-second tie → fetched state wins; canceled stays canceled even for a newer event; unknown org or a failed Stripe retrieve rolls back (event not recorded). The script refuses hosted DB URLs.
 
 Manual with the Stripe CLI (test mode, after the founder provides a test key; Preview deployment or local dev):
@@ -134,7 +135,8 @@ Manual with the Stripe CLI (test mode, after the founder provides a test key; Pr
 6. Cancel in the portal → `cancel_at_period_end=true`; advance a test clock → `canceled`.
 7. `stripe events resend <evt_id>` → response `duplicate`, no data change.
 8. Send a request with a wrong signature → 400.
-9. Never use `org_flowops_demo` or Brian's org on production for these tests.
+9. With an active/past_due subscription, `POST /api/billing/checkout` again → **409**; a checkout URL created earlier is expired and can no longer be paid.
+10. Never use `org_flowops_demo` or Brian's org on production for these tests.
 
 ## 10. Founder decisions needed (Brian)
 
