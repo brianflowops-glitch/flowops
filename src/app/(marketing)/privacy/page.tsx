@@ -52,7 +52,7 @@ export default function PrivacyPage() {
       </p>
       <UL>
         <li>
-          <strong className="text-white">Opt-in on the booking form.</strong> Appointment texts (confirmations, reschedules, cancellations and reminders) are sent
+          <strong className="text-white">Opt-in on the booking form.</strong> Appointment texts (confirmations, reschedules and cancellations) are sent
           only when a customer enters a mobile number <em>and</em> ticks the text-message opt-in checkbox on a FlowOps booking page (for example{" "}
           <a className="text-cyan-300 hover:underline" href="https://flowopsagent.ai/book/flowops-demo">flowopsagent.ai/book/flowops-demo</a>), or otherwise
           tells the business they agree. The box is never pre-ticked, and texting is not required to book. Consent is not a condition of purchase.
