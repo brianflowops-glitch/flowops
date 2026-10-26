@@ -1,4 +1,5 @@
-// DB integration tests for webhook STOP/START phone matching and the sweeper's SMS path.
+// DB integration tests for webhook STOP/START phone matching (incl. the 0007 expression index and time-zone-aware
+// START) and the sweeper's SMS path.
 //   TEST_DATABASE_URL=postgres://postgres@127.0.0.1:55433/postgres npm run test:db
 // Refuses anything but a localhost database. Applies migrations, uses its own random test org, deletes it at the end.
 // Provider calls are mocked (global fetch); nothing is sent.
@@ -33,6 +34,8 @@ globalThis.fetch = (async (u: string | URL | Request, init?: RequestInit) => {
   const { migrate } = await import("drizzle-orm/node-postgres/migrator");
   const { getDb, getConn, schema } = await import("../src/lib/db");
   const { toE164 } = await import("../src/lib/phone");
+  const { localStamp } = await import("../src/lib/booking/engine");
+  const { readFileSync } = await import("node:fs");
   const { applySmsKeyword, phoneE164Sql } = await import("../src/lib/server/webhooks/store");
   const { sweepQueuedNotifications } = await import("../src/lib/server/notification-sweeper");
   const { notifierAdapter } = await import("../src/lib/server/integrations/notify");
@@ -75,6 +78,46 @@ globalThis.fetch = (async (u: string | URL | Request, init?: RequestInit) => {
   check("START restores upcoming STOP-revoked bookings in every format", started === 5 && ["dash", "paren", "space", "plus1", "e164"].every((k) => s[k].c), { started });
   check("START does not restore past bookings or never-consented ones", !s.past.c && !s.noConsent.c);
 
+  // 2b. START is time-zone-aware: "upcoming" is judged in each business's own zone (date/time are org-local).
+  const tzPhone = "+16105550177";
+  const localAt = (offsetMin: number, tz: string) => { const s = localStamp(new Date(Date.now() + offsetMin * 60_000), tz); return { date: s.slice(0, 10), time: s.slice(11, 16) }; };
+  const tzOrgs = { kir: { id: `${org}_kir`, tz: "Pacific/Kiritimati" }, hnl: { id: `${org}_hnl`, tz: "Pacific/Honolulu" }, bad: { id: `${org}_bad`, tz: "Not/AZone" } };
+  for (const o of Object.values(tzOrgs)) await db.insert(schema.organization).values({ id: o.id, slug: o.id, name: `TZ ${o.tz}`, timeZone: o.tz, hours: {} as never });
+  const tzBookings = {
+    kirPast: { org: tzOrgs.kir.id, ...localAt(-60, tzOrgs.kir.tz) }, // an hour ago in UTC+14: always on/after the UTC date, so a UTC date-only rule wrongly restores it
+    kirSoon: { org: tzOrgs.kir.id, ...localAt(60, tzOrgs.kir.tz) },
+    hnlPast: { org: tzOrgs.hnl.id, ...localAt(-60, tzOrgs.hnl.tz) },
+    hnlSoon: { org: tzOrgs.hnl.id, ...localAt(60, tzOrgs.hnl.tz) }, // in UTC-10: before the UTC date for much of the day
+    badFuture: { org: tzOrgs.bad.id, date: "2099-01-01", time: "10:00" },
+    badPast: { org: tzOrgs.bad.id, date: "2000-01-01", time: "10:00" },
+  };
+  const tzIds: Record<string, string> = {};
+  for (const [k, b] of Object.entries(tzBookings)) {
+    tzIds[k] = `BK-tz-${k}-${randomUUID().slice(0, 6)}`;
+    await db.insert(schema.booking).values({ ...base, organizationId: b.org, id: tzIds[k], phone: "610-555-0177", smsConsent: true, smsConsentAt: new Date(), date: b.date, time: b.time });
+  }
+  const tzStopped = await db.transaction((tx) => applySmsKeyword(tx, tzPhone, "STOP"));
+  const tzStarted = await db.transaction((tx) => applySmsKeyword(tx, tzPhone, "START"));
+  const tzState = Object.fromEntries((await db.select({ id: schema.booking.id, c: schema.booking.smsConsent }).from(schema.booking).where(inArray(schema.booking.id, Object.values(tzIds)))).map((r) => [Object.keys(tzIds).find((k) => tzIds[k] === r.id)!, r.c]));
+  check("TZ: STOP revoked all 6 bookings", tzStopped === 6, { tzStopped });
+  check("TZ: START restores bookings upcoming in their own zone (Kiritimati +1h, Honolulu +1h)", tzState.kirSoon === true && tzState.hnlSoon === true, { tzState, tzBookings });
+  check("TZ: START leaves bookings already past in their own zone (Kiritimati −1h, Honolulu −1h)", tzState.kirPast === false && tzState.hnlPast === false, { tzState, tzBookings });
+  check("TZ: unknown zone falls back to date-only (future restored, past not)", tzState.badFuture === true && tzState.badPast === false, tzState);
+  check("TZ: START count matches", tzStarted === 3, { tzStarted });
+
+  // 2c. 0007 expression index exists, re-applying it is a no-op, and the planner uses it for the STOP/START match.
+  const idx = (await db.execute<{ indexdef: string }>(sql`select indexdef from pg_indexes where tablename = 'booking' and indexname = 'booking_phone_e164_idx'`)).rows;
+  check("0007: booking_phone_e164_idx exists", idx.length === 1);
+  let reapplied = true;
+  try { await db.execute(sql.raw(readFileSync("./drizzle/0007_phone_e164_idx.sql", "utf8"))); } catch (e) { reapplied = false; console.error(e); }
+  check("0007: re-running the migration SQL is a no-op (IF NOT EXISTS)", reapplied);
+  const plan = await db.transaction(async (tx) => {
+    await tx.execute(sql`set local enable_seqscan = off`);
+    const r = await tx.execute<{ "QUERY PLAN": string }>(sql`explain select ${schema.booking.id} from ${schema.booking} where ${phoneE164Sql(schema.booking.phone)} = ${"+16105550134"} and ${schema.booking.smsConsent} = true`);
+    return r.rows.map((x) => x["QUERY PLAN"]).join("\n");
+  });
+  check("0007: planner can use booking_phone_e164_idx for the STOP/START phone match", /booking_phone_e164_idx/.test(plan), plan);
+
   // 3. Sweeper + sendSms with a non-E.164 stored phone: sends to E.164, and honors STOP for that phone.
   const mk = async (id: string, booking: string) =>
     db.insert(schema.notification).values({ id, organizationId: org, at: new Date(Date.now() - 6 * 60_000), bookingId: booking, recipient: stored.paren, channel: "sms", subject: "Booking confirmed: S on 2099-01-01 at 10:00", deliveryStatus: "queued", detail: "queued" });
@@ -107,8 +150,8 @@ globalThis.fetch = (async (u: string | URL | Request, init?: RequestInit) => {
 
   // Cleanup: only this run's org (cascades to its bookings/notifications) and the opt-out row it created.
   await db.delete(schema.notificationFailure).where(eq(schema.notificationFailure.organizationId, org));
-  await db.delete(schema.organization).where(eq(schema.organization.id, org));
-  await db.delete(schema.smsOptOut).where(inArray(schema.smsOptOut.phone, ["+16105550134"]));
+  await db.delete(schema.organization).where(inArray(schema.organization.id, [org, ...Object.values(tzOrgs).map((o) => o.id)]));
+  await db.delete(schema.smsOptOut).where(inArray(schema.smsOptOut.phone, ["+16105550134", tzPhone]));
   await new Promise((r) => setTimeout(r, 200));
   await getConn().pool.end();
   console.log(`\n${failed ? `${failed} FAILED` : "all DB checks passed"}`);
