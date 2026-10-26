@@ -79,7 +79,7 @@ export interface NotificationRecord {
   recipient: string;
   channel: "email (simulated)" | "sms (simulated)" | "email" | "sms";
   subject: string;
-  deliveryStatus: "simulated-sent" | "sent" | "failed";
+  deliveryStatus: "simulated-sent" | "queued" | "sent" | "failed";
   detail?: string;
 }
 
