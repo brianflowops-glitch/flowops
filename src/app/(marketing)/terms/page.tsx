@@ -78,10 +78,16 @@ export default function TermsPage() {
           to receive appointment texts.
         </li>
         <li>
-          <strong className="text-white">Replies to people who text us</strong> — when you text our number first with questions about FlowOps, its features, pricing
-          or sales, we reply to your questions in that conversation.
+          <strong className="text-white">Replies to people who text us</strong> — when you text our number first with questions about your appointment or our service,
+            we reply to your questions in that conversation.
         </li>
       </UL>
+      <p>
+        See exactly how customers opt in, including the booking-form checkbox and its wording, on our{" "}
+        <Link href="/sms-consent" className="text-cyan-300 hover:underline">SMS consent page</Link> (
+        <a className="text-cyan-300 hover:underline" href="https://flowopsagent.ai/sms-consent">flowopsagent.ai/sms-consent</a>). We do not send marketing or
+        promotional text messages.
+      </p>
       <UL>
         <li><strong className="text-white">Consent is not a condition of purchase.</strong> You do not have to agree to receive texts to book an appointment or buy any product or service.</li>
         <li><strong className="text-white">Message frequency varies</strong> depending on your bookings and conversations with us.</li>

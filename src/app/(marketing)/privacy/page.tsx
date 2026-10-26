@@ -58,8 +58,8 @@ export default function PrivacyPage() {
           tells the business they agree. The box is never pre-ticked, and texting is not required to book. Consent is not a condition of purchase.
         </li>
         <li>
-          <strong className="text-white">People who text us first.</strong> If you text our FlowOps number with questions about FlowOps, its features, pricing or
-          sales, we reply to you in that conversation. By texting us you agree to receive those replies.
+          <strong className="text-white">People who text us first.</strong> If you text our FlowOps number with questions about your appointment or our service, 
+           we reply to you in that conversation. By texting us you agree to receive those replies.
         </li>
       </UL>
       <p>
