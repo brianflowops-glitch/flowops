@@ -54,6 +54,7 @@ export function BookingCenter() {
     durationMin: 60,
   });
   const [fault, setFault] = useState<"" | PipelineAgent>("");
+  const faultAllowed = Boolean(me?.integrations.faultInjection);
   const [steps, setSteps] = useState<AgentStep[]>(idleSteps);
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<PipelineResult | null>(null);
@@ -84,7 +85,7 @@ export function BookingCenter() {
   async function exec(fn: (opts: { stepDelayMs: number; onStep: (s: AgentStep[]) => void; failAgent?: PipelineAgent }) => Promise<PipelineResult>) {
     setRunning(true);
     setResult(null);
-    const r = await fn({ stepDelayMs: 320, onStep: setSteps, failAgent: fault || undefined });
+    const r = await fn({ stepDelayMs: 320, onStep: setSteps, failAgent: (faultAllowed && fault) || undefined });
     setSteps(r.steps.map((s) => ({ ...s })));
     setResult(r);
     setRunning(false);
@@ -215,6 +216,7 @@ export function BookingCenter() {
                 </select>
               </Field>
             </div>
+            {faultAllowed && (
             <details className="rounded-lg border border-white/[0.06] bg-black/20 px-3 py-2 text-xs text-slate-400">
               <summary className="cursor-pointer select-none">Fault injection (test agent failure handling)</summary>
               <div className="mt-2">
@@ -228,6 +230,7 @@ export function BookingCenter() {
                 </select>
               </div>
             </details>
+            )}
             <button
               type="submit"
               disabled={running || !hydrated}
