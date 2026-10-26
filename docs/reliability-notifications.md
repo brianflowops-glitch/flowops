@@ -52,3 +52,20 @@ New env vars (all optional):
 | `TWILIO_STATUS_CALLBACK_URL` | e.g. `https://flowopsagent.ai/api/webhooks/twilio/status`; sent with each SMS |
 | `TWILIO_WEBHOOK_BASE_URL` | Public origin Twilio signs against if the request host differs (e.g. `https://flowopsagent.ai`) |
 | `TWILIO_KEYWORD_REPLIES` | `true` = reply to STOP/START/HELP from FlowOps (leave off if Twilio Advanced Opt-Out replies) |
+
+## Recovery sweeper for stuck "queued" notifications — migration `0005_notification_sweeper` (additive)
+Depends on PR #3 (`fix/booking-side-effects-after-commit`, 9d20c66), which writes notification rows as `queued`
+in the booking transaction and sends right after commit. If the function dies in between, rows stay `queued`.
+- `GET /api/cron/notifications` (Vercel Cron, `Authorization: Bearer $CRON_SECRET`; 503 if unset, 401 on mismatch)
+  runs `sweepQueuedNotifications()` (`src/lib/server/notification-sweeper.ts`).
+- Adds `notification.claimed_at`, `notification.sweep_attempts` (default 0) and index `(delivery_status, at)`.
+- Picks rows `queued` for > 5 min and < 24 h. Atomic claim: `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED)
+  RETURNING` sets `claimed_at` (10-min lease) and bumps `sweep_attempts` (max 3), so overlapping runs never claim the
+  same row. Finalizes with `WHERE delivery_status = 'queued'` so it never overwrites PR #3's own result.
+- Skips (marks `failed` with a reason) when the booking is gone, a newer notification exists for the same booking +
+  channel (rescheduled/cancelled since), or SMS consent was withdrawn. Rows older than 24 h, or out of sweeps, are
+  expired → `failed` + failure log + alert.
+- Re-sends use the retry logic above; email uses Resend `Idempotency-Key: flowops-notification-<row id>`.
+- Body is rebuilt from the booking with the engine's template (duplicated in `emailBodyFor`; keep in sync).
+- Schedule needs a `vercel.json` cron entry (not committed; deployment-setting change needs approval):
+  `{ "crons": [{ "path": "/api/cron/notifications", "schedule": "*/5 * * * *" }] }` (Hobby plans only allow daily crons).

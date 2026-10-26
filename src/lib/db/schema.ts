@@ -245,8 +245,12 @@ export const notification = pgTable(
     subject: text("subject").notNull(),
     deliveryStatus: text("delivery_status").notNull(),
     detail: text("detail"),
+    /** v2.4 sweeper lease: set atomically when the recovery cron claims a stale "queued" row. */
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    /** v2.4: how many times the recovery cron has claimed this row (capped, so it can't loop). */
+    sweepAttempts: integer("sweep_attempts").notNull().default(0),
   },
-  (t) => [index("notification_org_at_idx").on(t.organizationId, t.at)],
+  (t) => [index("notification_org_at_idx").on(t.organizationId, t.at), index("notification_status_at_idx").on(t.deliveryStatus, t.at)],
 );
 
 /**

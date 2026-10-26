@@ -11,6 +11,11 @@ import { type AttemptOutcome, type FailureKind, maskEmail, parseRetryAfter, with
 export interface SendMeta {
   tag?: string;
   organizationId?: string | null;
+  /**
+   * Email only: stable Resend Idempotency-Key for this logical message (e.g. `notification-<row id>`), so a
+   * later re-send of the same row (recovery sweeper) is deduped by Resend for 24 h. Default: random per call.
+   */
+  idempotencyKey?: string;
 }
 
 /** Record a final failure + alert without blocking the caller (kept alive past the response on Vercel). */
@@ -76,7 +81,7 @@ function twilioAuthHeader() {
  * Never throws. A final failure is recorded in notification_failure and alerted (see notification-failures.ts).
  */
 export async function sendEmail(to: string, subject: string, text: string, replyTo?: string, meta?: SendMeta): Promise<{ ok: boolean; detail?: string }> {
-  const idempotencyKey = `flowops-${randomUUID()}`;
+  const idempotencyKey = meta?.idempotencyKey ? `flowops-${meta.idempotencyKey}`.slice(0, 256) : `flowops-${randomUUID()}`;
   const payload = JSON.stringify({
     from: process.env.RESEND_FROM_EMAIL || "FlowOps <onboarding@resend.dev>",
     to: [to],
@@ -193,8 +198,10 @@ export function notifierAdapter(opts: { businessName?: string; organizationId?: 
   if (!email && !sms) return undefined;
   return {
     channels: { email, sms },
-    async send(b, subject, body, channel) {
-      const meta: SendMeta = { tag: `booking:${b.id}`, organizationId: opts.organizationId };
+    // sendOpts.idempotencyKey is "notification-<row id>" from the pipeline (PR #3); the sweeper uses the same
+    // format, so an email re-sent for the same row reuses Resend Idempotency-Key "flowops-notification-<row id>".
+    async send(b, subject, body, channel, sendOpts) {
+      const meta: SendMeta = { tag: `booking:${b.id}`, organizationId: opts.organizationId, idempotencyKey: sendOpts?.idempotencyKey };
       if (channel === "email") return sendEmail(b.email, subject, body, process.env.RESEND_REPLY_TO || undefined, meta);
       return sendSms(b.phone!, smsBody(subject, b.id, opts.businessName), b.id, meta);
     },
