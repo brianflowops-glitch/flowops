@@ -36,8 +36,13 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      # Next 16 declares route types (e.g. the global LayoutProps) in generated files; without
+      # this, `tsc --noEmit` fails on a clean checkout with two LayoutProps errors.
+      - name: Generate Next route types
+        run: npx next typegen
+
       - name: Typecheck
-        run: npm run typecheck
+        run: npx tsc --noEmit
 
       - name: Test
         run: npm test
