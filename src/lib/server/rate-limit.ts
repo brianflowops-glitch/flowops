@@ -3,11 +3,18 @@ import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { ipAddress } from "@vercel/functions";
 import { getDb } from "@/lib/db";
+import { sendOpsAlertText } from "@/lib/server/integrations/notification-failures";
+import { MemoryRateLimiter } from "./rate-limit-memory";
+
+const fallback = new MemoryRateLimiter();
 
 /**
  * Fixed-window rate limiter stored in the existing `rate_limit` table (shared with Better Auth;
  * our keys are prefixed `flowops:` so they never collide). One atomic upsert per check.
- * Fails open (allows) if the database errors, so a limiter hiccup never takes the app down.
+ * If the database errors, falls back to a per-instance in-memory limiter with the same limits (previously it
+ * failed open and allowed everything), and fires a throttled ops alert so the outage isn't silent.
+ * Covers every caller: public booking (book:*), availability (avail:*) and FlowAI (ai:user:*, ai:org:*).
+ * Sign-in/sign-up limits are Better Auth's own (auth.ts) and are not affected.
  */
 export async function rateLimit(key: string, max: number, windowSec: number): Promise<{ ok: boolean; retryAfter: number }> {
   const now = Date.now();
@@ -26,8 +33,13 @@ export async function rateLimit(key: string, max: number, windowSec: number): Pr
     const retryAfter = Math.max(1, Math.ceil((started + windowSec * 1000 - now) / 1000));
     return { ok: Number(row.count) <= max, retryAfter };
   } catch (e) {
-    console.error("rateLimit failed (allowing request)", e);
-    return { ok: true, retryAfter: 0 };
+    console.error(`rateLimit database error — using in-memory fallback (${e instanceof Error ? e.message.slice(0, 120) : "unknown error"})`);
+    sendOpsAlertText(
+      "rate_limit_db_error",
+      "Rate limiter database error",
+      "FlowOps alert: rate limiter could not reach the database; using the per-instance in-memory fallback.",
+    ).catch(() => {});
+    return fallback.check(`flowops:${key}`, max, windowSec, now);
   }
 }
 

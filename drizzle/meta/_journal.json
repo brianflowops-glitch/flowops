@@ -22,6 +22,27 @@
       "when": 1792961215000,
       "tag": "0002_booking_sms_consent",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1793041990977,
+      "tag": "0003_notification_failures",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1793042318437,
+      "tag": "0004_provider_webhooks",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1793042663058,
+      "tag": "0005_notification_sweeper",
+      "breakpoints": true
     }
   ]
 }
