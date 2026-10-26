@@ -1,0 +1,46 @@
+{
+  "name": "flowops",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "test": "tsx scripts/run-tests.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "tsx scripts/db-migrate.ts",
+    "db:migrate:local": "dotenv -e .env.development.local -- tsx scripts/db-migrate.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/react": "^3.0.318",
+    "@vercel/functions": "^3.10.3",
+    "ai": "^6.0.315",
+    "better-auth": "^1.7.13",
+    "drizzle-orm": "^0.45.4",
+    "lucide-react": "^1.61.0",
+    "next": "16.4.3",
+    "pg": "^8.23.1",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "server-only": "^0.0.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@neondatabase/serverless": "^1.2.0",
+    "@tailwindcss/turbopack": "^4",
+    "@types/node": "^20",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@types/ws": "^8.18.2",
+    "dotenv-cli": "^11.0.0",
+    "drizzle-kit": "^0.31.11",
+    "eslint": "^9",
+    "eslint-config-next": "16.4.3",
+    "tailwindcss": "^4",
+    "tsx": "^4.23.15",
+    "typescript": "^5",
+    "ws": "^8.22.0"
+  }
+}

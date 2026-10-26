@@ -1,0 +1,39 @@
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background: #060a14;
+  color: #e2e8f0;
+}
+
+::selection {
+  background: rgba(34, 211, 238, 0.3);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.2) transparent;
+}
+
+input[type="date"]::-webkit-calendar-picker-indicator,
+input[type="time"]::-webkit-calendar-picker-indicator {
+  filter: invert(0.7);
+}
+
+@keyframes flow-dash {
+  to {
+    stroke-dashoffset: -20;
+  }
+}
+.flow-dash {
+  stroke-dasharray: 4 6;
+  animation: flow-dash 1s linear infinite;
+}
