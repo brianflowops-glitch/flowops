@@ -12,7 +12,9 @@ export async function getOrCreateCustomer(ctx: OrgContext): Promise<string> {
   if (existing) return existing.stripeCustomerId;
   const customer = await getStripe().customers.create(
     { name: ctx.org.name, email: ctx.user.email, metadata: { organizationId: ctx.org.id } },
-    { idempotencyKey: `flowops-customer-${ctx.org.id}` },
+    // Per org + user: a retry by the same person reuses the customer; a different admin never hits a
+    // params-mismatch 400 on a stale key. The DB insert below keeps the first customer per org.
+    { idempotencyKey: `flowops-customer-${ctx.org.id}-${ctx.user.id}` },
   );
   await db.insert(schema.billingCustomer).values({ organizationId: ctx.org.id, stripeCustomerId: customer.id }).onConflictDoNothing();
   const [row] = await db.select().from(schema.billingCustomer).where(eq(schema.billingCustomer.organizationId, ctx.org.id)).limit(1);
