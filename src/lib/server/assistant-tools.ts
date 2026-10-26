@@ -6,6 +6,7 @@ import { getDb, schema } from "@/lib/db";
 import type { PipelineResult } from "@/lib/booking/types";
 import type { OrgContext } from "./context";
 import { availability, listServices, runPipeline } from "./pipeline";
+import { canUseFlowAiTool, flowAiNeedsApproval, type FlowAiTool } from "./flowai-policy";
 
 const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe("YYYY-MM-DD in the business's local time zone");
 const time = z.string().regex(/^\d{2}:\d{2}$/).describe("HH:MM 24-hour local time");
@@ -36,8 +37,31 @@ async function findService(orgId: string, name: string) {
   return { svc: services.find((s) => s.name.toLowerCase() === n) ?? services.find((s) => s.name.toLowerCase().includes(n)), services };
 }
 
-/** FlowAI tools — every write goes through the same 6-agent pipeline, scoped to the signed-in user's org. */
+/**
+ * FlowAI tools — every write goes through the same 6-agent pipeline, scoped to the signed-in user's org.
+ * Authorization comes from FLOWAI_POLICY: tools the user's role can't use are not offered to the
+ * model at all, every execute() re-checks the role (defense in depth), and every mutating tool
+ * requires the user's approval in the UI before it runs.
+ */
 export function assistantTools(ctx: OrgContext) {
+  const all = allTools(ctx);
+  const allowed = {} as Partial<typeof all>;
+  for (const name of Object.keys(all) as FlowAiTool[]) {
+    if (!canUseFlowAiTool(ctx.role, name)) continue;
+    const t = all[name];
+    (allowed as Record<string, unknown>)[name] = {
+      ...t,
+      needsApproval: flowAiNeedsApproval(name),
+      execute: async (input: never, options: never) => {
+        if (!canUseFlowAiTool(ctx.role, name)) return { ok: false, error: `Your role (${ctx.role}) can't use ${name}.` };
+        return (t.execute as (i: never, o: never) => unknown)(input, options);
+      },
+    };
+  }
+  return allowed as typeof all;
+}
+
+function allTools(ctx: OrgContext) {
   const actor = `flowai:${ctx.user.email}`;
   return {
     listServices: tool({
@@ -148,7 +172,6 @@ export function assistantTools(ctx: OrgContext) {
     cancelBooking: tool({
       description: "Cancel a booking. The user must confirm in the UI before this runs.",
       inputSchema: z.object({ bookingId: z.string(), reason: z.string().optional() }),
-      needsApproval: true,
       execute: async ({ bookingId }) => summarize(await runPipeline(ctx.org, { action: "cancel", bookingId }, { actor, source: "assistant" })),
     }),
   };

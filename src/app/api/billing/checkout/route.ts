@@ -1,0 +1,43 @@
+import { z } from "zod";
+import { billingConfigured, billingEnabled, planByKey } from "@/lib/billing/config";
+import { expireOpenCheckoutSessions, findLiveStripeSubscription, getOrCreateCustomer } from "@/lib/billing/checkout";
+import { getStripe } from "@/lib/billing/stripe";
+import { requireApi } from "@/lib/server/context";
+import { badRequest, readJson } from "@/lib/server/validation";
+
+const body = z.object({ plan: z.string().min(1).max(64) });
+
+/** Owner or Admin starts Stripe Checkout for a configured plan. 404 unless BILLING_ENABLED=true. */
+export async function POST(req: Request) {
+  if (!billingEnabled()) return new Response("Not found", { status: 404 });
+  if (!billingConfigured()) return Response.json({ error: "Billing not configured" }, { status: 503 });
+  const ctx = await requireApi(req, { manager: true }); // Owner or Admin (canManageBilling); /api/billing/* is exempt from the billing lock
+  if (ctx instanceof Response) return ctx;
+  const parsed = body.safeParse(await readJson(req));
+  if (!parsed.success) return badRequest(parsed.error);
+  const plan = planByKey(parsed.data.plan);
+  if (!plan) return badRequest("Unknown plan");
+
+  const origin = new URL(req.url).origin;
+  const customer = await getOrCreateCustomer(ctx);
+  // One subscription per org: a second Checkout would double-bill. Plan changes go through the portal.
+  // Old open sessions are expired first, so a stale checkout tab can't start a second subscription either.
+  await expireOpenCheckoutSessions(customer);
+  const live = await findLiveStripeSubscription(customer);
+  if (live)
+    return Response.json(
+      { error: "This organization already has a subscription. Use the billing portal to change plan or payment method.", status: live.status },
+      { status: 409 },
+    );
+  const session = await getStripe().checkout.sessions.create({
+    mode: "subscription",
+    customer,
+    client_reference_id: ctx.org.id,
+    line_items: [{ price: plan.priceId, quantity: 1 }],
+    subscription_data: { metadata: { organizationId: ctx.org.id } },
+    metadata: { organizationId: ctx.org.id },
+    success_url: `${origin}/admin?billing=success`,
+    cancel_url: `${origin}/admin?billing=cancelled`,
+  });
+  return Response.json({ url: session.url });
+}

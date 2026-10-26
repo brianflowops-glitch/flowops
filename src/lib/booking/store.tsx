@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { emptyState } from "./engine";
 import type { AgentStep, BookingRequest, EngineState, PipelineAgent, PipelineResult, WeekHoursClient } from "./types";
+import { isBillingLockedResponse } from "@/lib/billing/lock-copy";
 
 export interface ServiceRow {
   id: string;
@@ -93,6 +94,11 @@ export function BookingProvider({ children }: { children: React.ReactNode }) {
         return;
       }
       const data = await res.json();
+      // Billing got locked mid-session: re-render the layout, which shows the billing lock screen.
+      if (isBillingLockedResponse(res.status, data)) {
+        router.refresh();
+        return;
+      }
       if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
       setState(data.state);
       setMe({ user: data.user, role: data.role, org: data.org, today: data.today, services: data.services, team: data.team, integrations: data.integrations });

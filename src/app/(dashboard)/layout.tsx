@@ -4,6 +4,10 @@ import { AppShell } from "@/components/app-shell";
 import { getContext } from "@/lib/server/context";
 import { hasDatabase } from "@/lib/db";
 import { resendConfigured } from "@/lib/server/integrations/notify";
+import { getBillingAccess } from "@/lib/billing/access";
+import { plans } from "@/lib/billing/config";
+import { lockScreenCopy } from "@/lib/billing/lock-copy";
+import { BillingLocked } from "@/components/billing/billing-locked";
 
 async function Gate({ children }: { children: React.ReactNode }) {
   if (!hasDatabase()) {
@@ -18,6 +22,13 @@ async function Gate({ children }: { children: React.ReactNode }) {
   }
   const ctx = await getContext();
   if (!ctx) redirect("/sign-in");
+  // Failed card / no active plan → lock screen instead of the app (no-op while BILLING_ENABLED is off).
+  const access = await getBillingAccess(ctx.org.id, ctx.role);
+  if (access.access === "locked") {
+    // Plan keys only (never price ids) and only for people who can act on them.
+    const planKeys = access.canManageBilling ? plans().map((p) => p.key) : [];
+    return <BillingLocked copy={lockScreenCopy(access)} orgName={ctx.org.name} planKeys={planKeys} />;
+  }
   return (
     <AppShell
       session={{

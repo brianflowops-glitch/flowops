@@ -1,5 +1,8 @@
 import type { Role } from "@/lib/server/context";
 
+/** Owner and Admin manage the team (invites, reset links) and billing. Settings stay Owner-only. */
+export const canManageTeam = (r: Role) => r === "owner" || r === "admin";
+
 /** Who may invite which role: Owner → Admin or Staff; Admin → Staff. */
 export function canInviteRole(actor: Role, role: "admin" | "staff") {
   if (actor === "owner") return true;
