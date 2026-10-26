@@ -318,3 +318,60 @@ export const smsOptOut = pgTable("sms_opt_out", {
 export const userRelations = relations(user, ({ many }) => ({ sessions: many(session), accounts: many(account) }));
 export const sessionRelations = relations(session, ({ one }) => ({ user: one(user, { fields: [session.userId], references: [user.id] }) }));
 export const accountRelations = relations(account, ({ one }) => ({ user: one(user, { fields: [account.userId], references: [user.id] }) }));
+
+// ───────────────────────────── Billing (Stripe, v2.4, additive 0006) ─────────────────────────────
+// See docs/BILLING.md. Stripe is the source of truth; these rows mirror it from webhooks.
+// Plain text status column (no DB enum), matching the member.role convention.
+
+/** One Stripe customer per organization. */
+export const billingCustomer = pgTable(
+  "billing_customer",
+  {
+    organizationId: text("organization_id")
+      .primaryKey()
+      .references(() => organization.id, { onDelete: "cascade" }),
+    stripeCustomerId: text("stripe_customer_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("billing_customer_stripe_customer_unique").on(t.stripeCustomerId)],
+);
+
+export const SUBSCRIPTION_STATUSES = [
+  "trialing",
+  "active",
+  "past_due",
+  "canceled",
+  "incomplete",
+  "incomplete_expired",
+  "unpaid",
+  "paused",
+] as const;
+export type SubscriptionStatus = (typeof SUBSCRIPTION_STATUSES)[number];
+
+/** Mirror of a Stripe subscription, scoped to one organization. */
+export const subscription = pgTable(
+  "subscription",
+  {
+    id: text("id").primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organization.id, { onDelete: "cascade" }),
+    stripeSubscriptionId: text("stripe_subscription_id").notNull(),
+    status: text("status", { enum: SUBSCRIPTION_STATUSES }).notNull(),
+    /** Stripe price id (price_…); mapped to a plan key via STRIPE_PRICE_* env vars. */
+    priceId: text("price_id"),
+    currentPeriodEnd: timestamp("current_period_end", { withTimezone: true }),
+    cancelAtPeriodEnd: boolean("cancel_at_period_end").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("subscription_stripe_subscription_unique").on(t.stripeSubscriptionId), index("subscription_org_idx").on(t.organizationId)],
+);
+
+/** Processed Stripe webhook events (idempotency: Stripe retries and may deliver an event more than once). */
+export const stripeEvent = pgTable("stripe_event", {
+  id: text("id").primaryKey(), // evt_…
+  type: text("type").notNull(),
+  processedAt: timestamp("processed_at", { withTimezone: true }).notNull().defaultNow(),
+});
