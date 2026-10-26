@@ -12,6 +12,7 @@
 import { relations } from "drizzle-orm";
 import { bigint, boolean, index, integer, jsonb, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
 import type { DayHours } from "@/lib/booking/types";
+import { phoneE164Sql } from "./phone-sql";
 
 // ───────────────────────────── Better Auth core ─────────────────────────────
 
@@ -210,7 +211,12 @@ export const booking = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
   },
-  (t) => [index("booking_org_date_idx").on(t.organizationId, t.date), index("booking_org_status_idx").on(t.organizationId, t.status)],
+  (t) => [
+    index("booking_org_date_idx").on(t.organizationId, t.date),
+    index("booking_org_status_idx").on(t.organizationId, t.status),
+    /** STOP/START match on the normalized phone (migration 0007). Must stay identical to the query's phoneE164Sql. */
+    index("booking_phone_e164_idx").on(phoneE164Sql(t.phone)),
+  ],
 );
 
 export const auditEntry = pgTable(
