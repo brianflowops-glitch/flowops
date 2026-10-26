@@ -11,7 +11,8 @@ export interface NotificationFailure {
   organizationId?: string | null;
   /** Already-redacted target (maskPhone / maskEmail). */
   target: string;
-  failureKind: FailureKind;
+  /** Send-time kinds from withRetry, or post-acceptance kinds from provider webhooks. */
+  failureKind: FailureKind | "undelivered" | "bounced" | "complained";
   detail: string;
   attempts: number;
 }

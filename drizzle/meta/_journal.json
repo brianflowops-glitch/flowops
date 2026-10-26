@@ -29,6 +29,13 @@
       "when": 1793041990977,
       "tag": "0003_notification_failures",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1793042318437,
+      "tag": "0004_provider_webhooks",
+      "breakpoints": true
     }
   ]
 }

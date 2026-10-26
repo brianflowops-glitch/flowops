@@ -6,7 +6,8 @@
  * - Tenancy: organization (tenant), member (user ↔ org, role owner|admin|staff),
  *   team_invite (token invites, v2.1), staff_invite (legacy email-match invites)
  * - Booking data, all scoped by organization_id: service, booking, audit_entry, notification
- * - Reliability: notification_failure (final send failures after retries; redacted)
+ * - Reliability: notification_failure (final send failures after retries; redacted),
+ *   provider_webhook_event (dedupe), message_delivery_event, sms_opt_out
  */
 import { relations } from "drizzle-orm";
 import { bigint, boolean, index, integer, jsonb, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
@@ -268,6 +269,46 @@ export const notificationFailure = pgTable(
   },
   (t) => [index("notification_failure_org_created_idx").on(t.organizationId, t.createdAt), index("notification_failure_created_idx").on(t.createdAt)],
 );
+
+/** Inbound provider webhook dedupe (v2.4): one row per (provider, event key); a replay hits the unique index. */
+export const providerWebhookEvent = pgTable(
+  "provider_webhook_event",
+  {
+    id: text("id").primaryKey(),
+    provider: text("provider").notNull(), // "twilio" | "resend"
+    eventKey: text("event_key").notNull(), // Twilio MessageSid[:MessageStatus], Resend svix-id
+    eventType: text("event_type").notNull(),
+    receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("provider_webhook_event_key_uq").on(t.provider, t.eventKey)],
+);
+
+/** Delivery status callbacks (Twilio StatusCallback, Resend email.* events). Append-only. */
+export const messageDeliveryEvent = pgTable(
+  "message_delivery_event",
+  {
+    id: text("id").primaryKey(),
+    provider: text("provider").notNull(),
+    messageId: text("message_id").notNull(), // Twilio SM…/MM… sid or Resend email id
+    status: text("status").notNull(), // e.g. delivered, undelivered, failed, email.bounced
+    errorCode: text("error_code"),
+    detail: text("detail"), // scrubbed
+    occurredAt: timestamp("occurred_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("message_delivery_event_msg_idx").on(t.provider, t.messageId)],
+);
+
+/**
+ * Carrier-level SMS opt-out state per phone (E.164) for the FlowOps sender. STOP applies to every org that
+ * texts from the shared number, so this is not org-scoped. Checked before every outbound SMS.
+ */
+export const smsOptOut = pgTable("sms_opt_out", {
+  phone: text("phone").primaryKey(),
+  optedOut: boolean("opted_out").notNull(),
+  keyword: text("keyword").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 // Relations (used by Better Auth joins and Drizzle relational queries)
 export const userRelations = relations(user, ({ many }) => ({ sessions: many(session), accounts: many(account) }));

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { waitUntil } from "@vercel/functions";
 import type { NotifierAdapter } from "@/lib/booking/types";
 import { maskPhone, toE164 } from "@/lib/phone";
+import { isSmsOptedOut } from "@/lib/server/webhooks/store";
 import { recordNotificationFailure } from "./notification-failures";
 import { type AttemptOutcome, type FailureKind, maskEmail, parseRetryAfter, withRetry } from "./retry";
 
@@ -134,8 +135,15 @@ export async function sendSms(to: string, body: string, ref?: string, meta?: Sen
     reportFailure("sms", maskPhone(to), failMeta, { detail: "invalid phone number", attempts: 0, failureKind: "permanent" });
     return { ok: false, detail: "Twilio: invalid phone number" };
   }
+  if (await isSmsOptedOut(dest)) {
+    // Customer replied STOP (see /api/webhooks/twilio/inbound). Not an ops failure, so no alert.
+    console.error(`[twilio] ${tag} not sent: customer opted out (STOP)`);
+    return { ok: false, detail: "Twilio: not sent — customer has opted out (replied STOP)" };
+  }
   const sid = process.env.TWILIO_ACCOUNT_SID!.trim();
   const params = new URLSearchParams({ To: dest, Body: body.slice(0, 600) });
+  const statusCallback = process.env.TWILIO_STATUS_CALLBACK_URL?.trim();
+  if (statusCallback) params.set("StatusCallback", statusCallback);
   const mss = process.env.TWILIO_MESSAGING_SERVICE_SID?.trim();
   if (mss) params.set("MessagingServiceSid", mss);
   else params.set("From", twilioFrom()!);

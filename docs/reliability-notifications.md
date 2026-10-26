@@ -37,3 +37,22 @@ Recommended (needs owner sign-off; not implemented here):
    outage degrades protection instead of removing it.
 3. **Alert on fail-open**: count limiter DB errors and call the ops alert hook (throttled) so it isn't silent.
 4. Keep the public booking page fail-open (availability matters more there), with the in-memory fallback.
+
+## Inbound provider webhooks — migration `0004_provider_webhooks` (additive: 3 new tables)
+| Route | Verifies | Dedupe key | Writes |
+| --- | --- | --- | --- |
+| `POST /api/webhooks/twilio/inbound` | `X-Twilio-Signature` (HMAC-SHA1, `TWILIO_AUTH_TOKEN`) | `inbound:<MessageSid>` | STOP → `sms_opt_out.opted_out=true`, `booking.sms_consent=false` for that phone (all orgs; `sms_consent_at` kept as the original opt-in record; history entry `sms_opt_out`). START → opt-out cleared; consent restored (new `sms_consent_at`) only on upcoming confirmed bookings previously revoked by STOP. HELP → no DB change. |
+| `POST /api/webhooks/twilio/status` | same | `status:<MessageSid>:<MessageStatus>` | `message_delivery_event`; `failed`/`undelivered` → `notification_failure` + alert |
+| `POST /api/webhooks/resend` | Svix (`svix-id/timestamp/signature`, `RESEND_WEBHOOK_SECRET`, 5-min tolerance) | `svix-id` | `message_delivery_event`; `email.bounced/complained/failed` → `notification_failure` + alert. Opens/clicks ignored. |
+
+Dedupe claim and processing share one transaction (unique index on `provider_webhook_event(provider, event_key)`),
+so a replay is a no-op and a failed processing attempt is retried by the provider. Missing secret → 503 (fail closed).
+`sendSms` now skips numbers in `sms_opt_out` (no alert) and adds `StatusCallback` when `TWILIO_STATUS_CALLBACK_URL` is set.
+
+New env vars (all optional):
+| Var | Purpose |
+| --- | --- |
+| `RESEND_WEBHOOK_SECRET` | Resend webhook signing secret (`whsec_…`) |
+| `TWILIO_STATUS_CALLBACK_URL` | e.g. `https://flowopsagent.ai/api/webhooks/twilio/status`; sent with each SMS |
+| `TWILIO_WEBHOOK_BASE_URL` | Public origin Twilio signs against if the request host differs (e.g. `https://flowopsagent.ai`) |
+| `TWILIO_KEYWORD_REPLIES` | `true` = reply to STOP/START/HELP from FlowOps (leave off if Twilio Advanced Opt-Out replies) |
