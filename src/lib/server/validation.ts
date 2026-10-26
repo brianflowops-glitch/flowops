@@ -52,30 +52,27 @@ export const orgPatch = z.object({
   googleCalendarId: z.string().trim().max(200).nullable().optional(),
 });
 
-export const serviceInput = z.object({
+// Shared field rules for services. serviceInput (create) layers defaults on
+// top; serviceUpdate (PATCH) is a plain partial with no defaults, because zod v4
+// still applies .default() values inside .partial() and would reset fields.
+const serviceFields = {
   name: z.string().trim().min(1).max(120),
-  category: CATEGORY.default("appointment"),
+  category: CATEGORY,
   durationMin: z.coerce.number().int().min(15).max(480),
   resource: z.string().trim().min(1).max(120),
   description: z.string().trim().max(500).optional().nullable(),
-  active: z.boolean().default(true),
-  sortOrder: z.coerce.number().int().default(0),
+  active: z.boolean(),
+  sortOrder: z.coerce.number().int(),
+};
+
+export const serviceInput = z.object({
+  ...serviceFields,
+  category: serviceFields.category.default("appointment"),
+  active: serviceFields.active.default(true),
+  sortOrder: serviceFields.sortOrder.default(0),
 });
 
-// For PATCH: every field optional and no defaults, so a partial update
-// (e.g. toggling `active`) never resets category or sortOrder.
-// (zod v4 still applies .default() inside .partial().)
-export const serviceUpdate = z
-  .object({
-    name: z.string().trim().min(1).max(120),
-    category: CATEGORY,
-    durationMin: z.coerce.number().int().min(15).max(480),
-    resource: z.string().trim().min(1).max(120),
-    description: z.string().trim().max(500).nullable(),
-    active: z.boolean(),
-    sortOrder: z.coerce.number().int(),
-  })
-  .partial();
+export const serviceUpdate = z.object(serviceFields).partial();
 
 export const publicBook = z.object({
   serviceId: z.string().min(1),
