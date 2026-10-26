@@ -230,7 +230,17 @@ export async function runPipeline(
   return result;
 }
 
-/** Executes deferred calendar + notification calls after commit and records their real outcome. Never throws. */
+/**
+ * Executes deferred calendar + notification calls after commit and records their real outcome. Never throws.
+ *
+ * Known limits (tracked for follow-up):
+ * - These calls run OUTSIDE the per-org advisory lock. Two quick reschedules of the same
+ *   booking can therefore reach the calendar provider out of order. Rare; if it matters,
+ *   re-read the booking's latest state before each calendar write.
+ * - If the process dies after commit but before this finishes, notification rows stay at
+ *   status "queued". The notification retry worker (Agent's retry work) owns picking up
+ *   stale "queued" rows; this function only moves rows it created from queued to sent/failed.
+ */
 async function runSideEffects(
   org: Org,
   result: PipelineResult,
