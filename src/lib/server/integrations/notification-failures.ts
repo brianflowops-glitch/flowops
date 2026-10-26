@@ -61,15 +61,34 @@ export function alertConfigured() {
  * The alert never contains message bodies, links, or unmasked contact details.
  */
 export async function sendOpsAlert(f: NotificationFailure, now = Date.now()): Promise<{ webhook?: boolean; email?: boolean; throttled?: boolean }> {
-  if (!alertConfigured()) return {};
-  const key = `${f.channel}:${f.failureKind}:${f.detail.slice(0, 40)}`;
-  const prev = lastAlertAt.get(key);
-  if (prev && now - prev < ALERT_WINDOW_MS) return { throttled: true };
-  lastAlertAt.set(key, now);
-
   const text =
     `FlowOps alert: ${f.channel.toUpperCase()} notification failed (${f.failureKind}) after ${f.attempts} attempt${f.attempts === 1 ? "" : "s"}` +
     ` · ${f.tag} · org ${f.organizationId ?? "n/a"} · to ${f.target} · ${f.detail}`;
+  return deliverAlert(
+    `${f.channel}:${f.failureKind}:${f.detail.slice(0, 40)}`,
+    `${f.channel} notification failed (${f.failureKind})`,
+    text,
+    { type: "notification_failure", ...f },
+    now,
+  );
+}
+
+/** Generic throttled ops alert (same destinations as sendOpsAlert). `key` groups repeats for throttling. Never throws. */
+export async function sendOpsAlertText(key: string, subject: string, text: string, now = Date.now()) {
+  return deliverAlert(`text:${key}`, subject, text, { type: key }, now);
+}
+
+async function deliverAlert(
+  key: string,
+  subject: string,
+  text: string,
+  payload: Record<string, unknown>,
+  now: number,
+): Promise<{ webhook?: boolean; email?: boolean; throttled?: boolean }> {
+  if (!alertConfigured()) return {};
+  const prev = lastAlertAt.get(key);
+  if (prev && now - prev < ALERT_WINDOW_MS) return { throttled: true };
+  lastAlertAt.set(key, now);
   const out: { webhook?: boolean; email?: boolean } = {};
 
   const hook = process.env.ALERT_WEBHOOK_URL?.trim();
@@ -78,7 +97,7 @@ export async function sendOpsAlert(f: NotificationFailure, now = Date.now()): Pr
       const res = await fetch(hook, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, source: "flowops", type: "notification_failure", ...f }),
+        body: JSON.stringify({ text, source: "flowops", ...payload }),
         signal: AbortSignal.timeout(3_000),
       });
       out.webhook = res.ok;
@@ -99,7 +118,7 @@ export async function sendOpsAlert(f: NotificationFailure, now = Date.now()): Pr
         body: JSON.stringify({
           from: process.env.RESEND_FROM_EMAIL || "FlowOps <onboarding@resend.dev>",
           to,
-          subject: `[FlowOps alert] ${f.channel} notification failed (${f.failureKind})`,
+          subject: `[FlowOps alert] ${subject}`,
           text,
         }),
         signal: AbortSignal.timeout(3_000),

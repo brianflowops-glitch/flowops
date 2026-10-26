@@ -26,17 +26,13 @@ Optional env vars (no-op when unset):
 Throttled per instance: one alert per channel + failure kind + error prefix every 5 min. Alert sends are
 direct (no retry, no failure recording) so a broken alert destination can't recurse.
 
-## Recommendation: `rate-limit.ts` fails open (not changed)
-`rateLimit()` returns `{ ok: true }` when the database call throws. That keeps the app up during a DB blip,
-but it means a DB outage (or an attacker who can induce DB errors/timeouts) removes brute-force protection on
-sign-in/sign-up, booking spam protection, and the FlowAI cost cap at the same time.
-Recommended (needs owner sign-off; not implemented here):
-1. **Fail closed for cost/abuse-sensitive keys** (FlowAI, sign-up, sign-in): add a `failMode: "open" | "closed"`
-   option, default open, and pass `"closed"` from those routes (return 429/503 with `Retry-After: 30`).
-2. **Small in-memory fallback** when the DB errors: a per-instance fixed window with a stricter limit, so a DB
-   outage degrades protection instead of removing it.
-3. **Alert on fail-open**: count limiter DB errors and call the ops alert hook (throttled) so it isn't silent.
-4. Keep the public booking page fail-open (availability matters more there), with the in-memory fallback.
+## `rate-limit.ts`: no longer fails open
+Previously `rateLimit()` returned `{ ok: true }` on any database error, which silently removed booking-spam
+protection and the FlowAI cost cap during a DB blip. Now, on a DB error it falls back to a per-instance in-memory
+fixed-window limiter (`rate-limit-memory.ts`) with the same limits for every key (`book:*`, `avail:*`,
+`ai:user:*`, `ai:org:*`) and fires a throttled ops alert. Caveat: per-instance only, so across N warm instances
+the effective limit is up to N× during an outage. Sign-in/sign-up limits belong to Better Auth (`auth.ts`) and
+are unchanged. Possible follow-up: true fail-closed (503) for `ai:*` if the founder prefers cost safety over availability.
 
 ## Inbound provider webhooks — migration `0004_provider_webhooks` (additive: 3 new tables)
 | Route | Verifies | Dedupe key | Writes |
