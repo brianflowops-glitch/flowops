@@ -72,7 +72,7 @@ export default function TermsPage() {
       </p>
       <UL>
         <li>
-          <strong className="text-white">Appointment messages</strong> — booking confirmations, reschedule notices, cancellation notices and appointment reminders,
+          <strong className="text-white">Appointment messages</strong> — confirmations, reschedules and cancellations,
           sent to people who give a mobile number and tick the text-message opt-in box when booking on a FlowOps booking page (for example{" "}
           <a className="text-cyan-300 hover:underline" href="https://flowopsagent.ai/book/flowops-demo">flowopsagent.ai/book/flowops-demo</a>), or who otherwise agree
           to receive appointment texts.

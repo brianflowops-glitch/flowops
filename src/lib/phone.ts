@@ -27,5 +27,6 @@ export function maskPhone(phone: string | null | undefined) {
   return d.length >= 4 ? `•••${d.slice(-4)}` : "•••";
 }
 
+/** Checkbox sentence shared by the booking form and /sms-consent. Links live in SmsConsentCheckbox. */
 export const SMS_CONSENT_TEXT =
-  "Yes, text me about this appointment (FlowOps texts: confirmations, reschedules, cancellations and reminders). Consent is not required to book. Message frequency varies. Msg & data rates may apply. Reply STOP to opt out, HELP for help.";
+  "Yes, text me about this appointment (FlowOps texts: confirmations, reschedules and cancellations). Consent is not required to book. Message frequency varies. Msg & data rates may apply. Reply STOP to opt out, HELP for help.";
