@@ -22,6 +22,20 @@ jobs:
       # No real secrets in CI. The build is designed to run without DATABASE_URL /
       # BETTER_AUTH_SECRET (DB and auth are created lazily at request time), and tests use an
       # in-process PGlite database with dummy values set in vitest.config.mts.
+    services:
+      # Throwaway Postgres for tests/*.pg.test.ts (real-Postgres integration tests).
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: flowops
+          POSTGRES_PASSWORD: flowops-ci-only
+          POSTGRES_DB: flowops_ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U flowops"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -46,6 +60,9 @@ jobs:
 
       - name: Test
         run: npm test
+        env:
+          # Local CI service container only (helpers refuse non-localhost URLs).
+          TEST_DATABASE_URL: postgres://flowops:flowops-ci-only@localhost:5432/flowops_ci
 
       - name: Build
         run: npm run build
