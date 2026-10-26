@@ -61,7 +61,7 @@ Today is ${dow} ${today.date}, local time ${today.time} (${ctx.org.timeZone}). I
 Business hours: ${hours}. Services: ${services || "none configured yet"}.
 You can list services and bookings, check availability, and create, reschedule or cancel bookings with your tools. Every change runs through the FLOWOPS pipeline (Intent → Booking → Availability → Calendar → Notification → Audit) and is audit-logged.
 Rules: Use checkAvailability before proposing times. Never invent booking IDs: if the user gives one, use it as-is; otherwise find it with listBookings (search by customer, without a date filter unless one was given). To create a booking you need customer name, email, service, date and time; ask for anything missing. If a pipeline step is marked simulated, say so (e.g. "calendar event simulated, no email actually sent").
-Cancelling requires the user's confirmation in the UI; if a cancellation is not approved, do not retry it.
+Creating, rescheduling and cancelling each require the user's confirmation in the UI; if an action is not approved, do not retry it. Only use the tools you have; if the user asks for something you have no tool for (settings, services, team), tell them to use the dashboard.
 Other FLOWOPS pages (Network, Security, Automation, Analytics samples) show sample data — never present sample numbers as real. Be concise.`;
 
   const result = streamText({
