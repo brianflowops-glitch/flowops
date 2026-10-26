@@ -2,7 +2,32 @@ import "server-only";
 import { and, eq, sql } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
 import { DEMO_ORG_ID, defaultHours, slugify } from "./defaults";
-import { consumeInvite, findUsableInvite } from "./invites";
+import { INVITE_TTL_DAYS, consumeInvite, findUsableInvite } from "./invites";
+
+type Tx = Parameters<Parameters<ReturnType<typeof getDb>["transaction"]>[0]>[0];
+type LegacyInvite = typeof schema.staffInvite.$inferSelect;
+
+/**
+ * Legacy email-match staff invites (pre-v2.1, no token) are only honored for a VERIFIED email,
+ * and only within INVITE_TTL_DAYS of being created. Without this, whoever signed up first with
+ * that address (no proof they own it) became Staff in the inviting org.
+ */
+export const LEGACY_INVITE_TTL_DAYS = INVITE_TTL_DAYS;
+export function legacyInviteUsable(inv: Pick<LegacyInvite, "createdAt">, emailVerified: boolean, now = new Date()) {
+  if (!emailVerified) return false;
+  return now.getTime() - inv.createdAt.getTime() < LEGACY_INVITE_TTL_DAYS * 24 * 3600 * 1000;
+}
+
+/** True if `orgId` is a throwaway auto-created workspace: not the primary org, no other members, no bookings. */
+async function isEmptyOwnWorkspace(tx: Tx, orgId: string, userId: string) {
+  if (orgId === DEMO_ORG_ID) return false;
+  const [{ others }] = (
+    await tx.execute(sql`select
+      (select count(*)::int from member where organization_id = ${orgId} and user_id <> ${userId}) +
+      (select count(*)::int from booking where organization_id = ${orgId}) as others`)
+  ).rows as { others: number }[];
+  return Number(others) === 0;
+}
 
 const rid = (p: string) => `${p}_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
 
@@ -19,14 +44,17 @@ function ownerEmails(): string[] | null {
  * Give a newly signed-up user exactly one organization membership:
  *  0. Signed up from an invite link (`inviteToken`, validated in the auth before-hook) →
  *     that invite's org and role; the token is consumed (single use).
- *  1. A legacy email-match staff invite for their email → Staff in that org.
+ *  1. A legacy email-match staff invite for their email → Staff in that org, ONLY if the email is
+ *     already verified and the invite is under LEGACY_INVITE_TTL_DAYS old (see legacyInviteUsable).
+ *     At sign-up the email is unverified, so this normally happens later, in
+ *     claimLegacyInviteAfterVerification (called when the user verifies their email).
  *  2. The primary org ("flowops-demo") has no owner yet → Owner of it. This is the
  *     "first account created becomes Owner" rule. If FLOWOPS_OWNER_EMAILS is set, only
  *     those emails can claim it (prevents a stranger claiming Brian's workspace).
  *  3. Otherwise → a brand-new organization, with the user as its Owner (multi-tenant).
  * Idempotent and serialized with an advisory lock.
  */
-export async function ensureMembership(u: { id: string; email: string; name: string; businessName?: string | null; inviteToken?: string | null }) {
+export async function ensureMembership(u: { id: string; email: string; name: string; emailVerified?: boolean; businessName?: string | null; inviteToken?: string | null }) {
   const db = getDb();
   return db.transaction(async (tx) => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext('flowops:membership'))`);
@@ -43,7 +71,7 @@ export async function ensureMembership(u: { id: string; email: string; name: str
       // Invite became unusable between validation and here (race) → fall through to the normal rules.
     }
     const [invite] = await tx.select().from(schema.staffInvite).where(eq(schema.staffInvite.email, email)).limit(1);
-    if (invite) {
+    if (invite && legacyInviteUsable(invite, Boolean(u.emailVerified))) {
       const [m] = await tx
         .insert(schema.member)
         .values({ id: rid("mem"), organizationId: invite.organizationId, userId: u.id, role: "staff" })
@@ -89,24 +117,27 @@ export class InviteJoinError extends Error {}
  *  - Owner of an *empty* auto-created workspace (no other members, no bookings) → that empty
  *    workspace is removed and they join.
  *  - Owner of a workspace with bookings or teammates (or the primary org) → refused.
+ * With `requireVerifiedEmail`, the account's email must be verified first.
  */
-export async function joinOrgWithInvite(u: { id: string; email: string }, token: string) {
+export async function joinOrgWithInvite(u: { id: string; email: string }, token: string, opts: { requireVerifiedEmail?: boolean } = {}) {
   const db = getDb();
+  // Validate first (without consuming) so a refusal leaves the invite usable. Done before the
+  // transaction: it reads via its own connection, and consumeInvite below re-checks atomically.
+  const usable = await findUsableInvite(token, u.email);
+  if (!usable) throw new InviteJoinError("This invite is invalid, expired, already used, revoked, or for a different email.");
   return db.transaction(async (tx) => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext('flowops:membership'))`);
     const [current] = await tx.select().from(schema.member).where(eq(schema.member.userId, u.id)).limit(1);
-    // Validate first (without consuming) so a refusal leaves the invite usable.
-    const usable = await findUsableInvite(token, u.email);
-    if (!usable) throw new InviteJoinError("This invite is invalid, expired, already used, revoked, or for a different email.");
+    // An existing account must prove it owns the invited address before switching orgs — when
+    // verification emails can actually be sent (otherwise nobody could ever accept).
+    if (opts.requireVerifiedEmail) {
+      const [row] = await tx.select({ v: schema.user.emailVerified }).from(schema.user).where(eq(schema.user.id, u.id)).limit(1);
+      if (!row?.v) throw new InviteJoinError("Verify your email address first (check your inbox for the FlowOps verification link), then open this invite again.");
+    }
     if (current?.organizationId === usable.invite.organizationId) throw new InviteJoinError("You're already a member of this organization.");
     if (current) {
       if (current.role === "owner") {
-        const [{ others }] = (
-          await tx.execute(sql`select
-            (select count(*)::int from member where organization_id = ${current.organizationId} and user_id <> ${u.id}) +
-            (select count(*)::int from booking where organization_id = ${current.organizationId}) as others`)
-        ).rows as { others: number }[];
-        if (current.organizationId === DEMO_ORG_ID || Number(others) > 0)
+        if (!(await isEmptyOwnWorkspace(tx, current.organizationId, u.id)))
           throw new InviteJoinError("You own a workspace that has bookings or teammates. FlowOps accounts belong to one organization, so sign up with a different email to accept this invite.");
         await tx.delete(schema.organization).where(eq(schema.organization.id, current.organizationId));
       } else {
@@ -117,5 +148,75 @@ export async function joinOrgWithInvite(u: { id: string; email: string }, token:
     if (!inv) throw new InviteJoinError("This invite was just used or revoked.");
     const [m] = await tx.insert(schema.member).values({ id: rid("mem"), organizationId: inv.organizationId, userId: u.id, role: inv.role }).returning();
     return m;
+  });
+}
+
+/**
+ * Called after a user verifies their email: if a usable legacy email-match staff invite exists
+ * for that (now proven) address, join that org as Staff — but only if the user has no
+ * membership yet or is the Owner of an empty auto-created workspace (which is then removed).
+ * Never moves someone out of a real workspace. Returns the new membership, or null.
+ */
+export async function claimLegacyInviteAfterVerification(u: { id: string; email: string }) {
+  const db = getDb();
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext('flowops:membership'))`);
+    const email = u.email.toLowerCase();
+    const [invite] = await tx.select().from(schema.staffInvite).where(eq(schema.staffInvite.email, email)).limit(1);
+    if (!invite || !legacyInviteUsable(invite, true)) return null;
+    const [current] = await tx.select().from(schema.member).where(eq(schema.member.userId, u.id)).limit(1);
+    if (current?.organizationId === invite.organizationId) {
+      await tx.delete(schema.staffInvite).where(eq(schema.staffInvite.id, invite.id));
+      return null;
+    }
+    if (current) {
+      if (current.role !== "owner" || !(await isEmptyOwnWorkspace(tx, current.organizationId, u.id))) return null;
+      await tx.delete(schema.organization).where(eq(schema.organization.id, current.organizationId));
+    }
+    const [m] = await tx.insert(schema.member).values({ id: rid("mem"), organizationId: invite.organizationId, userId: u.id, role: "staff" }).returning();
+    await tx.delete(schema.staffInvite).where(eq(schema.staffInvite.id, invite.id));
+    return m;
+  });
+}
+
+export class RemoveMemberError extends Error {}
+
+/**
+ * Remove someone from one organization. Deletes ONLY their membership row in that org (never the
+ * user account, bookings, or anything in other orgs), signs them out, drops any legacy email-match
+ * staff invite for that org (so they aren't auto-re-added on next sign-in), and writes an audit row.
+ * Next sign-in, a user with no membership gets the normal new-account flow (their own empty workspace).
+ */
+export async function removeMemberFromOrg(opts: { orgId: string; memberId: string; actor: string; actorEmail?: string }) {
+  const db = getDb();
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext('flowops:membership'))`);
+    const [m] = await tx
+      .select({ id: schema.member.id, userId: schema.member.userId, role: schema.member.role, email: schema.user.email })
+      .from(schema.member)
+      .innerJoin(schema.user, eq(schema.user.id, schema.member.userId))
+      .where(and(eq(schema.member.id, opts.memberId), eq(schema.member.organizationId, opts.orgId)))
+      .limit(1);
+    if (!m) return null;
+    if (m.role === "owner") throw new RemoveMemberError("Owners can't be removed here");
+
+    await tx.delete(schema.member).where(and(eq(schema.member.id, m.id), eq(schema.member.organizationId, opts.orgId)));
+    // Sign them out everywhere: accounts belong to one organization, so their sessions were for this org.
+    await tx.delete(schema.session).where(eq(schema.session.userId, m.userId));
+    await tx
+      .delete(schema.staffInvite)
+      .where(and(eq(schema.staffInvite.organizationId, opts.orgId), eq(schema.staffInvite.email, m.email.toLowerCase())));
+    await tx.insert(schema.auditEntry).values({
+      id: rid("aud"),
+      organizationId: opts.orgId,
+      at: new Date(),
+      action: "member.removed",
+      bookingId: null,
+      agent: "TeamAdmin",
+      outcome: "success",
+      detail: `Removed ${m.role} ${m.email} (member ${m.id}) from the team`,
+      actor: opts.actor,
+    });
+    return { memberId: m.id, userId: m.userId, role: m.role };
   });
 }

@@ -3,6 +3,7 @@ import { getDb, schema } from "@/lib/db";
 import { publicOrg, requireApi } from "@/lib/server/context";
 import { listServices, loadState, orgToday } from "@/lib/server/pipeline";
 import { integrationStatus } from "@/lib/server/integrations/notify";
+import { canInjectFaults } from "@/lib/server/fault-injection";
 
 /** Team size for the onboarding checklist: members + invites ever sent (not revoked). */
 async function teamCounts(orgId: string) {
@@ -30,7 +31,7 @@ export async function GET(req: Request) {
       state,
       services,
       team,
-      integrations,
+      integrations: { ...integrations, faultInjection: canInjectFaults(ctx.role) },
     },
     { headers: { "Cache-Control": "no-store" } },
   );

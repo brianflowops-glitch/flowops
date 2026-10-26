@@ -4,6 +4,7 @@ import { getDb, schema } from "@/lib/db";
 import { canManageTeam, requireApi, type Role } from "@/lib/server/context";
 import { badRequest, readJson } from "@/lib/server/validation";
 import { inviteStatus } from "@/lib/tenancy/invites";
+import { RemoveMemberError, removeMemberFromOrg } from "@/lib/tenancy/membership";
 import { canInviteRole, canRemove, canResetFor } from "@/lib/tenancy/team-rules";
 
 /** Team overview: members, token invites (with status), legacy email-match invites. */
@@ -58,8 +59,14 @@ export async function DELETE(req: Request) {
     if (!m) return Response.json({ error: "Member not found" }, { status: 404 });
     if (!canRemove({ id: ctx.user.id, role: ctx.role }, { userId: m.userId, role: m.role }))
       return Response.json({ error: m.role === "owner" ? "Owners can't be removed here" : "You can't remove this member" }, { status: 403 });
-    // Removing a member deletes their login (accounts belong to one organization).
-    await db.delete(schema.user).where(eq(schema.user.id, m.userId));
+    // Remove only their membership in THIS org (never the account itself) and audit it.
+    try {
+      const removed = await removeMemberFromOrg({ orgId: ctx.org.id, memberId: m.id, actor: `user:${ctx.user.email}` });
+      if (!removed) return Response.json({ error: "Member not found" }, { status: 404 });
+    } catch (e) {
+      if (e instanceof RemoveMemberError) return Response.json({ error: e.message }, { status: 403 });
+      throw e;
+    }
   }
   return Response.json({ ok: true });
 }

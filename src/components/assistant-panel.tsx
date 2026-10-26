@@ -19,6 +19,20 @@ const TOOL_LABEL: Record<string, string> = {
   cancelBooking: "Cancel booking",
 };
 
+/** Confirmation card text for tools that need approval (see FLOWAI_POLICY on the server). */
+function approvalText(name: string, input: Record<string, string>) {
+  switch (name) {
+    case "cancelBooking":
+      return { title: `Confirm: cancel booking ${input.bookingId}?`, detail: "The customer will be notified and the calendar event removed.", yes: "Yes, cancel it", no: "Keep booking" };
+    case "rescheduleBooking":
+      return { title: `Confirm: move booking ${input.bookingId} to ${input.date} ${input.time}?`, detail: "The customer will be notified and the calendar event updated.", yes: "Yes, reschedule", no: "Don't change it" };
+    case "createBooking":
+      return { title: `Confirm: book ${input.service} for ${input.customer} on ${input.date} ${input.time}?`, detail: `A confirmation goes to ${input.email || "the customer"} and a calendar event is created.`, yes: "Yes, book it", no: "Don't book" };
+    default:
+      return { title: `Confirm: ${TOOL_LABEL[name] ?? name}?`, detail: "FlowAI wants to make a change.", yes: "Approve", no: "Decline" };
+  }
+}
+
 /** HTTP errors arrive as the raw JSON body; streamed errors are already friendly text. */
 function errorText(e: Error) {
   const raw = e.message ?? "";
@@ -133,20 +147,20 @@ export function AssistantPanel({ open, onClose }: { open: boolean; onClose: () =
                 if (part.state === "approval-requested") {
                   return (
                     <div key={i} className="max-w-[90%] rounded-xl border border-rose-400/30 bg-rose-400/[0.06] p-3 text-sm text-rose-100">
-                      <p className="font-medium">Confirm: cancel booking {input.bookingId}?</p>
-                      <p className="mt-0.5 text-xs text-rose-100/70">The customer will be notified and the calendar event removed.</p>
+                      <p className="font-medium">{approvalText(name, input).title}</p>
+                      <p className="mt-0.5 text-xs text-rose-100/70">{approvalText(name, input).detail}</p>
                       <div className="mt-2 flex gap-2">
                         <button
                           onClick={() => addToolApprovalResponse({ id: part.approval.id, approved: true })}
                           className="rounded-md bg-rose-500/80 px-3 py-1 text-xs font-medium text-white hover:bg-rose-500"
                         >
-                          Yes, cancel it
+                          {approvalText(name, input).yes}
                         </button>
                         <button
-                          onClick={() => addToolApprovalResponse({ id: part.approval.id, approved: false, reason: "User declined the cancellation" })}
+                          onClick={() => addToolApprovalResponse({ id: part.approval.id, approved: false, reason: `User declined: ${label}` })}
                           className="rounded-md border border-white/15 px-3 py-1 text-xs text-slate-200 hover:bg-white/5"
                         >
-                          Keep booking
+                          {approvalText(name, input).no}
                         </button>
                       </div>
                     </div>

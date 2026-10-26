@@ -27,7 +27,7 @@ export async function getContextFromHeaders(h: Headers): Promise<OrgContext | nu
     // Session cookie may outlive a deleted user (cookie cache) — treat as signed out.
     const [u] = await db.select({ id: schema.user.id }).from(schema.user).where(eq(schema.user.id, session.user.id)).limit(1);
     if (!u) return null;
-    m = await ensureMembership({ id: session.user.id, email: session.user.email, name: session.user.name });
+    m = await ensureMembership({ id: session.user.id, email: session.user.email, name: session.user.name, emailVerified: Boolean(session.user.emailVerified) });
   }
   const [org] = await db.select().from(schema.organization).where(eq(schema.organization.id, m.organizationId)).limit(1);
   if (!org) return null;

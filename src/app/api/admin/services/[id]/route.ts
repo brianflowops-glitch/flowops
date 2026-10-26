@@ -1,14 +1,15 @@
 import { and, eq } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
 import { requireApi } from "@/lib/server/context";
-import { badRequest, readJson, serviceInput } from "@/lib/server/validation";
+import { badRequest, readJson, serviceUpdate } from "@/lib/server/validation";
 
 export async function PATCH(req: Request, { params }: { params: Promise<{ id: string }> }) {
   const ctx = await requireApi(req, { owner: true });
   if (ctx instanceof Response) return ctx;
   const { id } = await params;
-  const parsed = serviceInput.partial().safeParse(await readJson(req));
+  const parsed = serviceUpdate.safeParse(await readJson(req));
   if (!parsed.success) return badRequest(parsed.error);
+  if (Object.keys(parsed.data).length === 0) return Response.json({ error: "No fields to update" }, { status: 400 });
   const [svc] = await getDb()
     .update(schema.service)
     .set(parsed.data)
