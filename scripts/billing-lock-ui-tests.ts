@@ -14,7 +14,7 @@ const locked = (status: string | null, canManageBilling: boolean) =>
 check("past_due + Owner/Admin → update card via portal", lockScreenCopy(locked("past_due", true)).action === "portal" && /update your card/i.test(lockScreenCopy(locked("past_due", true)).title));
 check("unpaid + Owner/Admin → portal", lockScreenCopy(locked("unpaid", true)).action === "portal");
 check("no subscription + Owner/Admin → choose a plan", lockScreenCopy(locked(null, true)).action === "choose_plan");
-check("canceled + Owner/Admin → portal", lockScreenCopy(locked("canceled", true)).action === "portal");
+check("canceled + Owner/Admin → choose a plan (portal can't restart a canceled sub)", lockScreenCopy(locked("canceled", true)).action === "choose_plan");
 for (const s of LOCKED_STATUSES) {
   const c = lockScreenCopy(locked(s, false));
   check(`${s} + Staff → contact admin, no billing action`, c.action === "contact_admin");

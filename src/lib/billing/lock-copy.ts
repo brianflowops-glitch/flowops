@@ -26,7 +26,8 @@ export function lockScreenCopy(a: Pick<BillingAccess, "reason" | "canManageBilli
     case "incomplete_expired":
       return { title: "Choose a plan to continue", message: `This workspace doesn't have an active plan yet. ${reassure}`, action: "choose_plan" };
     case "canceled":
-      return { title: "Your plan has ended", message: `Your subscription was canceled. Restart it in billing to pick up where you left off. ${reassure}`, action: "portal" };
+      // Stripe's portal can't restart a canceled subscription; a new Checkout can.
+      return { title: "Your plan has ended", message: `Your subscription was canceled. Choose a plan to pick up where you left off. ${reassure}`, action: "choose_plan" };
     case "paused":
       return { title: "Your plan is paused", message: `Resume your subscription in billing to continue. ${reassure}`, action: "portal" };
     default:
