@@ -5,7 +5,8 @@ import type Stripe from "stripe";
 import { eq } from "drizzle-orm";
 import { getDb, getConn, schema } from "../src/lib/db";
 import { processStripeEvent, type SubscriptionFetcher } from "../src/lib/billing/webhook";
-import { DEMO_ORG_ID } from "../src/lib/tenancy/defaults";
+import { getBillingAccess, requireBillingAccess } from "../src/lib/billing/access";
+import { DEMO_ORG_ID, defaultHours } from "../src/lib/tenancy/defaults";
 
 if (/neon\.tech|vercel|amazonaws/.test(process.env.DATABASE_URL ?? "")) throw new Error("Refusing to run against a hosted database");
 
@@ -130,6 +131,66 @@ const row = async (id: string) => (await getDb().select().from(schema.subscripti
 
   const ign = await run(ev("charge.refunded", {}));
   check("unhandled type ignored", ign.status === "ignored", ign);
+
+  // ── billing access lock: failed card → locked, paid → full (docs/BILLING.md §6) ──
+  const ORG = `org_lock_${n}`;
+  await db.insert(schema.organization).values({ id: ORG, slug: `lock-${n}`, name: "Lock test", hours: defaultHours() });
+  const ON = { BILLING_ENABLED: "true" };
+  const access = (role: "owner" | "admin" | "staff" = "owner", env: Record<string, string> = ON) => getBillingAccess(ORG, role, { env });
+  let a = await access();
+  check("lock: no subscription row → locked/no_subscription", a.access === "locked" && a.reason === "no_subscription" && a.status === null, a);
+  a = await access("owner", { ...ON, BILLING_EXEMPT_ORG_IDS: `org_other,${ORG}` });
+  check("lock: org in BILLING_EXEMPT_ORG_IDS → full/exempt", a.access === "full" && a.reason === "exempt", a);
+  a = await access("owner", {});
+  check("lock: BILLING_ENABLED off → full/billing_disabled", a.access === "full" && a.reason === "billing_disabled", a);
+
+  const SL = `sub_lock_${n}`;
+  const lockSub = (status: string) => sub(SL, status, { customer: `cus_lock_${n}`, metadata: { organizationId: ORG } });
+  stripeState.set(SL, lockSub("active"));
+  await run(ev("customer.subscription.created", lockSub("active"), T0 + 100));
+  a = await access();
+  check("lock: active subscription → full/ok", a.access === "full" && a.reason === "ok" && a.status === "active", a);
+
+  const invoice = (id: string) => ({ id, object: "invoice", customer: `cus_lock_${n}`, parent: { subscription_details: { subscription: SL } } });
+  stripeState.set(SL, lockSub("past_due"));
+  const failRes = await run(ev("invoice.payment_failed", invoice(`in_fail_${n}`), T0 + 110));
+  a = await access("owner");
+  check("lock: invoice.payment_failed webhook → past_due → locked", failRes.status === "processed" && a.access === "locked" && a.reason === "past_due", { failRes, a });
+  check("lock: Owner can still manage billing while locked", a.canManageBilling === true, a);
+  check("lock: Admin can still manage billing while locked", (await access("admin")).canManageBilling === true);
+  check("lock: Staff is locked and cannot manage billing", (await access("staff")).access === "locked" && (await access("staff")).canManageBilling === false);
+
+  // Shared guard (requireApi calls this): 402 on normal API routes, billing/auth routes exempt.
+  const prevFlag = process.env.BILLING_ENABLED;
+  process.env.BILLING_ENABLED = "true";
+  const ctxLike = { org: { id: ORG } as typeof schema.organization.$inferSelect, role: "admin" as const };
+  const g = await requireBillingAccess(new Request("http://localhost/api/state"), ctxLike);
+  const gBody = g ? await g.json() : null;
+  check("guard: locked org → 402 {error:billing_locked, reason:past_due}", g?.status === 402 && gBody?.error === "billing_locked" && gBody?.reason === "past_due", gBody);
+  check("guard: /api/billing/portal exempt while locked", (await requireBillingAccess(new Request("http://localhost/api/billing/portal"), ctxLike)) === null);
+  check("guard: /api/auth/sign-out exempt while locked", (await requireBillingAccess(new Request("http://localhost/api/auth/sign-out"), ctxLike)) === null);
+  check("guard: /api/billing/webhook exempt while locked", (await requireBillingAccess(new Request("http://localhost/api/billing/webhook"), ctxLike)) === null);
+
+  const [orgStill] = await db.select().from(schema.organization).where(eq(schema.organization.id, ORG));
+  check("lock: org data kept while locked (nothing deleted)", Boolean(orgStill) && Boolean(await row(SL)));
+
+  stripeState.set(SL, lockSub("active"));
+  const paidRes = await run(ev("invoice.paid", invoice(`in_paid_${n}`), T0 + 120));
+  a = await access();
+  check("lock: invoice.paid webhook → active → full again", paidRes.status === "processed" && a.access === "full" && a.reason === "ok", { paidRes, a });
+  check("guard: paid org passes", (await requireBillingAccess(new Request("http://localhost/api/state"), ctxLike)) === null);
+
+  stripeState.set(SL, lockSub("unpaid"));
+  await run(ev("customer.subscription.updated", lockSub("unpaid"), T0 + 130));
+  a = await access();
+  check("lock: unpaid → locked/unpaid", a.access === "locked" && a.reason === "unpaid", a);
+  stripeState.set(SL, lockSub("canceled"));
+  await run(ev("customer.subscription.deleted", lockSub("canceled"), T0 + 140));
+  a = await access();
+  check("lock: canceled → locked/canceled", a.access === "locked" && a.reason === "canceled", a);
+  if (prevFlag === undefined) delete process.env.BILLING_ENABLED;
+  else process.env.BILLING_ENABLED = prevFlag;
+  await db.delete(schema.organization).where(eq(schema.organization.id, ORG)); // test org only (cascades its subscription rows)
 
   console.log(`\n${failed ? `${failed} failed` : "all passed"} (billing, local database, Stripe mocked)`);
   await getConn().pool.end();

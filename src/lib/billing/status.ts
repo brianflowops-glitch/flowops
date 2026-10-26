@@ -6,13 +6,14 @@ export function normalizeStatus(s: string): SubscriptionStatus {
 }
 
 /**
- * Whether an org with this status gets paid features. past_due keeps access during
- * Stripe's retry window by default — the grace policy is a founder decision (docs/BILLING.md).
+ * Whether an org with this status gets paid features. Founder decision (docs/BILLING.md §6):
+ * a failed card locks immediately, so past_due has no grace by default. The app-wide lock
+ * itself is `getBillingAccess()` in ./access.ts; this stays for per-feature checks.
  */
 export function hasPaidAccess(status: SubscriptionStatus | null | undefined, opts: { pastDueGrace?: boolean } = {}): boolean {
   if (!status) return false;
   if (status === "active" || status === "trialing") return true;
-  if (status === "past_due") return opts.pastDueGrace ?? true;
+  if (status === "past_due") return opts.pastDueGrace ?? false;
   return false;
 }
 

@@ -4,10 +4,12 @@ import { eq } from "drizzle-orm";
 import { getAuth } from "@/lib/auth";
 import { getDb, hasDatabase, schema } from "@/lib/db";
 import { ensureMembership } from "@/lib/tenancy/membership";
+import { canManageTeam } from "@/lib/tenancy/team-rules";
+import { requireBillingAccess } from "@/lib/billing/access";
 
 export type Role = "owner" | "admin" | "staff";
-/** Owner and Admin manage the team (invites, reset links). Settings stay Owner-only. */
-export const canManageTeam = (r: Role) => r === "owner" || r === "admin";
+/** Owner and Admin manage the team (invites, reset links). Settings stay Owner-only. Pure helper lives in team-rules. */
+export { canManageTeam };
 export interface OrgContext {
   user: { id: string; name: string; email: string; emailVerified: boolean };
   role: Role;
@@ -47,13 +49,20 @@ export function forbidden(message = "Owner role required") {
   return Response.json({ error: message }, { status: 403 });
 }
 
-/** For route handlers: returns the context or a 401 Response. */
+/**
+ * For route handlers: returns the context or an error Response (401 / 403 / 402 / 503).
+ * Billing lock (docs/BILLING.md §6): when BILLING_ENABLED=true and the org's subscription isn't
+ * active/trialing, every route that uses this guard returns 402 {error:"billing_locked", reason}.
+ * /api/billing/* is exempt (by path) so Owner/Admin can still fix billing.
+ */
 export async function requireApi(req: Request, opts: { owner?: boolean; manager?: boolean } = {}): Promise<OrgContext | Response> {
   if (!hasDatabase()) return Response.json({ error: "Database not configured (DATABASE_URL missing)" }, { status: 503 });
   const ctx = await getContextFromHeaders(req.headers);
   if (!ctx) return unauthorized();
   if (opts.owner && ctx.role !== "owner") return forbidden();
   if (opts.manager && !canManageTeam(ctx.role)) return forbidden("Owner or Admin role required");
+  const locked = await requireBillingAccess(req, ctx);
+  if (locked) return locked;
   return ctx;
 }
 

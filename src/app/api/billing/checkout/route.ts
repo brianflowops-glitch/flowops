@@ -7,11 +7,11 @@ import { badRequest, readJson } from "@/lib/server/validation";
 
 const body = z.object({ plan: z.string().min(1).max(64) });
 
-/** Owner starts Stripe Checkout for a configured plan. 404 unless BILLING_ENABLED=true. */
+/** Owner or Admin starts Stripe Checkout for a configured plan. 404 unless BILLING_ENABLED=true. */
 export async function POST(req: Request) {
   if (!billingEnabled()) return new Response("Not found", { status: 404 });
   if (!billingConfigured()) return Response.json({ error: "Billing not configured" }, { status: 503 });
-  const ctx = await requireApi(req, { owner: true });
+  const ctx = await requireApi(req, { manager: true }); // Owner or Admin (canManageBilling); /api/billing/* is exempt from the billing lock
   if (ctx instanceof Response) return ctx;
   const parsed = body.safeParse(await readJson(req));
   if (!parsed.success) return badRequest(parsed.error);
