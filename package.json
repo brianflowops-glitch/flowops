@@ -10,7 +10,8 @@
     "test": "tsx scripts/run-tests.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx scripts/db-migrate.ts",
-    "db:migrate:local": "dotenv -e .env.development.local -- tsx scripts/db-migrate.ts"
+    "db:migrate:local": "dotenv -e .env.development.local -- tsx scripts/db-migrate.ts",
+    "test:db": "tsx --conditions=react-server scripts/test-db.ts"
   },
   "dependencies": {
     "@ai-sdk/react": "^3.0.318",

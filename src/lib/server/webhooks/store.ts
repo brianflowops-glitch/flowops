@@ -1,6 +1,7 @@
 import "server-only";
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
+import { type SQL, and, eq, sql } from "drizzle-orm";
+import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { getDb, schema } from "@/lib/db";
 import { scrubDetail } from "@/lib/server/integrations/retry";
 
@@ -38,9 +39,27 @@ export async function recordDeliveryEvent(
   });
 }
 
+/**
+ * SQL mirror of `toE164` (src/lib/phone.ts) applied to a stored phone column, so STOP/START match bookings whose
+ * phone was saved as typed ("610-555-0134", "(610) 555-0134", "610 555 0134", "+1 610…", "1-610-…", "… ext 12").
+ * Same rules: drop a trailing extension, reject letters, "+…" keeps its digits, 10 digits → +1, 11 starting with 1 → +.
+ * (NANP range checks are implied: the value is compared to an already-valid E.164 number.) Stored data is not rewritten.
+ */
+export function phoneE164Sql(col: SQL | AnyPgColumn) {
+  const main = sql`regexp_replace(btrim(${col}), '\\s*(ext\\.?|x)\\s*\\d+$', '', 'i')`;
+  const digits = sql`regexp_replace(${main}, '\\D', '', 'g')`;
+  return sql`(case
+    when ${col} is null or ${main} ~* '[a-z]' then null
+    when left(${main}, 1) = '+' then '+' || ${digits}
+    when length(${digits}) = 10 then '+1' || ${digits}
+    when length(${digits}) = 11 and left(${digits}, 1) = '1' then '+' || ${digits}
+    else null end)`;
+}
+
 const historyEntry = (action: string, detail: string) => sql`jsonb_build_array(jsonb_build_object('at', ${new Date().toISOString()}::text, 'action', ${action}::text, 'detail', ${detail}::text))`;
 
 /**
+ * `phone` must be E.164 (toE164 of Twilio's From); bookings are matched on their normalized phone (phoneE164Sql).
  * STOP: mark the phone opted out and revoke sms_consent on every booking with that phone (all orgs share the
  * sender). sms_consent_at is kept as the original opt-in record; the revocation is appended to booking history.
  * START: clear the opt-out and restore consent only on upcoming confirmed bookings that were revoked by STOP.
@@ -59,7 +78,7 @@ export async function applySmsKeyword(tx: Tx, phone: string, keyword: "STOP" | "
         history: sql`${schema.booking.history} || ${historyEntry("sms_opt_out", "Customer replied STOP — texts disabled")}`,
         updatedAt: new Date(),
       })
-      .where(and(eq(schema.booking.phone, phone), eq(schema.booking.smsConsent, true)))
+      .where(and(sql`${phoneE164Sql(schema.booking.phone)} = ${phone}`, eq(schema.booking.smsConsent, true)))
       .returning({ id: schema.booking.id });
     return rows.length;
   }
@@ -73,7 +92,7 @@ export async function applySmsKeyword(tx: Tx, phone: string, keyword: "STOP" | "
     })
     .where(
       and(
-        eq(schema.booking.phone, phone),
+        sql`${phoneE164Sql(schema.booking.phone)} = ${phone}`,
         eq(schema.booking.smsConsent, false),
         eq(schema.booking.status, "confirmed"),
         sql`${schema.booking.date} >= to_char(now(), 'YYYY-MM-DD')`,

@@ -3,6 +3,7 @@
  * `twilio` (6.2.0, getExpectedTwilioSignature) and `svix` (1.99.1, Webhook.sign) libraries.
  */
 import type { Assertion, TestCase } from "@/lib/booking/tests";
+import { toE164 } from "@/lib/phone";
 import { smsKeyword, twilioSignature, verifySvix, verifyTwilioSignature } from "./signatures";
 
 const check = (label: string, pass: boolean, detail?: string): Assertion => ({ label, pass, detail });
@@ -55,5 +56,15 @@ export const WEBHOOK_TEST_CASES: TestCase[] = [
       check("OptOutType preferred", smsKeyword("anything", "STOP") === "STOP"),
       check("sentences ignored", smsKeyword("please don't stop texting me") === null && smsKeyword("") === null),
     ],
+  },
+  {
+    id: "WH-004",
+    name: "Stored phone formats normalize to Twilio's From",
+    description: "Bookings may store phones as typed; STOP/START match on E.164 (SQL mirror verified in npm run test:db).",
+    run: async () => {
+      const formats = ["610-555-0134", "(610) 555-0134", "610 555 0134", "+1 610 555 0134", "+16105550134", "1-610-555-0134", "610.555.0134", "610-555-0134 ext 12"];
+      const bad = formats.filter((f) => toE164(f) !== "+16105550134");
+      return [check("all formats → +16105550134", bad.length === 0, bad.join(" | ") || undefined)];
+    },
   },
 ];
