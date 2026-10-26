@@ -13,6 +13,7 @@
     "db:migrate:local": "dotenv -e .env.development.local -- tsx scripts/db-migrate.ts",
     "test:db": "tsx --conditions=react-server scripts/test-db.ts",
     "test:billing": "tsx scripts/billing-tests.ts",
+    "test:billing:ui": "tsx scripts/billing-lock-ui-tests.ts",
     "test:billing:db": "tsx --conditions=react-server scripts/billing-db-tests.ts"
   },
   "dependencies": {
