@@ -1,7 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { billingConfigured, billingEnabled } from "@/lib/billing/config";
 import { billingExemptOrgIds } from "@/lib/billing/access-rules";
-import { sweepAddonCharges } from "@/lib/billing/addon-charges-db";
+import { AddonLockUnavailable, sweepAddonCharges } from "@/lib/billing/addon-charges-db";
 import { getStripe } from "@/lib/billing/stripe";
 import { getDb } from "@/lib/db";
 import { DEMO_ORG_ID } from "@/lib/tenancy/defaults";
@@ -11,8 +11,9 @@ import { DEMO_ORG_ID } from "@/lib/tenancy/defaults";
  * Vercel Cron calls it with GET and `Authorization: Bearer ${CRON_SECRET}` (vercel.json: once a day, which the Hobby
  * plan allows; Hobby runs it at some minute within the scheduled hour). Same auth as /api/cron/notifications:
  * fails closed, 503 when CRON_SECRET is unset, 401 on mismatch (constant-time compare).
- * BILLING_ENABLED off → 200 no-op (nothing read or written). Demo / exempt orgs (org_flowops_demo +
- * BILLING_EXEMPT_ORG_IDS) are never touched. Each org is settled under its add-on lock; busy orgs are skipped and
+ * BILLING_ENABLED off → 200 no-op (nothing read or written). Demo / exempt orgs (org_flowops_demo,
+ * BILLING_EXEMPT_ORG_IDS, and any org with is_demo set) are never touched. No usable lock connection (a Neon -pooler
+ * DATABASE_URL without DATABASE_URL_UNPOOLED, or a pool timeout) → 503 `session_db_unavailable`, never a silent 200. Each org is settled under its add-on lock; busy orgs are skipped and
  * retried next run (a live request settles them anyway). Idempotent.
  */
 export const maxDuration = 60;
@@ -33,13 +34,18 @@ export async function GET(req: Request) {
   if (!billingConfigured()) return Response.json({ skipped: "billing_not_configured" });
   try {
     const skipOrgIds = new Set([DEMO_ORG_ID, ...billingExemptOrgIds()]);
-    const results = await sweepAddonCharges(getDb(), getStripe(), { skipOrgIds, deadline: Date.now() + BUDGET_MS });
+    const results = await sweepAddonCharges(getDb(), getStripe(), { skipOrgIds, skipDemoOrgs: true, deadline: Date.now() + BUDGET_MS });
     const counts: Record<string, number> = {};
     for (const r of results) counts[r.status] = (counts[r.status] ?? 0) + 1;
     const settled = results.filter((r) => r.id !== "*" && r.status !== "pending" && r.status !== "paid" && r.status !== "error").length;
     if (results.length) console.log(`[addon-charges] ${JSON.stringify(counts)}`);
     return Response.json({ orgs: new Set(results.map((r) => r.orgId)).size, settled, counts });
   } catch (e) {
+    if (e instanceof AddonLockUnavailable) {
+      // Visible in the Vercel cron log as a failed run, with the reason (no secrets in it).
+      console.error(`[addon-charges] database unavailable for the sweep: ${e.message.slice(0, 200)}`);
+      return Response.json({ error: "session_db_unavailable", message: e.message.slice(0, 200) }, { status: 503 });
+    }
     console.error(`[addon-charges] run failed: ${e instanceof Error ? e.message.slice(0, 200) : "unknown error"}`);
     return Response.json({ error: "sweep failed" }, { status: 500 });
   }

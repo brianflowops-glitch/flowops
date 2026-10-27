@@ -69,3 +69,4 @@ export async function connectSession() {
   return { db: drizzle(c, { schema }) as unknown as Db, query: (text: string, params?: unknown[]) => c.query(text, params) as never, release: (destroy?: boolean) => c.release(destroy ? true : undefined) };
 }
 export { schema };
+export { sessionDatabaseUrl, sessionDbProblem } from "../../src/lib/db/session-url";

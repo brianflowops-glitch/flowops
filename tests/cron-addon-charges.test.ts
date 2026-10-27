@@ -4,7 +4,9 @@ import { initTestDb } from "./helpers/db";
 import { seedDemoOrg } from "./helpers/app";
 import * as cronRoute from "@/app/api/cron/addon-charges/route";
 import * as chargesDb from "@/lib/billing/addon-charges-db";
-import { DEMO_ORG_ID } from "@/lib/tenancy/defaults";
+import { DEMO_ORG_ID, defaultHours } from "@/lib/tenancy/defaults";
+import { getDb, schema } from "@/lib/db";
+import { eq } from "drizzle-orm";
 
 // GET /api/cron/addon-charges: the daily sweep of crashed trial add-on charge attempts (docs/BILLING.md §11, 0006).
 describe("GET /api/cron/addon-charges", () => {
@@ -83,6 +85,7 @@ describe("GET /api/cron/addon-charges", () => {
       expect(await res.json()).toEqual({ orgs: 3, settled: 2, counts: { refunded: 1, applied: 1, busy: 1, skipped_exempt: 1 } });
       const opts = sweep.mock.calls[0][2]!;
       expect([...opts.skipOrgIds!].sort()).toEqual([DEMO_ORG_ID, "org_exempt_1", "org_exempt_2"].sort());
+      expect(opts.skipDemoOrgs).toBe(true); // 0007: organization.is_demo too
       expect(opts.deadline! - t).toBeGreaterThan(30_000);
       expect(opts.deadline! - t).toBeLessThan(cronRoute.maxDuration * 1000);
     });
@@ -93,6 +96,37 @@ describe("GET /api/cron/addon-charges", () => {
       const res = await call(`Bearer ${SECRET}`);
       expect(res.status).toBe(500);
       expect(await res.text()).not.toMatch(/boom|sk_test/);
+    });
+
+    it("0007: a Neon -pooler DATABASE_URL without DATABASE_URL_UNPOOLED → 503 session_db_unavailable (visible failure, not a silent 200)", async () => {
+      vi.stubEnv("DATABASE_URL", "postgres://u:p@ep-cool-name-123456-pooler.us-east-2.aws.neon.tech/db?sslmode=require");
+      vi.stubEnv("DATABASE_URL_UNPOOLED", "");
+      const err = vi.spyOn(console, "error").mockImplementation(() => {});
+      const res = await call(`Bearer ${SECRET}`);
+      expect(res.status).toBe(503);
+      const j = await res.json();
+      expect(j.error).toBe("session_db_unavailable");
+      expect(j.message).toMatch(/DATABASE_URL_UNPOOLED is required/);
+      expect(JSON.stringify(j)).not.toMatch(/u:p@|neon\.tech/); // no URL or credentials in the response
+      expect(err.mock.calls.flat().join(" ")).toMatch(/DATABASE_URL_UNPOOLED/);
+      // With the direct URL present the same environment is fine again.
+      vi.stubEnv("DATABASE_URL_UNPOOLED", "postgres://u:p@ep-cool-name-123456.us-east-2.aws.neon.tech/db");
+      expect((await call(`Bearer ${SECRET}`)).status).toBe(200);
+      vi.stubEnv("DATABASE_URL", "");
+      vi.stubEnv("DATABASE_URL_UNPOOLED", "");
+    });
+
+    it("0007: an org with is_demo set is never swept (real run: its stranded attempt stays pending, no Stripe call)", async () => {
+      const db = getDb();
+      const org = "org_cron_is_demo";
+      await db.insert(schema.organization).values({ id: org, slug: "cron-is-demo", name: "Some demo", hours: defaultHours(), isDemo: true });
+      await db.insert(schema.addonCharge).values({ id: "adc_cron_demo", organizationId: org, stripeSubscriptionId: "sub_demo", stripeCustomerId: "cus_demo", addonKey: "seat", priceId: "price_x_seat", fromQuantity: 0, toQuantity: 1, amount: 100, currency: "usd", paymentMethod: "pm_x", status: "pending", createdAt: new Date(Date.now() - 3_600_000) });
+      const res = await call(`Bearer ${SECRET}`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ orgs: 1, settled: 0, counts: { skipped_demo: 1 } });
+      const [row] = await db.select().from(schema.addonCharge).where(eq(schema.addonCharge.id, "adc_cron_demo"));
+      expect(row.status).toBe("pending");
+      await db.delete(schema.organization).where(eq(schema.organization.id, org));
     });
 
     it("real run against the test DB with nothing to settle → 200, zero orgs, no Stripe call", async () => {

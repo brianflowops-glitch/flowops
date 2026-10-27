@@ -3,6 +3,7 @@ import { Pool, type PoolClient } from "pg";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { attachDatabasePool } from "@vercel/functions";
 import * as schema from "./schema";
+import { sessionDatabaseUrl } from "./session-url";
 
 /**
  * Lazily-created Postgres pool (DATABASE_URL from the Neon Marketplace integration: the POOLED PgBouncer URL,
@@ -70,20 +71,7 @@ export const SESSION_CONNECTION_TIMEOUT_MS = 5_000;
 /** Server-side backstop: a session idle this long (e.g. a frozen/killed function holding a lock) is terminated by Postgres. */
 export const SESSION_IDLE_TIMEOUT = "120s";
 
-export function sessionDatabaseUrl(env: Record<string, string | undefined> = process.env): string {
-  const direct = env.DATABASE_URL_UNPOOLED?.trim();
-  if (direct) return direct;
-  const url = env.DATABASE_URL?.trim();
-  if (!url) throw new Error("DATABASE_URL is not set");
-  let host = "";
-  try {
-    host = new URL(url).hostname;
-  } catch {
-    /* not a URL (e.g. pglite://): fall through */
-  }
-  if (/-pooler\./i.test(host)) throw new Error("DATABASE_URL_UNPOOLED is required: the pooled (PgBouncer transaction mode) DATABASE_URL can't hold a session advisory lock");
-  return url;
-}
+export { sessionDatabaseUrl, sessionDbProblem } from "./session-url";
 
 let _session: Pool | null = null;
 export function getSessionPool() {

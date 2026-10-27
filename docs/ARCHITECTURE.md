@@ -160,7 +160,7 @@ There are no DB enums, so the "enum" columns are plain `text` checked only in Ty
 | `/api/webhooks/twilio/status` | POST | same | message status callbacks (PR #4) |
 | `/api/webhooks/resend` | POST | Svix signature (`RESEND_WEBHOOK_SECRET`, 5-min tolerance); 503 if unset, 401 if bad | bounces, complaints, failures (PR #4) |
 | `/api/cron/notifications` | GET | `Authorization: Bearer $CRON_SECRET` (constant-time compare); 503 if unset, 401 if wrong | stuck-queued sweeper (PR #4). **Not scheduled** (not in `vercel.json`) |
-| `/api/cron/addon-charges` | GET | same as above | daily sweep of crashed trial add-on charge attempts (`vercel.json`, `0 9 * * *`); no-op while `BILLING_ENABLED` is off; skips demo/exempt orgs (docs/BILLING.md §11) |
+| `/api/cron/addon-charges` | GET | same as above | daily sweep of crashed trial add-on charge attempts (`vercel.json`, `0 9 * * *`); no-op while `BILLING_ENABLED` is off; skips demo (`org_flowops_demo`, `is_demo`) and exempt orgs; 503 if the lock pool is misconfigured (docs/BILLING.md §11) |
 
 Role rules (`src/lib/tenancy/team-rules.ts`): Owner can invite Admin or Staff, and Admin can invite Staff only. For reset links, Owner can reset anyone and Admin can reset Staff and themselves. No one can remove an Owner, and no one can remove themselves; Admin can remove Staff only. Org settings, services and Google are Owner-only. Billing checkout/portal are Owner or Admin (`canManageTeam`). Bookings (dashboard) are open to every role. In FlowAI, every role can read, create and reschedule (each write needs UI approval), and **only Owner and Admin can cancel** (PR #7, §7). Fault injection is Owner/Admin and non-production only (PR #6).
 

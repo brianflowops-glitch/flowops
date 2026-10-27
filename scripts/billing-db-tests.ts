@@ -12,7 +12,7 @@ import { textPackExpiry } from "../src/lib/billing/text-pack-rules";
 import { trialEligibility } from "../src/lib/billing/checkout";
 import { subscriptionFields } from "../src/lib/billing/webhook";
 import { DEMO_ORG_ID, defaultHours } from "../src/lib/tenancy/defaults";
-import { AddonChangeBusy, addonLockFailureResponse, dbAddonChargeLedger, sweepAddonCharges, withAddonChangeLock } from "../src/lib/billing/addon-charges-db";
+import { AddonChangeBusy, AddonLockUnavailable, addonLockFailureResponse, dbAddonChargeLedger, sweepAddonCharges, withAddonChangeLock } from "../src/lib/billing/addon-charges-db";
 import { Pool } from "pg";
 import { connectSession, getSessionPool, isPoolTimeout, type SessionClient } from "../src/lib/db";
 import { setAddonQuantity, type AddonStripe } from "../src/lib/billing/addons";
@@ -657,6 +657,23 @@ const expectUnique = async (db: ReturnType<typeof getDb>, invoiceId: string) => 
     check("sweep: exempt/demo orgs passed in skipOrgIds are never touched", sw.some((x) => x.orgId === CORG && x.status === "skipped_exempt") && (await st(`adc_exempt_${n}`)) === "pending", sw);
     sw = await sweepAddonCharges(db, fstripe, { deadline: Date.now() - 1 });
     check("sweep: past its time budget the remaining orgs are deferred to the next run, untouched", sw.some((x) => x.orgId === CORG && x.status === "deferred") && (await st(`adc_exempt_${n}`)) === "pending", sw);
+    // 0007: orgs with organization.is_demo set are skipped when the caller asks (the cron always does).
+    await db.update(schema.organization).set({ isDemo: true }).where(eq(schema.organization.id, CORG));
+    sw = await sweepAddonCharges(db, fstripe, { skipDemoOrgs: true });
+    check("0007 sweep: an org with is_demo set is skipped (skipped_demo) with skipDemoOrgs, its attempt untouched", sw.some((x) => x.orgId === CORG && x.status === "skipped_demo") && !sw.some((x) => x.orgId === CORG && x.status !== "skipped_demo") && (await st(`adc_exempt_${n}`)) === "pending", sw);
+    await db.update(schema.organization).set({ isDemo: false }).where(eq(schema.organization.id, CORG));
+    // 0007: misconfigured lock pool → the whole sweep throws (no silent "nothing to do"), before touching anything.
+    {
+      const saved = { u: process.env.DATABASE_URL, d: process.env.DATABASE_URL_UNPOOLED };
+      process.env.DATABASE_URL = "postgres://u:p@ep-cool-name-123456-pooler.us-east-2.aws.neon.tech/db?sslmode=require";
+      delete process.env.DATABASE_URL_UNPOOLED;
+      const e1 = await sweepAddonCharges(db, fstripe).then(() => null, (e: unknown) => e);
+      process.env.DATABASE_URL = saved.u;
+      if (saved.d !== undefined) process.env.DATABASE_URL_UNPOOLED = saved.d;
+      check("0007 sweep: a Neon -pooler DATABASE_URL without DATABASE_URL_UNPOOLED → throws AddonLockUnavailable naming DATABASE_URL_UNPOOLED; attempt untouched", e1 instanceof AddonLockUnavailable && /DATABASE_URL_UNPOOLED/.test(e1.message) && (await st(`adc_exempt_${n}`)) === "pending", String(e1));
+      const e2 = await sweepAddonCharges(db, fstripe, { connect: async () => { throw new Error("timeout exceeded when trying to connect"); } }).then(() => null, (e: unknown) => e);
+      check("0007 sweep: no session connection for an org (pool timeout) → the run throws AddonLockUnavailable instead of reporting a per-org 'error' with 200", e2 instanceof AddonLockUnavailable && (await st(`adc_exempt_${n}`)) === "pending", String(e2));
+    }
 
     await db.delete(schema.organization).where(eq(schema.organization.id, CORG));
     check("org delete cascades addon_charge rows", (await db.select().from(T).where(eq(T.organizationId, CORG))).length === 0);
@@ -794,9 +811,17 @@ const expectUnique = async (db: ReturnType<typeof getDb>, invoiceId: string) => 
         c.release();
       }
     };
-    const oldRes = await Promise.all([1, 2, 3, 4, 5].map(oldShape));
+    const tStart = Date.now();
+    const oldRes = await Promise.all([1, 2, 3, 4, 5].map((i) => oldShape().then((r) => ({ r, ms: Date.now() - tStart, i }))));
     await old.end();
-    check("0006 contrast: the 0005 two-connection shape with 5 concurrent requests on a pool of 5 gets stuck (every request waits for a 2nd connection)", oldRes.every((x) => x === "stuck"), oldRes);
+    // 0007 (flake fix): once the first stuck request gives up after the 1 s timeout and returns its connection, one
+    // waiter can grab it and finish ("ok") — a timing race (1 of 6 runs showed stuck×4). The deadlock is shown by: at
+    // least 4 of 5 stuck, nothing else went wrong, and NO request got its 2nd connection before a timeout freed one
+    // (any "ok" finished only after ~the 1 s timeout, i.e. it was unblocked by a timed-out peer, not by free capacity).
+    const stuck = oldRes.filter((x) => x.r === "stuck").length;
+    const oks = oldRes.filter((x) => x.r === "ok");
+    console.log(`  0006 contrast: ${oldRes.map((x) => `${x.r}@${x.ms}ms`).join(", ")}`);
+    check("0006 contrast: the 0005 two-connection shape with 5 concurrent requests on a pool of 5 gets stuck (≥ 4 of 5 time out waiting for a 2nd connection; any 'ok' only after a peer's timeout freed one)", stuck >= 4 && stuck + oks.length === 5 && oks.every((x) => x.ms >= 950), oldRes);
 
     // The session pool refuses Neon's pooled (PgBouncer transaction-mode) URL: a session lock there would leak.
     const { sessionDatabaseUrl } = await import("../src/lib/db");

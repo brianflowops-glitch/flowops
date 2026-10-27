@@ -54,3 +54,9 @@ export async function connectSession() {
   };
 }
 export { schema };
+import { sessionDbProblem as realSessionDbProblem } from "../../src/lib/db/session-url";
+export { sessionDatabaseUrl } from "../../src/lib/db/session-url";
+/** Same rules as @/lib/db, except that no DATABASE_URL at all is fine here (PGlite stands in for it). */
+export function sessionDbProblem(env: Record<string, string | undefined> = process.env) {
+  return env.DATABASE_URL?.trim() || env.DATABASE_URL_UNPOOLED?.trim() ? realSessionDbProblem(env) : null;
+}

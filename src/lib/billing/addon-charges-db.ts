@@ -1,6 +1,6 @@
 import "server-only";
 import { and, asc, eq, inArray, lt } from "drizzle-orm";
-import { connectSession, isPoolTimeout, schema, type Db, type SessionClient } from "@/lib/db";
+import { connectSession, isPoolTimeout, schema, sessionDbProblem, type Db, type SessionClient } from "@/lib/db";
 import type { AddonChargeLedger, AddonChargeRecord } from "./addon-charge";
 import { reconcileAddonCharges, type AddonStripe } from "./addons";
 
@@ -168,24 +168,33 @@ export function addonLockFailureResponse(err: unknown): Response | null {
  * left `pending` / `paid` by a crash, for every org, under that org's add-on lock (`withAddonChangeLock`, so it never
  * races a live request). An org whose lock is busy is skipped (status "busy": a live request is settling it anyway,
  * and the next run retries). Only attempts older than `olderThanMs` (default 10 min) are touched. Orgs in
- * `skipOrgIds` (demo / exempt) are skipped; past `deadline` (epoch ms) the remaining orgs are left for the next run. Idempotent: safe to run as often as wanted. Uses one session connection
+ * `skipOrgIds` (demo / exempt) and, with `skipDemoOrgs`, orgs with `is_demo` set are skipped; a missing session connection (misconfigured URL, pool timeout) throws `AddonLockUnavailable` instead of being counted per org; past `deadline` (epoch ms) the remaining orgs are left for the next run. Idempotent: safe to run as often as wanted. Uses one session connection
  * at a time.
  */
-export async function sweepAddonCharges(db: Db, stripe: AddonStripe, opts: { olderThanMs?: number; now?: Date; skipOrgIds?: ReadonlySet<string>; deadline?: number; connect?: () => Promise<SessionClient>; waitMs?: number } = {}) {
+export async function sweepAddonCharges(db: Db, stripe: AddonStripe, opts: { olderThanMs?: number; now?: Date; skipOrgIds?: ReadonlySet<string>; skipDemoOrgs?: boolean; deadline?: number; connect?: () => Promise<SessionClient>; waitMs?: number } = {}) {
+  // 0007: a misconfigured lock pool (a Neon -pooler DATABASE_URL without DATABASE_URL_UNPOOLED) fails the whole run
+  // up front, even with nothing to settle, so the cron answers non-200 instead of a quiet 200.
+  const problem = opts.connect ? null : sessionDbProblem();
+  if (problem) throw new AddonLockUnavailable(problem);
   const cutoff = new Date((opts.now ?? new Date()).getTime() - (opts.olderThanMs ?? 10 * 60_000));
   const t = schema.addonCharge;
   const orgs = await db
-    .selectDistinct({ orgId: t.organizationId })
+    .selectDistinct({ orgId: t.organizationId, isDemo: schema.organization.isDemo })
     .from(t)
+    .innerJoin(schema.organization, eq(schema.organization.id, t.organizationId))
     .where(and(inArray(t.status, ["pending", "paid"]), lt(t.createdAt, cutoff)));
   const results: { orgId: string; id: string; status: string }[] = [];
-  for (const { orgId } of orgs) {
+  for (const { orgId, isDemo } of orgs) {
     if (opts.deadline && Date.now() > opts.deadline) {
       results.push({ orgId, id: "*", status: "deferred" }); // out of time: next run
       continue;
     }
     if (opts.skipOrgIds?.has(orgId)) {
       results.push({ orgId, id: "*", status: "skipped_exempt" });
+      continue;
+    }
+    if (opts.skipDemoOrgs && isDemo) {
+      results.push({ orgId, id: "*", status: "skipped_demo" }); // organization.is_demo (0007)
       continue;
     }
     try {
@@ -201,6 +210,8 @@ export async function sweepAddonCharges(db: Db, stripe: AddonStripe, opts: { old
         results.push({ orgId, id: "*", status: "busy" });
         continue;
       }
+      // No session connection (pool timeout / misconfigured URL) affects every org: stop and surface it (0007).
+      if (err instanceof AddonLockUnavailable) throw err;
       console.error("[billing] add-on charge sweep failed for an org (continuing)", orgId, err instanceof Error ? err.message : err);
       results.push({ orgId, id: "*", status: "error" });
     }
