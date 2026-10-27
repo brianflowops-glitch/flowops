@@ -16,7 +16,8 @@ export type OrgEntitlements =
  * What an org may use: plan limits plus add-ons from the mirrored subscription. Read-only.
  * Enforcement points (not wired yet, see docs/BILLING.md §11) should call this and compare:
  *   seats      → src/app/api/admin/invites/route.ts + src/lib/tenancy/invites.ts (count members + pending invites)
- *   texts      → src/lib/server/integrations/notify.ts (count this month's sent SMS rows)
+ *   texts      → src/lib/server/integrations/notify.ts: call consumeTexts (text-packs.ts) with allowance =
+ *                entitlements.includedTexts and sentBefore = this window's sent SMS rows (plan first, then packs)
  *   branding   → public booking page (src/app/book/…)
  *   locations  → no multi-location model exists yet
  */
@@ -37,7 +38,8 @@ export async function getEntitlements(organizationId: string, opts: { db?: Db; e
     .select({ priceId: schema.subscriptionItem.priceId, quantity: schema.subscriptionItem.quantity })
     .from(schema.subscriptionItem)
     .where(eq(schema.subscriptionItem.subscriptionId, sub.id));
-  // Monthly texts = plan texts + paid one-time packs whose window contains now (a pending or failed pack grants nothing).
+  // Monthly texts = plan texts + UNUSED texts of paid packs usable now (bought this window or rolled over from the last one;
+  // a pending or failed pack grants nothing).
   const packs = await activePaidPacks(db, organizationId, opts.now);
-  return { enforced: true, reason: "ok", entitlements: entitlementsFromItems(items, env, packs) };
+  return { enforced: true, reason: "ok", entitlements: entitlementsFromItems(items, env, packs.map((p) => ({ key: p.key, quantity: p.quantity, window: p.window, remaining: p.remaining }))) };
 }

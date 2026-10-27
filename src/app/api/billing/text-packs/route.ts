@@ -35,7 +35,7 @@ export async function POST(req: Request) {
     if (!result.ok) return Response.json({ error: result.error, code: result.code, ...(result.portal ? { portal: "/api/billing/portal" } : {}) }, { status: result.status });
     const { ok: _ok, ...rest } = result;
     void _ok;
-    return Response.json({ ...rest, billing: "Charged in full now, to the card on file. The texts are added to this month's allowance and expire at validUntil." });
+    return Response.json({ ...rest, billing: "Charged in full now, to the card on file. Unused texts roll over for one more billing period and expire at validUntil. Your plan's monthly texts are used first, then packs (soonest-expiring first)." });
   } catch (err) {
     if (err instanceof Stripe.errors.StripeError) {
       console.error("[billing] text pack purchase error", err.code, err.message);

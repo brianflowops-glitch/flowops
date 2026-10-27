@@ -8,6 +8,7 @@ import * as checkoutLib from "@/lib/billing/checkout";
 import * as packsLib from "@/lib/billing/text-packs";
 import * as stripeLib from "@/lib/billing/stripe";
 import * as scheduled from "@/lib/billing/scheduled";
+import * as addonsLib from "@/lib/billing/addons";
 
 // Route guards for /api/billing/addons. Nothing here reaches Stripe: every case is decided before the first Stripe call.
 describe("POST/GET /api/billing/addons guards", () => {
@@ -131,6 +132,59 @@ describe("POST/GET /api/billing/addons guards", () => {
     });
   });
 
+  describe("POST /api/billing/addons charging (0004: increases charged now, prorated)", () => {
+    const spies: { mockRestore(): void }[] = [];
+    afterEach(() => spies.splice(0).forEach((s) => s.mockRestore()));
+    beforeAll(() => {
+      vi.stubEnv("BILLING_ENABLED", "true");
+      vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_dummy_never_used");
+      vi.stubEnv("STRIPE_PRICE_STARTER", "price_x_starter");
+      vi.stubEnv("STRIPE_ADDON_PRICE_SEAT", "price_x_seat");
+    });
+    const post = (u: TestUser, body: unknown = { addon: "seat", quantity: 2 }) => addonsRoute.POST(req("/api/billing/addons", { method: "POST", body, cookie: u.cookie }));
+    const live = (status = "active") => {
+      spies.push(vi.spyOn(checkoutLib, "getOrCreateCustomer").mockResolvedValue("cus_x"), vi.spyOn(checkoutLib, "findLiveStripeSubscription").mockResolvedValue({ id: "sub_x", status } as never), vi.spyOn(stripeLib, "getStripe").mockReturnValue({} as never));
+    };
+
+    it("200: the prorated immediate charge is returned and explained", async () => {
+      live();
+      const set = vi.spyOn(addonsLib, "setAddonQuantity").mockResolvedValue({ ok: true, action: "created", addon: "seat", quantity: 2, currentQuantity: 2, effectiveAt: null, itemId: "si_1", proration: "always_invoice", charge: { kind: "proration", invoiceId: "in_1", amountPaid: 1032, currency: "usd" } });
+      spies.push(set);
+      const res = await post(owner);
+      expect(res.status).toBe(200);
+      const j = await res.json();
+      expect(j).toMatchObject({ action: "created", proration: "always_invoice", charge: { invoiceId: "in_1", amountPaid: 1032 } });
+      expect(j.billing).toContain("Charged 10.32 USD now, prorated for the rest of this billing period");
+      expect(set.mock.calls[0][0]).toMatchObject({ addon: "seat", quantity: 2, subscription: { id: "sub_x" } });
+    });
+
+    it("200 in a trial: says it covers the rest of the free trial", async () => {
+      live("trialing");
+      spies.push(vi.spyOn(addonsLib, "setAddonQuantity").mockResolvedValue({ ok: true, action: "updated", addon: "seat", quantity: 3, currentQuantity: 3, effectiveAt: null, itemId: "si_1", proration: "always_invoice", charge: { kind: "trial_proration", invoiceId: "in_2", amountPaid: 460, currency: "usd" } }));
+      const res = await post(admin, { addon: "seat", quantity: 3 });
+      expect(res.status).toBe(200);
+      expect((await res.json()).billing).toContain("for the rest of the free trial");
+    });
+
+    it("402 (declined proration / no card in a trial) is passed through with code and portal pointer; nothing granted", async () => {
+      live();
+      spies.push(vi.spyOn(addonsLib, "setAddonQuantity").mockResolvedValue({ ok: false, status: 402, code: "payment_failed", portal: true, error: "declined" }));
+      const res = await post(owner);
+      expect(res.status).toBe(402);
+      expect(await res.json()).toEqual({ error: "declined", code: "payment_failed", portal: "/api/billing/portal" });
+    });
+
+    it("a removal is still scheduled for the renewal with no credit", async () => {
+      live();
+      spies.push(vi.spyOn(addonsLib, "setAddonQuantity").mockResolvedValue({ ok: true, action: "scheduled", addon: "seat", quantity: 0, currentQuantity: 2, effectiveAt: 1800000000, itemId: "si_1", proration: "none", charge: null }));
+      const res = await post(owner, { addon: "seat", quantity: 0 });
+      expect(res.status).toBe(200);
+      const j = await res.json();
+      expect(j.charge).toBeNull();
+      expect(j.billing).toContain("No credit for the unused time");
+    });
+  });
+
   describe("POST /api/billing/text-packs", () => {
     const post = (u: TestUser | null, body: unknown = { pack: "texts_1000", quantity: 1 }) =>
       textPacksRoute.POST(req("/api/billing/text-packs", { method: "POST", body, cookie: u?.cookie }));
@@ -165,12 +219,12 @@ describe("POST/GET /api/billing/addons guards", () => {
 
     it("200: charged now, validUntil returned; Owner and Admin both allowed", async () => {
       spies.push(vi.spyOn(checkoutLib, "getOrCreateCustomer").mockResolvedValue("cus_x"), vi.spyOn(checkoutLib, "findLiveStripeSubscription").mockResolvedValue({ id: "sub_x", status: "trialing" } as never), vi.spyOn(stripeLib, "getStripe").mockReturnValue({} as never));
-      const buy = vi.spyOn(packsLib, "purchaseTextPack").mockResolvedValue({ ok: true, pack: "texts_1000", quantity: 2, texts: 2000, invoiceId: "in_1", amountPaid: 3000, currency: "usd", validUntil: "2026-12-01T00:00:00.000Z", duringTrial: true });
+      const buy = vi.spyOn(packsLib, "purchaseTextPack").mockResolvedValue({ ok: true, pack: "texts_1000", quantity: 2, texts: 2000, invoiceId: "in_1", amountPaid: 3000, currency: "usd", validUntil: "2026-12-01T00:00:00.000Z", windowEnd: "2026-11-01T00:00:00.000Z", duringTrial: true });
       spies.push(buy);
       for (const u of [owner, admin]) {
         const res = await post(u, { pack: "texts_1000", quantity: 2 });
         expect(res.status).toBe(200);
-        expect(await res.json()).toMatchObject({ texts: 2000, amountPaid: 3000, validUntil: "2026-12-01T00:00:00.000Z", duringTrial: true });
+        expect(await res.json()).toMatchObject({ texts: 2000, amountPaid: 3000, validUntil: "2026-12-01T00:00:00.000Z", windowEnd: "2026-11-01T00:00:00.000Z", duringTrial: true });
       }
       expect(buy.mock.calls[0][0]).toMatchObject({ pack: "texts_1000", quantity: 2, subscription: { id: "sub_x" } });
     });

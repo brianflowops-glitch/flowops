@@ -164,7 +164,7 @@ async function world(label: string, pm = "pm_card_visa") {
     const packInv = pr.ok ? await stripe.invoices.retrieve(pr.invoiceId) : null;
     check("TRIAL: the pack invoice is paid NOW, standalone (not on the subscription, not deferred to trial end)", packInv?.status === "paid" && packInv.amount_paid === 3000 && !packInv.parent?.subscription_details?.subscription, { st: packInv?.status, parent: packInv?.parent?.type });
     check("TRIAL: texts granted only after payment: 500 + 2000 = 2500", (await t.ent() as { texts: number }).texts === 2500, await t.ent());
-    check("TRIAL: the pack is valid until the trial ends (current period end)", pr.ok && Math.abs(new Date(pr.validUntil).getTime() / 1000 - trialEnd) < 5, pr.ok && pr.validUntil);
+    check("TRIAL: the pack's purchase window ends with the trial (windowEnd = trial end); it rolls over one month past that (0004)", pr.ok && Math.abs(new Date(pr.windowEnd).getTime() / 1000 - trialEnd) < 5 && new Date(pr.validUntil).getTime() / 1000 > trialEnd + 27 * 86400 && new Date(pr.validUntil).getTime() / 1000 < trialEnd + 32 * 86400, pr.ok && [pr.windowEnd, pr.validUntil]);
     pr = await t.buy(8, { id: trialSub.id, status: "trialing" });
     check("pack cap: 2 + 8 = 10 packs in the period is allowed", pr.ok, pr);
     pr = await t.buy(1, { id: trialSub.id, status: "trialing" });
@@ -180,9 +180,9 @@ async function world(label: string, pm = "pm_card_visa") {
     const afterTrial = (await t.subs())[0];
     const first = (await t.invoices()).find((i) => i.billing_reason === "subscription_cycle");
     check("DAY 14: trial → active, first real invoice paid: $49.00 (the packs are not on it)", afterTrial.status === "active" && m.s?.status === "active" && first?.status === "paid" && first.amount_paid === 4900, { st: afterTrial.status, mir: m.s?.status, inv: first && [first.status, first.amount_paid] });
-    check("DAY 14: the trial packs expired with the trial → texts back to the plan's 500", (await t.ent() as { texts: number }).texts === 500, await t.ent());
+    check("DAY 14: the 10 trial packs roll over into the first paid month (0004) → 500 + 10000 = 10500", (await t.ent() as { texts: number }).texts === 10500, await t.ent());
     pr = await t.buy(1);
-    check("new billing period: the pack cap resets (1 pack allowed again) and it is charged $15", pr.ok && pr.amountPaid === 1500 && !pr.duringTrial && (await t.ent() as { texts: number }).texts === 1500, pr);
+    check("new billing period: the pack cap resets even with 10 rolled-over packs (1 pack allowed again), charged $15 → 11500", pr.ok && pr.amountPaid === 1500 && !pr.duringTrial && (await t.ent() as { texts: number }).texts === 11500, pr);
 
     // one trial per business
     await stripe.subscriptions.cancel(trialSub.id);
@@ -240,7 +240,7 @@ async function world(label: string, pm = "pm_card_visa") {
     let r = await a.apply("seat", 2, noAnnualSeat);
     check("annual subscription + no annual seat price configured → 409, nothing changed in Stripe", !r.ok && r.status === 409 && (await a.live()).items.data.length === 1, r);
     r = await a.apply("seat", 2);
-    check("add 2 seats on the annual subscription → ANNUAL seat price ($100/yr each), proration none", r.ok && r.action === "created" && r.proration === "none", r);
+    check("add 2 seats on the annual subscription → ANNUAL seat price ($100/yr each), charged now prorated (0004: at the start of the year ≈ the full $200)", r.ok && r.action === "created" && r.proration === "always_invoice" && r.charge?.kind === "proration" && r.charge.amountPaid > 19500 && r.charge.amountPaid <= 20000, r);
     const seatItem = (await a.live()).items.data.find((i) => i.price.id === P.flowops_addon_seat_annual);
     check("the new item really is the annual seat price (interval year, 10000¢) × 2", seatItem?.quantity === 2 && seatItem.price.recurring?.interval === "year" && seatItem.price.unit_amount === 10000, seatItem?.price.id);
     r = await a.apply("location", 1);
@@ -248,11 +248,11 @@ async function world(label: string, pm = "pm_card_visa") {
     await a.drain();
     am = await a.mirrored();
     check("mirror: plan + annual seat ×2 + annual location ×1; entitlements 12 seats / 2 locations", am.items.length === 3 && JSON.stringify(await a.ent()) === JSON.stringify({ reason: "ok", seats: 12, locations: 2, texts: 2000, branding: true }), { items: am.items, e: await a.ent() });
-    check("no mid-cycle charge or credit: still one invoice ($990)", (await a.invoices()).length === 1, (await a.invoices()).length);
+    check("adds charged now (0004): $990 + one paid proration invoice per add (seat, location); no credits", (await a.invoices()).length === 3 && (await a.invoices()).every((i) => i.status === "paid") && (await stripe.creditNotes.list({ customer: a.customer.id, limit: 5 })).data.length === 0, (await a.invoices()).map((i) => [i.billing_reason, i.amount_paid]));
     const aPeriodEnd = (await a.live()).items.data[0].current_period_end;
     pr = await a.buy(1);
     const aStart = (await a.live()).items.data[0].current_period_start;
-    check("annual plan text pack: charged $15 now; valid for the current MONTH of the year (not the whole year)", pr.ok && pr.amountPaid === 1500 && new Date(pr.validUntil).getTime() / 1000 < aStart + 32 * 86400 && new Date(pr.validUntil).getTime() / 1000 > aStart + 27 * 86400 && new Date(pr.validUntil).getTime() / 1000 < aPeriodEnd, pr.ok && pr.validUntil);
+    check("annual plan text pack: charged $15 now; bought in the current MONTH of the year, usable through the next month (0004 rollover), not the whole year", pr.ok && pr.amountPaid === 1500 && new Date(pr.windowEnd).getTime() / 1000 < aStart + 32 * 86400 && new Date(pr.windowEnd).getTime() / 1000 > aStart + 27 * 86400 && new Date(pr.validUntil).getTime() / 1000 > aStart + 58 * 86400 && new Date(pr.validUntil).getTime() / 1000 < aStart + 63 * 86400 && new Date(pr.validUntil).getTime() / 1000 < aPeriodEnd, pr.ok && [pr.windowEnd, pr.validUntil]);
     pr = await a.buy(9);
     check("annual plan pack cap is per month: 10 in this month OK, then the 11th is refused", pr.ok && !(await a.buy(1)).ok, pr);
     // decrease at period end, no refund
@@ -278,12 +278,12 @@ async function world(label: string, pm = "pm_card_visa") {
     await b.drain();
     check("Business monthly $199: invoice 19900, entitlements 25 seats / 3 locations / 5000 texts / branding removed", (await b.invoices())[0].amount_paid === 19900 && JSON.stringify(await b.ent()) === JSON.stringify({ reason: "ok", seats: 25, locations: 3, texts: 5000, branding: true }), { amt: (await b.invoices())[0].amount_paid, e: await b.ent() });
     r = await b.apply("seat", 3);
-    check("add 3 seats (monthly price) → immediate, proration none, no mid-cycle invoice", r.ok && r.action === "created" && (await b.invoices()).length === 1, r);
+    check("add 3 seats (monthly price) → immediate, charged now prorated (0004: at the period start ≈ the full $30)", r.ok && r.action === "created" && r.charge?.amountPaid !== undefined && r.charge.amountPaid > 2900 && r.charge.amountPaid <= 3000 && (await b.invoices()).length === 2, r);
     await b.drain();
     check("entitlements: 28 seats immediately", (await b.ent() as { seats: number }).seats === 28, await b.ent());
     const bEnd = (await b.live()).items.data[0].current_period_end;
     r = await b.apply("seat", 1);
-    check("seat 3 → 1: stays 3 until period end (scheduled), no refund / credit", r.ok && r.action === "scheduled" && r.currentQuantity === 3 && r.effectiveAt === bEnd && (await b.invoices()).length === 1 && (await stripe.creditNotes.list({ customer: b.customer.id, limit: 5 })).data.length === 0, r);
+    check("seat 3 → 1: stays 3 until period end (scheduled), no refund / credit", r.ok && r.action === "scheduled" && r.currentQuantity === 3 && r.effectiveAt === bEnd && (await b.invoices()).length === 2 && (await stripe.creditNotes.list({ customer: b.customer.id, limit: 5 })).data.length === 0, r);
     await b.drain();
     check("entitlements still 28 seats before renewal", (await b.ent() as { seats: number }).seats === 28, await b.ent());
     await advance(b.clock.id, bEnd + 3600);

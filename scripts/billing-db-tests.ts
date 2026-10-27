@@ -7,7 +7,8 @@ import { getDb, getConn, schema } from "../src/lib/db";
 import { processStripeEvent, type SubscriptionFetcher } from "../src/lib/billing/webhook";
 import { getBillingAccess, requireBillingAccess } from "../src/lib/billing/access";
 import { getEntitlements } from "../src/lib/billing/org-entitlements";
-import { purchaseTextPack, type PackStripe } from "../src/lib/billing/text-packs";
+import { activePaidPacks, consumeTexts, purchaseTextPack, type PackStripe } from "../src/lib/billing/text-packs";
+import { textPackExpiry } from "../src/lib/billing/text-pack-rules";
 import { trialEligibility } from "../src/lib/billing/checkout";
 import { subscriptionFields } from "../src/lib/billing/webhook";
 import { DEMO_ORG_ID, defaultHours } from "../src/lib/tenancy/defaults";
@@ -360,7 +361,10 @@ const expectUnique = async (db: ReturnType<typeof getDb>, invoiceId: string) => 
     const inv1 = [...f.invs.values()][0];
     check("pack paid: ok, texts 2000, charged in full as its own invoice (one item, price_t_pack × 2), paid with the card on file, auto_advance off", pr.ok && pr.texts === 2000 && pr.amountPaid === 3000 && inv1.items.length === 1 && inv1.items[0].quantity === 2 && JSON.stringify(inv1.items[0].pricing) === JSON.stringify({ price: "price_t_pack" }) && inv1.params.auto_advance === false && inv1.params.collection_method === "charge_automatically" && f.log.join(",") === "invoice.create,item,finalize,pay pm_card", { pr, log: f.log });
     check("pack paid: row is paid, entitlements = plan 2000 + 2000", JSON.stringify(await packRows()) === '["paid:2"]' && (await texts()) === 4000, await packRows());
-    check("pack paid: the result says it expires at the end of the current period", pr.ok && pr.validUntil === new Date((nowS + 20 * 86400) * 1000).toISOString() && !pr.duringTrial, pr);
+    const expectExpiry = textPackExpiry(new Date((nowS - 10 * 86400) * 1000), new Date((nowS + 20 * 86400) * 1000), nowD);
+    check("pack paid: bought in this window (windowEnd = period end), usable until the end of the NEXT window (validUntil = rollover expiry)", pr.ok && pr.windowEnd === new Date((nowS + 20 * 86400) * 1000).toISOString() && pr.validUntil === expectExpiry.toISOString() && expectExpiry.getTime() > (nowS + 45 * 86400) * 1000 && !pr.duringTrial, { pr, expectExpiry });
+    const [paidRow] = await db.select().from(schema.textPack).where(eq(schema.textPack.organizationId, AORG));
+    check("pack paid: the row stores expires_at (rollover) and texts_used 0", paidRow?.expiresAt?.toISOString() === expectExpiry.toISOString() && paidRow.textsUsed === 0, paidRow);
 
     // declined card → nothing granted, invoice voided, no pending/active pack left
     f = mkPackStripe({ decline: true });
@@ -452,6 +456,49 @@ const expectUnique = async (db: ReturnType<typeof getDb>, invoiceId: string) => 
     check("webhook: a pack that was marked failed but Stripe later reports paid is recovered", (await texts()) === 5000, await texts());
     await expectUnique(db, `in_pend_${n}`);
     await db.delete(schema.textPack).where(eq(schema.textPack.organizationId, AORG));
+
+    // ── 0004 rollover: a pack is usable in its window and ONE more, then expires; plan allowance first, then packs soonest-expiring first ──
+    {
+      const D = (days: number) => new Date(nowD.getTime() + days * 86400000);
+      const at = (d: Date) => getEntitlements(AORG, { env: { ...process.env, BILLING_ENABLED: "true" }, now: d });
+      const txt = async (d: Date) => { const x = await at(d); return x.enforced ? x.entitlements.monthlyTexts : -1; };
+      // Pack bought in window N = [-10d, +20d), rollover window N+1 = [+20d, +50d) → expires at +50d.
+      await mkRow(`tp_r1_${n}`, "paid", -10, 20, { expiresAt: D(50), createdAt: D(-5) });
+      check("rollover: usable in its own window (N)", (await txt(D(0))) === 3000, await txt(D(0)));
+      check("rollover: still usable in the next window (N+1), incl. 1 ms before expiry", (await txt(D(25))) === 3000 && (await txt(new Date(D(50).getTime() - 1))) === 3000);
+      check("rollover: expired at the end of N+1 (exactly one extra period)", (await txt(D(50))) === 2000 && (await txt(D(60))) === 2000);
+      const lateRow = await db.select().from(schema.textPack).where(eq(schema.textPack.id, `tp_r1_${n}`));
+      check("rollover: a row from before 0010 (expires_at null) expires with its own window", (await db.update(schema.textPack).set({ expiresAt: null }).where(eq(schema.textPack.id, `tp_r1_${n}`)).returning({ id: schema.textPack.id })).length === 1 && (await txt(D(0))) === 3000 && (await txt(D(25))) === 2000, lateRow);
+      await db.delete(schema.textPack).where(eq(schema.textPack.organizationId, AORG));
+
+      // Rolled-over pack (bought last window, expires at +20d) + this window's pack (expires at +50d).
+      await mkRow(`tp_old_${n}`, "paid", -40, -10, { expiresAt: D(20), createdAt: D(-30) });
+      await mkRow(`tp_new_${n}`, "paid", -10, 20, { expiresAt: D(50), createdAt: D(-2) });
+      check("rollover: both packs usable now → 2000 plan + 2000 pack texts", (await txt(D(0))) === 4000);
+      let c = await consumeTexts(db, { orgId: AORG, allowance: 2000, sentBefore: 1500, count: 400, now: D(0) });
+      check("consumption: within the plan allowance → nothing drawn from packs", c.fromPlan === 400 && c.fromPacks.length === 0 && c.denied === 0, c);
+      c = await consumeTexts(db, { orgId: AORG, allowance: 2000, sentBefore: 1990, count: 500, now: D(0) });
+      check("consumption: plan allowance first (10), then the SOONEST-EXPIRING pack (the rolled-over one) for 490", c.fromPlan === 10 && JSON.stringify(c.fromPacks) === JSON.stringify([{ id: `tp_old_${n}`, texts: 490 }]) && c.denied === 0, c);
+      c = await consumeTexts(db, { orgId: AORG, allowance: 2000, sentBefore: 2500, count: 700, now: D(0) });
+      check("consumption: the rolled-over pack is emptied (510) before the new one is touched (190)", JSON.stringify(c.fromPacks) === JSON.stringify([{ id: `tp_old_${n}`, texts: 510 }, { id: `tp_new_${n}`, texts: 190 }]), c);
+      const left = await activePaidPacks(db, AORG, D(0));
+      check("consumption: texts_used persisted; remaining 0 + 810; entitlements show only unused pack texts", JSON.stringify(left.map((p) => [p.id, p.remaining])) === JSON.stringify([[`tp_old_${n}`, 0], [`tp_new_${n}`, 810]]) && (await txt(D(0))) === 2000 + 810, left);
+      c = await consumeTexts(db, { orgId: AORG, allowance: 2000, sentBefore: 3200, count: 1000, now: D(0) });
+      check("consumption: more than the packs hold → denied, nothing drawn", c.denied === 190 && c.fromPacks.length === 0 && (await activePaidPacks(db, AORG, D(0))).find((p) => p.id === `tp_new_${n}`)?.remaining === 810, c);
+      const [c1, c2] = await Promise.all([1, 2].map(() => consumeTexts(db, { orgId: AORG, allowance: 0, sentBefore: 0, count: 500, now: D(0) })));
+      check("consumption: two concurrent 500-text draws on 810 left → exactly one succeeds (row lock), never overdrawn", [c1, c2].filter((x) => x.denied === 0).length === 1 && (await activePaidPacks(db, AORG, D(0))).find((p) => p.id === `tp_new_${n}`)?.remaining === 310, { c1, c2 });
+      check("consumption: after the rolled-over pack expires only the newer pack's unused texts count", (await txt(D(25))) === 2000 + 310);
+      await db.delete(schema.textPack).where(eq(schema.textPack.organizationId, AORG));
+
+      // Cap with rollover: packs bought LAST window don't count toward this window's cap.
+      const curStart = new Date((nowS - 10 * 86400) * 1000);
+      await db.insert(schema.textPack).values({ id: `tp_cap_${n}`, organizationId: AORG, packKey: "texts_1000", textsPerPack: 1000, quantity: 10, status: "paid", periodStart: new Date(curStart.getTime() - 30 * 86400000), periodEnd: curStart, expiresAt: D(20) });
+      const pc = await buy(mkPackStripe(), 10);
+      check("rollover cap: 10 rolled-over packs + 10 new ones in this window are both allowed and both usable (2000 + 20000)", pc.ok && (await texts()) === 2000 + 20000, { pc, t: await texts() });
+      const pc2 = await buy(mkPackStripe(), 1);
+      check("rollover cap: the 11th pack bought in THIS window is still refused", !pc2.ok && pc2.code === "cap", pc2);
+      await db.delete(schema.textPack).where(eq(schema.textPack.organizationId, AORG));
+    }
 
     // legacy recurring texts item is still counted
     stripeState.set(SA, asub("active", [{ id: "si_plan2", price: "price_t_pro" }, { id: "si_seat", price: "price_t_seat", q: 2 }, { id: "si_t", price: "price_t_t1k", q: 2 }]));

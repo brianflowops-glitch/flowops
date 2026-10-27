@@ -1,7 +1,8 @@
 // Offline billing checks (no network, no database): `npm run test:billing`
 import Stripe from "stripe";
 import { addonByKey, addonByPriceId, addonPrice, addons, isLiveKey, isTextPackKey, planByKey, planByPriceId, plans, textPackByKey, textPackSize, trialDays } from "../src/lib/billing/config";
-import { addMonthsUTC, textPackWindow, validateTextPackRequest } from "../src/lib/billing/text-pack-rules";
+import { addMonthsUTC, allocatePackTexts, splitTextUsage, textPackExpiry, textPackWindow, validateTextPackRequest } from "../src/lib/billing/text-pack-rules";
+import { trialProrationAmount } from "../src/lib/billing/addon-charge";
 import { checkoutSessionParams } from "../src/lib/billing/checkout-params";
 import { addonEffect, addonMaxQuantity, resetAddonMaxWarnings, classifyItems, computeEntitlements, entitlementsFromItems, parsePlanLimits, planLimits, DEFAULT_PLAN_LIMITS } from "../src/lib/billing/entitlements";
 import { configuredAddons, phaseItems, retrieveSubscriptionComplete, scheduledChanges, setAddonQuantity, validateAddonQuantity, type AddonStripe } from "../src/lib/billing/addons";
@@ -208,8 +209,8 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
       subscriptions: { retrieve: async () => ({ ...sub, schedule: sched?.id ?? null }) as Stripe.Subscription },
       subscriptionItems: {
         list: () => ({ autoPagingToArray: async () => sub.items.data }),
-        create: async (p) => (calls.push(`create ${p.price} x${p.quantity} proration=${p.proration_behavior}`), { id: "si_new" } as Stripe.SubscriptionItem),
-        update: async (id, p) => (calls.push(`update ${id} x${p.quantity} proration=${p.proration_behavior}`), { id } as Stripe.SubscriptionItem),
+        create: async (p) => (calls.push(`create ${p.price} x${p.quantity} proration=${p.proration_behavior}${p.payment_behavior ? ` payment=${p.payment_behavior}` : ""}`), { id: "si_new" } as Stripe.SubscriptionItem),
+        update: async (id, p) => (calls.push(`update ${id} x${p.quantity} proration=${p.proration_behavior}${p.payment_behavior ? ` payment=${p.payment_behavior}` : ""}`), { id } as Stripe.SubscriptionItem),
       },
       subscriptionSchedules: {
         retrieve: async () => sched!,
@@ -230,10 +231,10 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
   const baseSub = fakeSub([{ id: "si_plan", price: "price_s" }]);
   const act = { id: "sub_x", status: "active" };
   let r = await setAddonQuantity({ stripe: mkStripe(baseSub), subscription: act, addon: "seat", quantity: 2, env: aenv });
-  check("add-on: new add-on → subscriptionItems.create with proration none", r.ok && r.action === "created" && r.currentQuantity === 2 && calls.at(-1) === "create price_seat x2 proration=none", { r, calls });
+  check("add-on: new add-on → subscriptionItems.create, charged now (always_invoice, applied only if paid: pending_if_incomplete)", r.ok && r.action === "created" && r.currentQuantity === 2 && r.proration === "always_invoice" && calls.at(-1) === "create price_seat x2 proration=always_invoice payment=pending_if_incomplete", { r, calls });
   const withSeat = fakeSub([{ id: "si_plan", price: "price_s" }, { id: "si_seat", price: "price_seat", q: 4 }]);
   r = await setAddonQuantity({ stripe: mkStripe(withSeat), subscription: act, addon: "SEAT", quantity: 6, env: aenv });
-  check("add-on: increase an existing add-on → update quantity now, proration none", r.ok && r.action === "updated" && r.currentQuantity === 6 && calls.at(-1) === "update si_seat x6 proration=none", { r, calls });
+  check("add-on: increase an existing add-on → update quantity now, prorated charge now (always_invoice + pending_if_incomplete)", r.ok && r.action === "updated" && r.currentQuantity === 6 && calls.at(-1) === "update si_seat x6 proration=always_invoice payment=pending_if_incomplete", { r, calls });
 
   // decrease / removal: nothing changes now; a schedule's next phase holds the lower quantity
   let nCalls = calls.length;
@@ -248,7 +249,7 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
   r = await setAddonQuantity({ stripe: st, subscription: act, addon: "seat", quantity: 2, env: aenv });
   check("add-on: a different decrease replaces the pending one (still below current)", r.ok && r.action === "scheduled" && r.currentQuantity === 4 && phaseItemsStr(st.schedule()!.phases[1]) === "price_s×1,price_seat×2" && phaseItemsStr(st.schedule()!.phases[0]) === "price_s×1,price_seat×4", { r, calls: calls.slice(nCalls) });
   r = await setAddonQuantity({ stripe: st, subscription: act, addon: "seat", quantity: 7, env: aenv });
-  check("add-on: increase after a pending decrease → the pending decrease is replaced (both phases at 7) and the now-pointless schedule is released", r.ok && r.action === "updated" && r.currentQuantity === 7 && calls.at(-2)!.startsWith("schedule.update") && calls.at(-2)!.includes("price_seatx7[none] | price_sx1+price_seatx7") && calls.at(-1) === "schedule.release" && st.schedule() === null, { r, calls: calls.slice(nCalls) });
+  check("add-on: increase after a pending decrease → charged now on the subscription (prorated), then both phases at 7 (phase rewrite proration none) and the now-pointless schedule is released", r.ok && r.action === "updated" && r.currentQuantity === 7 && calls.at(-3) === "update si_seat x7 proration=always_invoice payment=pending_if_incomplete" && calls.at(-2)!.startsWith("schedule.update proration=none") && calls.at(-2)!.includes("price_seatx7[none] | price_sx1+price_seatx7") && calls.at(-1) === "schedule.release" && st.schedule() === null, { r, calls: calls.slice(nCalls) });
 
   // cancel a pending decrease by asking for the current quantity
   st = mkStripe(withSeat);
@@ -268,7 +269,7 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
   r = await setAddonQuantity({ stripe: st, subscription: act, addon: "location", quantity: 2, env: aenv });
   check("add-on: cancelling the add-on decrease keeps the portal's plan downgrade (schedule NOT released)", r.ok && r.action === "schedule_cleared" && st.schedule() !== null && phaseItemsStr(st.schedule()!.phases[1]) === "price_s×1,price_seat×4,price_loc×2", { r, ph: st.schedule()?.phases.map(phaseItemsStr) });
   r = await setAddonQuantity({ stripe: st, subscription: act, addon: "seat", quantity: 5, env: aenv });
-  check("add-on: an increase with a plan downgrade pending raises both phases, no item write", r.ok && r.action === "updated" && phaseItemsStr(st.schedule()!.phases[0]) === "price_p×1,price_seat×5,price_loc×2" && phaseItemsStr(st.schedule()!.phases[1]) === "price_s×1,price_seat×5,price_loc×2" && !calls.at(-1)!.startsWith("update "), { r, calls: calls.slice(-2) });
+  check("add-on: an increase with a plan downgrade pending → charged now on the subscription item, then both phases raised (plan downgrade kept)", r.ok && r.action === "updated" && phaseItemsStr(st.schedule()!.phases[0]) === "price_p×1,price_seat×5,price_loc×2" && phaseItemsStr(st.schedule()!.phases[1]) === "price_s×1,price_seat×5,price_loc×2" && calls.at(-2) === "update si_seat x5 proration=always_invoice payment=pending_if_incomplete" && calls.at(-1)!.startsWith("schedule.update proration=none"), { r, calls: calls.slice(-2) });
   const sc = scheduledChanges(mkSchedule([
     { start_date: START, end_date: END, items: [{ price: "price_p", quantity: 1 }, { price: "price_seat", quantity: 4 }] },
     { start_date: END, end_date: END + 1, items: [{ price: "price_s", quantity: 1 }, { price: "price_seat", quantity: 1 }, { price: "price_t1k", quantity: 2 }] },
@@ -380,9 +381,9 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
   const annualSub = fakeSub([{ id: "si_plan", price: "p_s_y" }]);
   const nAnn = calls.length;
   r = await setAddonQuantity({ stripe: mkStripe(annualSub), subscription: act, addon: "seat", quantity: 2, env: fenv });
-  check("add-on on an annual subscription → the ANNUAL seat price, proration none", r.ok && r.action === "created" && calls.at(-1) === "create a_seat_y x2 proration=none", { r, calls: calls.slice(nAnn) });
+  check("add-on on an annual subscription → the ANNUAL seat price, prorated for the rest of the YEAR (always_invoice)", r.ok && r.action === "created" && calls.at(-1) === "create a_seat_y x2 proration=always_invoice payment=pending_if_incomplete", { r, calls: calls.slice(nAnn) });
   r = await setAddonQuantity({ stripe: mkStripe(fakeSub([{ id: "si_plan", price: "p_s_m" }])), subscription: act, addon: "location", quantity: 1, env: fenv });
-  check("add-on on a monthly subscription → the MONTHLY location price", r.ok && calls.at(-1) === "create a_loc_m x1 proration=none", { r });
+  check("add-on on a monthly subscription → the MONTHLY location price", r.ok && calls.at(-1) === "create a_loc_m x1 proration=always_invoice payment=pending_if_incomplete", { r });
   const noAnnual = { ...fenv, STRIPE_ADDON_PRICE_SEAT_ANNUAL: "" };
   const nNo = calls.length;
   r = await setAddonQuantity({ stripe: mkStripe(annualSub), subscription: act, addon: "seat", quantity: 1, env: noAnnual });
@@ -396,6 +397,131 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
   check("configuredAddons lists seat/location/branding with both intervals, never a text pack", (() => { const c = configuredAddons(fenv); return JSON.stringify(c.map((a) => a.key)) === '["branding","location","seat"]' && c.every((a) => a.prices.month && a.prices.year); })());
   const legacySc = scheduledChanges(mkSchedule([{ start_date: START, end_date: END, items: [{ price: "p_s_m", quantity: 1 }, { price: "legacy_t", quantity: 2 }] }, { start_date: END, end_date: END + 1, items: [{ price: "p_s_m", quantity: 1 }] }]), { ...fenv, STRIPE_ADDON_LEGACY_PRICE_TEXTS_1000: "legacy_t" });
   check("legacy recurring texts item: still counted today and shown as going away at renewal", !!legacySc && JSON.stringify(legacySc.addons) === JSON.stringify([{ key: "texts_1000", from: 2, to: 0 }]), legacySc);
+
+
+  // ───── 0004: increases charged now (prorated), failed charge grants nothing, trial adds charged, removals unchanged ─────
+  {
+    const T0 = 1795000000; // "now" in the fake
+    type Opt = { status?: string; pending?: boolean; newInvoice?: boolean; pm?: string | null; payStatus?: "paid" | "decline"; schedule?: Stripe.SubscriptionSchedule | null; items?: { id: string; price: string; q?: number }[] };
+    const mk = (o: Opt = {}) => {
+      const log: string[] = [];
+      let sched = o.schedule ?? null;
+      let applied = false;
+      const sub = { ...fakeSub(o.items ?? [{ id: "si_plan", price: "price_p" }]), status: o.status ?? "active", customer: "cus_1", latest_invoice: "in_old", trial_end: o.status === "trialing" ? T0 + 7 * 86400 : null, default_payment_method: null } as unknown as Stripe.Subscription;
+      const invState: Record<string, { status: string; amount: number }> = {};
+      const client: AddonStripe = {
+        subscriptions: {
+          retrieve: async (_id, params) => {
+            if (!params?.expand) return { ...sub, schedule: sched?.id ?? null } as Stripe.Subscription;
+            log.push("sub.retrieve(expand latest_invoice)");
+            const fresh = o.newInvoice !== false;
+            const inv = fresh ? { id: "in_prorate", status: o.pending ? "open" : "paid", amount_paid: o.pending ? 0 : 1032, currency: "usd", lines: { data: [{ description: "Remaining time on 2 × seat after 11 Nov", amount: 1032 }] } } : { id: "in_old" };
+            invState["in_prorate"] ??= { status: inv.status ?? "paid", amount: 1032 };
+            return { ...sub, latest_invoice: inv, pending_update: o.pending ? { expires_at: T0 + 82800, subscription_items: [] } : null } as unknown as Stripe.Subscription;
+          },
+        },
+        subscriptionItems: {
+          list: () => ({ autoPagingToArray: async () => sub.items.data }),
+          create: async (p) => (log.push(`create ${p.price} x${p.quantity} ${p.proration_behavior}${p.payment_behavior ? `/${p.payment_behavior}` : ""}`), (applied = !o.pending || p.proration_behavior === "none"), { id: "si_new" } as Stripe.SubscriptionItem),
+          update: async (id, p) => (log.push(`update ${id} x${p.quantity} ${p.proration_behavior}${p.payment_behavior ? `/${p.payment_behavior}` : ""}`), (applied = !o.pending), { id } as Stripe.SubscriptionItem),
+        },
+        subscriptionSchedules: {
+          retrieve: async () => sched!,
+          create: async () => (log.push("schedule.create"), (sched = mkSchedule([{ start_date: START, end_date: END, items: sub.items.data.map((i) => ({ price: i.price.id, quantity: i.quantity ?? 1 })) }])), sched),
+          update: async (_id, p) => (log.push(`schedule.update ${p.proration_behavior} ` + (p.phases ?? []).map((ph) => (ph.items ?? []).map((i) => `${i.price}x${i.quantity}`).join("+")).join(" | ")), pushPhases(sched!, p.phases ?? []), sched!),
+          release: async () => (log.push("schedule.release"), (sched = null), {} as Stripe.SubscriptionSchedule),
+        },
+        invoices: {
+          create: async (p) => (log.push(`invoice.create ${(p.metadata as Record<string, string> | undefined)?.flowops_addon_charge} pm=${p.default_payment_method} excl=${p.pending_invoice_items_behavior}`), (invState["in_trial"] = { status: "draft", amount: 0 }), { id: "in_trial", status: "draft" } as Stripe.Invoice),
+          finalizeInvoice: async (id) => (log.push(`finalize ${id}`), (invState[id].status = "open"), { id, status: "open" } as Stripe.Invoice),
+          pay: async (id) => {
+            log.push(`pay ${id}`);
+            if (o.payStatus === "decline") throw Object.assign(new Error("declined"), { type: "StripeCardError" });
+            invState[id].status = "paid";
+            return { id, status: "paid", amount_paid: invState[id].amount, currency: "usd" } as Stripe.Invoice;
+          },
+          retrieve: async (id) => ({ id, status: invState[id]?.status ?? "open", amount_paid: invState[id]?.amount ?? 0, currency: "usd" }) as Stripe.Invoice,
+          voidInvoice: async (id) => (log.push(`void ${id}`), (invState[id] = { ...(invState[id] ?? { amount: 0 }), status: "void" }), { id, status: "void" } as Stripe.Invoice),
+          del: async (id) => (log.push(`del ${id}`), {}),
+        },
+        invoiceItems: { create: async (p) => (log.push(`invoiceItem ${p.amount} ${p.currency} period=${p.period?.start}-${p.period?.end}`), (invState[p.invoice as string].amount = p.amount!), { id: "ii_1" } as Stripe.InvoiceItem) },
+        prices: { retrieve: async (id) => ({ id, unit_amount: id === "price_brand" ? 1500 : id === "price_loc" ? 2900 : 1000, currency: "usd" }) as Stripe.Price },
+        customers: { retrieve: async () => ({ id: "cus_1", invoice_settings: { default_payment_method: o.pm === undefined ? "pm_card" : o.pm } }) as unknown as Stripe.Customer },
+      };
+      return { client, log, applied: () => applied, sched: () => sched };
+    };
+    const now = new Date(T0 * 1000);
+
+    // proration on add (active)
+    let f = mk();
+    let r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "active" }, addon: "seat", quantity: 2, env: aenv, now });
+    check("0004 proration on add: active sub → item written with always_invoice + pending_if_incomplete, the paid immediate invoice is returned with its prorated lines", r4.ok && r4.action === "created" && r4.proration === "always_invoice" && r4.charge?.kind === "proration" && r4.charge.invoiceId === "in_prorate" && r4.charge.amountPaid === 1032 && r4.charge.lines?.[0].amount === 1032 && f.log[0] === "create price_seat x2 always_invoice/pending_if_incomplete" && f.log.includes("sub.retrieve(expand latest_invoice)") && !f.log.some((l) => l.startsWith("void")), { r4, log: f.log });
+    f = mk({ newInvoice: false });
+    r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "active" }, addon: "location", quantity: 1, env: aenv, now });
+    check("0004 proration on add: no new invoice (e.g. $0 proration) → applied, charge null", r4.ok && r4.action === "created" && r4.charge === null, r4);
+    // branding is treated like seats
+    f = mk({ items: [{ id: "si_plan", price: "price_s" }] });
+    r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "active" }, addon: "branding", quantity: 1, env: aenv, now });
+    check("0004 branding removal on add → charged now like seats (always_invoice + pending_if_incomplete)", r4.ok && f.log[0] === "create price_brand x1 always_invoice/pending_if_incomplete" && r4.charge?.kind === "proration", { r4, log: f.log });
+
+    // failed proration payment grants nothing
+    f = mk({ pending: true });
+    r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "active" }, addon: "seat", quantity: 2, env: aenv, now });
+    check("0004 failed proration payment: pending update → the open invoice is voided (discards the pending update), 402 payment_failed with portal, nothing granted", !r4.ok && r4.status === 402 && r4.code === "payment_failed" && r4.portal === true && f.log.includes("void in_prorate") && !f.applied() && /declined/.test(r4.error), { r4, log: f.log });
+    f = mk({ pending: true, items: [{ id: "si_plan", price: "price_p" }, { id: "si_seat", price: "price_seat", q: 3 }], schedule: mkSchedule([
+      { start_date: START, end_date: END, items: [{ price: "price_p", quantity: 1 }, { price: "price_seat", quantity: 3 }] },
+      { start_date: END, end_date: END + 2592000, items: [{ price: "price_p", quantity: 1 }, { price: "price_seat", quantity: 1 }] },
+    ]) });
+    r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "active" }, addon: "seat", quantity: 6, env: aenv, now });
+    check("0004 failed proration payment with a pending decrease: 402, the schedule is NOT touched (the pending decrease stays)", !r4.ok && r4.status === 402 && !f.log.some((l) => l.startsWith("schedule.")) && phaseItemsStr(f.sched()!.phases[1]) === "price_p×1,price_seat×1", { r4, log: f.log });
+
+    // trial add charging
+    f = mk({ status: "trialing" });
+    r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now });
+    const expectTrial = Math.round(1000 * 2 * (7 * 86400) / ((addMonthsUTC(now, 1).getTime() - now.getTime()) / 1000));
+    check("0004 trial add: the rest of the trial at the seat rate is charged NOW on a standalone invoice (pending items excluded), and only then the item is written with proration none", r4.ok && r4.action === "created" && r4.charge?.kind === "trial_proration" && r4.charge.amountPaid === expectTrial && f.log.join("|") === `invoice.create trial_proration pm=pm_card excl=exclude|invoiceItem ${expectTrial} usd period=${T0}-${T0 + 7 * 86400}|finalize in_trial|pay in_trial|create price_seat x2 none`, { r4, log: f.log, expectTrial });
+    check("0004 trial add: amount ≈ 7/30 of 2 × $10 (≈ $4.60)", expectTrial > 440 && expectTrial < 480, expectTrial);
+    f = mk({ status: "trialing", pm: null });
+    r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now });
+    check("0004 trial add with no card on file → 402 no_payment_method, no invoice, no item write", !r4.ok && r4.status === 402 && r4.code === "no_payment_method" && f.log.length === 0, { r4, log: f.log });
+    f = mk({ status: "trialing", payStatus: "decline" });
+    r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now });
+    check("0004 trial add with a declined card → invoice voided, 402 payment_failed, no item write", !r4.ok && r4.status === 402 && r4.code === "payment_failed" && f.log.includes("void in_trial") && !f.log.some((l) => l.startsWith("create ") || l.startsWith("update ")), { r4, log: f.log });
+    check("trialProrationAmount: full interval left → full price; nothing left → 0; annual uses a year", trialProrationAmount({ unitAmount: 1000, delta: 2, now: T0, periodEnd: T0 + 10 * 365 * 86400, interval: "month" }) === 2000 && trialProrationAmount({ unitAmount: 1000, delta: 2, now: T0, periodEnd: T0, interval: "month" }) === 0 && Math.abs(trialProrationAmount({ unitAmount: 10000, delta: 1, now: T0, periodEnd: T0 + 14 * 86400, interval: "year" }) - Math.round(10000 * 14 / 365)) <= 2);
+
+    // removal unchanged
+    f = mk({ items: [{ id: "si_plan", price: "price_p" }, { id: "si_seat", price: "price_seat", q: 4 }] });
+    r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "active" }, addon: "seat", quantity: 1, env: aenv, now });
+    check("0004 removal unchanged: decrease → scheduled for the period end, no item write, no invoice, no proration (none), no charge", r4.ok && r4.action === "scheduled" && r4.currentQuantity === 4 && r4.proration === "none" && r4.charge === null && f.log.join("|") === "schedule.create|schedule.update none price_px1+price_seatx4 | price_px1+price_seatx1", { r4, log: f.log });
+    f = mk({ status: "trialing", items: [{ id: "si_plan", price: "price_p" }, { id: "si_seat", price: "price_seat", q: 4 }] });
+    r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 0, env: aenv, now });
+    check("0004 removal in a trial: scheduled, nothing charged or refunded", r4.ok && r4.action === "scheduled" && !f.log.some((l) => l.startsWith("invoice") || l.startsWith("pay")), { r4, log: f.log });
+  }
+
+  // ───── 0004: text pack rollover (one extra period, then expiry) + consumption order ─────
+  {
+    const D = (x: string) => new Date(x);
+    check("rollover (monthly plan): a pack bought in Oct expires at the end of the NEXT period (Dec 1)", textPackExpiry(D("2026-10-01T00:00:00Z"), D("2026-11-01T00:00:00Z"), D("2026-10-29T00:00:00Z")).toISOString() === "2026-12-01T00:00:00.000Z");
+    check("rollover (monthly, 31st anchor): Jan 31 period → expires Mar 31 (anchor kept, not Mar 28)", textPackExpiry(D("2027-01-31T00:00:00Z"), D("2027-02-28T00:00:00Z"), D("2027-02-10T00:00:00Z")).toISOString() === "2027-03-31T00:00:00.000Z");
+    check("rollover (annual plan, mid-year): bought in March → expires end of April (one extra MONTH, not a year)", textPackExpiry(D("2026-10-01T00:00:00Z"), D("2027-10-01T00:00:00Z"), D("2027-03-20T00:00:00Z")).toISOString() === "2027-05-01T00:00:00.000Z");
+    check("rollover (annual plan, last month): rolls into the first month of the next year", textPackExpiry(D("2026-10-01T00:00:00Z"), D("2027-10-01T00:00:00Z"), D("2027-09-30T00:00:00Z")).toISOString() === "2027-11-01T00:00:00.000Z");
+    check("rollover (trial): bought in the trial → usable through the first paid month", textPackExpiry(D("2026-11-10T00:00:00Z"), D("2026-11-24T00:00:00Z"), D("2026-11-12T00:00:00Z")).toISOString() === "2026-12-24T00:00:00.000Z");
+    check("consumption: plan allowance first, then packs", JSON.stringify(splitTextUsage(500, 0, 300)) === '{"fromPlan":300,"fromPacks":0}' && JSON.stringify(splitTextUsage(500, 400, 300)) === '{"fromPlan":100,"fromPacks":200}' && JSON.stringify(splitTextUsage(500, 900, 10)) === '{"fromPlan":0,"fromPacks":10}');
+    const packs = [
+      { id: "new", remaining: 1000, expiresAt: D("2027-01-01T00:00:00Z"), createdAt: D("2026-11-05T00:00:00Z") },
+      { id: "old", remaining: 300, expiresAt: D("2026-12-01T00:00:00Z"), createdAt: D("2026-10-05T00:00:00Z") },
+      { id: "new2", remaining: 1000, expiresAt: D("2027-01-01T00:00:00Z"), createdAt: D("2026-11-20T00:00:00Z") },
+      { id: "empty", remaining: 0, expiresAt: D("2026-11-30T00:00:00Z"), createdAt: D("2026-10-01T00:00:00Z") },
+    ];
+    let al = allocatePackTexts(packs, 500);
+    check("consumption: packs soonest-expiring first (rolled-over pack before this period's), then oldest purchase", JSON.stringify(al) === '{"draws":[{"id":"old","texts":300},{"id":"new","texts":200}],"shortfall":0}', al);
+    al = allocatePackTexts(packs, 2500);
+    check("consumption: more than all packs hold → shortfall reported", al.shortfall === 200 && al.draws.length === 3, al);
+    e = computeEntitlements("starter", [], {}, [{ key: "texts_1000", quantity: 10, window: "2026-10-01", remaining: 4000 }, { key: "texts_1000", quantity: 10, window: "2026-11-01" }]);
+    check("entitlements with rollover: the cap is per purchase window (10 rolled over + 10 new both count), unused texts only", e.monthlyTexts === 500 + 4000 + 10000 && e.includedTexts === 500 && e.packTexts === 14000 && JSON.stringify(e.packs) === '[{"key":"texts_1000","quantity":20}]', e);
+    e = computeEntitlements("starter", [], {}, [{ key: "texts_1000", quantity: 15, window: "2026-11-01", remaining: 15000 }]);
+    check("entitlements with rollover: still clamped to the cap within one window", e.packTexts === 10000, e);
+  }
 
   // Signature verification, fully offline (dummy key, locally generated header).
   const stripe = new Stripe("sk_test_dummy_offline");

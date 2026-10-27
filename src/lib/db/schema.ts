@@ -405,6 +405,9 @@ export const subscriptionItem = pgTable(
  * `period_end` is the monthly text window the pack is valid for (the billing period; for annual subscriptions
  * the current month inside the year), also the unit of the per-period cap. `stripe_invoice_id` is unique, which
  * is the dedupe key for invoice.paid / invoice.payment_failed.
+ * Rollover (additive 0010): `expires_at` = end of the window AFTER the purchase window (a pack bought in window N is
+ * usable in N and N+1; null on older rows = `period_end`). `texts_used` counts texts drawn from the pack
+ * (plan allowance first, then packs soonest-expiring first; see consumeTexts in text-packs.ts).
  */
 export const TEXT_PACK_STATUSES = ["pending", "paid", "failed"] as const;
 export type TextPackStatus = (typeof TEXT_PACK_STATUSES)[number];
@@ -428,8 +431,16 @@ export const textPack = pgTable(
     paidAt: timestamp("paid_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    /** Last instant the pack's texts are usable: end of the next text window (rollover, 0010). Null = period_end. */
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
+    /** Texts already drawn from this pack (0..texts_per_pack × quantity). */
+    textsUsed: integer("texts_used").notNull().default(0),
   },
-  (t) => [uniqueIndex("text_pack_stripe_invoice_unique").on(t.stripeInvoiceId), index("text_pack_org_period_idx").on(t.organizationId, t.periodStart)],
+  (t) => [
+    uniqueIndex("text_pack_stripe_invoice_unique").on(t.stripeInvoiceId),
+    index("text_pack_org_period_idx").on(t.organizationId, t.periodStart),
+    index("text_pack_org_expires_idx").on(t.organizationId, t.expiresAt),
+  ],
 );
 
 /** Processed Stripe webhook events (idempotency: Stripe retries and may deliver an event more than once). */

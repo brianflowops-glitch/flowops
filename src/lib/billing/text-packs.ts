@@ -4,7 +4,7 @@ import { and, eq, gt, inArray, or, sql } from "drizzle-orm";
 import { schema, type Db } from "@/lib/db";
 import { textPackByKey, textPackSize } from "./config";
 import { addonMaxQuantity } from "./entitlements";
-import { PENDING_RESERVATION_MS, textPackWindow, validateTextPackRequest } from "./text-pack-rules";
+import { allocatePackTexts, PENDING_RESERVATION_MS, splitTextUsage, textPackExpiry, textPackWindow, validateTextPackRequest } from "./text-pack-rules";
 
 type Env = Record<string, string | undefined>;
 
@@ -17,6 +17,10 @@ type Env = Record<string, string | undefined>;
  * create invoice (auto_advance false, pending items excluded) + invoice item → store the invoice id →
  * finalize → pay with the card on file → `paid` (grant) | void the invoice + `failed` (402).
  * The invoice.paid / invoice.payment_failed webhooks settle the same row idempotently (webhook.ts).
+ *
+ * Rollover (0004): a pack bought in text window N is usable in N and N+1 (`expires_at`), then expires. The cap
+ * counts packs BOUGHT in the current window only, so up to 2× the cap can be usable at once (10 rolled over + 10 new).
+ * Texts are drawn plan allowance first, then packs soonest-expiring first (`consumeTexts`).
  */
 export interface PackStripe {
   subscriptions: { retrieve(id: string): Promise<Stripe.Subscription> };
@@ -41,8 +45,10 @@ export type PackPurchaseResult =
       invoiceId: string;
       amountPaid: number;
       currency: string;
-      /** The texts are usable until this instant (end of the current text window). */
+      /** The texts are usable until this instant: the end of the NEXT text window (one period of rollover). */
       validUntil: string;
+      /** End of the text window the pack was bought in (the cap's window). */
+      windowEnd: string;
       duringTrial: boolean;
     }
   | { ok: false; status: 400 | 402 | 409 | 502; error: string; code: "invalid" | "cap" | "no_subscription" | "no_payment_method" | "payment_failed" | "stripe_error"; portal?: boolean };
@@ -69,15 +75,68 @@ const isCardError = (e: unknown) => {
   return x?.type === "StripeCardError" || x?.rawType === "card_error";
 };
 
-/** Paid packs of the org whose window contains `now` (what entitlements count). */
-export async function activePaidPacks(db: Db, orgId: string, now: Date = new Date()): Promise<{ key: string; quantity: number }[]> {
+export interface UsablePackRow {
+  id: string;
+  key: string;
+  quantity: number;
+  textsPerPack: number;
+  textsUsed: number;
+  /** Texts still in the pack. */
+  remaining: number;
+  /** Start of the window the pack was bought in (the cap's unit). */
+  window: string;
+  expiresAt: Date;
+  createdAt: Date;
+}
+
+const expiresSql = () => sql`coalesce(${schema.textPack.expiresAt}, ${schema.textPack.periodEnd})`;
+
+/**
+ * Paid packs of the org usable at `now`: bought in a window that has started and not expired yet (purchase window
+ * or the one rollover window). What entitlements count, soonest-expiring first. Fully used packs are included with remaining 0.
+ */
+export async function activePaidPacks(db: Pick<Db, "select">, orgId: string, now: Date = new Date()): Promise<UsablePackRow[]> {
   const t = schema.textPack;
   const rows = await db
-    .select({ key: t.packKey, quantity: sql<number>`sum(${t.quantity})::int` })
+    .select({ id: t.id, key: t.packKey, quantity: t.quantity, textsPerPack: t.textsPerPack, textsUsed: t.textsUsed, periodStart: t.periodStart, periodEnd: t.periodEnd, expiresAt: t.expiresAt, createdAt: t.createdAt })
     .from(t)
-    .where(and(eq(t.organizationId, orgId), eq(t.status, "paid"), sql`${t.periodStart} <= ${now.toISOString()}::timestamptz`, gt(t.periodEnd, now)))
-    .groupBy(t.packKey);
-  return rows.map((r) => ({ key: r.key, quantity: Number(r.quantity) }));
+    .where(and(eq(t.organizationId, orgId), eq(t.status, "paid"), sql`${t.periodStart} <= ${now.toISOString()}::timestamptz`, sql`${expiresSql()} > ${now.toISOString()}::timestamptz`))
+    .orderBy(expiresSql(), t.createdAt, t.id);
+  return rows.map((r) => ({
+    id: r.id, key: r.key, quantity: r.quantity, textsPerPack: r.textsPerPack, textsUsed: r.textsUsed,
+    remaining: Math.max(0, r.textsPerPack * r.quantity - r.textsUsed),
+    window: r.periodStart.toISOString(), expiresAt: r.expiresAt ?? r.periodEnd, createdAt: r.createdAt,
+  }));
+}
+
+export interface ConsumeTextsResult {
+  /** Texts covered by the plan's monthly allowance. */
+  fromPlan: number;
+  /** Texts drawn from packs (pack id → texts), soonest-expiring first. */
+  fromPacks: { id: string; texts: number }[];
+  /** Texts nothing could cover (the caller must not send them). */
+  denied: number;
+}
+
+/**
+ * Account for `count` texts about to be sent in the current window: the plan allowance first (`allowance` = the
+ * plan's + recurring add-ons' monthly texts, `sentBefore` = texts already sent in this window, which the caller
+ * counts), then paid usable packs soonest-expiring first. Pack draws are written under a row lock on the
+ * organization, so concurrent sends never overdraw a pack. Nothing is drawn when the request can't be covered in
+ * full (`denied` > 0), unless `partial` is set. Not wired into the SMS sender yet (enforcement is a launch task, §11).
+ */
+export async function consumeTexts(db: Db, p: { orgId: string; allowance: number; sentBefore: number; count: number; now?: Date; partial?: boolean }): Promise<ConsumeTextsResult> {
+  const { fromPlan, fromPacks } = splitTextUsage(p.allowance, p.sentBefore, p.count);
+  if (fromPacks === 0) return { fromPlan, fromPacks: [], denied: 0 };
+  return db.transaction(async (tx) => {
+    await tx.select({ id: schema.organization.id }).from(schema.organization).where(eq(schema.organization.id, p.orgId)).for("update");
+    const packs = await activePaidPacks(tx, p.orgId, p.now ?? new Date());
+    const { draws, shortfall } = allocatePackTexts(packs, fromPacks);
+    if (shortfall > 0 && !p.partial) return { fromPlan, fromPacks: [], denied: shortfall };
+    for (const d of draws)
+      await tx.update(schema.textPack).set({ textsUsed: sql`${schema.textPack.textsUsed} + ${d.texts}`, updatedAt: new Date() }).where(eq(schema.textPack.id, d.id));
+    return { fromPlan, fromPacks: draws, denied: shortfall };
+  });
 }
 
 /** Packs bought (paid) plus in-flight reservations in one window: the number the per-period cap counts. */
@@ -152,6 +211,7 @@ export async function purchaseTextPack({ stripe, db, orgId, customerId, subscrip
   const first = sub.items.data[0];
   if (!first?.current_period_start || !first.current_period_end) return { ok: false, status: 409, error: "Could not read the subscription's billing period", code: "no_subscription" };
   const win = textPackWindow(new Date(first.current_period_start * 1000), new Date(first.current_period_end * 1000), now);
+  const expiresAt = textPackExpiry(new Date(first.current_period_start * 1000), new Date(first.current_period_end * 1000), now);
   const size = textPackSize(key)!;
 
   // Reserve (cap check + insert) under a row lock on the organization, so two requests can't both slip under the cap.
@@ -161,7 +221,7 @@ export async function purchaseTextPack({ stripe, db, orgId, customerId, subscrip
     const used = await packsInWindow(tx, orgId, key, win.start, now);
     const max = addonMaxQuantity(key, env);
     if (used + quantity > max) return { used, max } as const;
-    await tx.insert(schema.textPack).values({ id, organizationId: orgId, packKey: key, textsPerPack: size, quantity, status: "pending", periodStart: win.start, periodEnd: win.end });
+    await tx.insert(schema.textPack).values({ id, organizationId: orgId, packKey: key, textsPerPack: size, quantity, status: "pending", periodStart: win.start, periodEnd: win.end, expiresAt });
     return null;
   });
   if (reserved) {
@@ -192,7 +252,7 @@ export async function purchaseTextPack({ stripe, db, orgId, customerId, subscrip
     await markPackPaid(db, invoiceId, paid.amount_paid);
     return {
       ok: true, pack: key, quantity, texts: size * quantity, invoiceId, amountPaid: paid.amount_paid, currency: paid.currency,
-      validUntil: win.end.toISOString(), duringTrial: sub.status === "trialing",
+      validUntil: expiresAt.toISOString(), windowEnd: win.end.toISOString(), duringTrial: sub.status === "trialing",
     };
   } catch (err) {
     // Whatever went wrong, an unpaid invoice must not stay payable, and nothing is granted.
@@ -201,7 +261,7 @@ export async function purchaseTextPack({ stripe, db, orgId, customerId, subscrip
       // The charge actually went through (e.g. a timeout after Stripe collected): grant, it is paid.
       const inv = await stripe.invoices.retrieve(invoiceId).catch(() => null);
       await markPackPaid(db, invoiceId, inv?.amount_paid ?? null);
-      return { ok: true, pack: key, quantity, texts: size * quantity, invoiceId, amountPaid: inv?.amount_paid ?? 0, currency: inv?.currency ?? "usd", validUntil: win.end.toISOString(), duringTrial: sub.status === "trialing" };
+      return { ok: true, pack: key, quantity, texts: size * quantity, invoiceId, amountPaid: inv?.amount_paid ?? 0, currency: inv?.currency ?? "usd", validUntil: expiresAt.toISOString(), windowEnd: win.end.toISOString(), duringTrial: sub.status === "trialing" };
     }
     await markPackFailed(db, { id });
     if (isCardError(err)) return { ok: false, status: 402, error: `Your card was declined, so nothing was charged and no texts were added. ${PORTAL_HINT}`, code: "payment_failed", portal: true };

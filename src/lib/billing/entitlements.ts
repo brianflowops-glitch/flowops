@@ -165,14 +165,26 @@ export interface AddonQuantity {
   quantity: number;
 }
 
+/** A paid one-time pack (or several of one key) as counted by entitlements. */
+export interface PackQuantity extends AddonQuantity {
+  /** The window the pack was bought in; the per-period cap applies per window (rollover makes two windows usable). Omitted = one shared window. */
+  window?: string;
+  /** Texts still unused; omitted = the full pack (texts × quantity). */
+  remaining?: number;
+}
+
 export interface Entitlements extends PlanLimits {
   planKey: string | null;
   /** "configured": plan limits known; "fallback": plan not recognised → smallest tier; "none": no subscription. */
   source: "configured" | "fallback" | "none";
   /** Recurring add-ons that were counted (unknown keys dropped), quantity = what was counted after the cap. */
   addons: AddonQuantity[];
-  /** One-time text packs (`texts_<n>`) that were counted for the current period, quantity after the cap. */
+  /** One-time text packs (`texts_<n>`) usable now (bought this window or rolled over from the last one), quantity after the cap. */
   packs: AddonQuantity[];
+  /** The monthly allowance from the plan + recurring add-ons (used FIRST each window). */
+  includedTexts: number;
+  /** Unused texts left in usable packs (used after the allowance, soonest-expiring first). monthlyTexts = includedTexts + packTexts. */
+  packTexts: number;
 }
 
 /**
@@ -181,13 +193,13 @@ export interface Entitlements extends PlanLimits {
  * or an add-on unlocks it). Each add-on's summed quantity is capped at `addonMaxQuantity` (so a quantity
  * set directly in Stripe never grants more than the cap); `addons` reports the quantity actually counted.
  */
-export function computeEntitlements(planKey: string | null | undefined, addonQuantities: readonly AddonQuantity[] = [], env: Env = process.env, packQuantities: readonly AddonQuantity[] = []): Entitlements {
-  if (!planKey) return { ...NO_LIMITS, planKey: null, source: "none", addons: [], packs: [] };
+export function computeEntitlements(planKey: string | null | undefined, addonQuantities: readonly AddonQuantity[] = [], env: Env = process.env, packQuantities: readonly PackQuantity[] = []): Entitlements {
+  if (!planKey) return { ...NO_LIMITS, planKey: null, source: "none", addons: [], packs: [], includedTexts: 0, packTexts: 0 };
   const { source, ...limits } = planLimits(planKey, env);
   return applyAddons(limits, planKey.toLowerCase(), source, addonQuantities, env, packQuantities);
 }
 
-function applyAddons(limits: PlanLimits, planKey: string | null, source: Entitlements["source"], addonQuantities: readonly AddonQuantity[], env: Env, packQuantities: readonly AddonQuantity[] = []): Entitlements {
+function applyAddons(limits: PlanLimits, planKey: string | null, source: Entitlements["source"], addonQuantities: readonly AddonQuantity[], env: Env, packQuantities: readonly PackQuantity[] = []): Entitlements {
   const merged = new Map<string, number>();
   for (const a of addonQuantities) {
     const q = Number.isFinite(a.quantity) ? Math.max(0, Math.floor(a.quantity)) : 0;
@@ -205,19 +217,35 @@ function applyAddons(limits: PlanLimits, planKey: string | null, source: Entitle
     if (fx.brandingRemoved) total.brandingRemoved = true;
     counted.push({ key, quantity: q });
   }
-  // One-time text packs bought (and paid) for the current period: n texts each, capped per key like any add-on.
-  const packSum = new Map<string, number>();
+  // One-time text packs (paid, usable now): the cap applies per purchase window (rollover → up to two windows usable).
+  // Each pack adds its UNUSED texts on top of the allowance.
+  const includedTexts = total.monthlyTexts;
+  const groups = new Map<string, { key: string; quantity: number; texts: number }>();
   for (const p of packQuantities) {
     const q = Number.isFinite(p.quantity) ? Math.max(0, Math.floor(p.quantity)) : 0;
-    if (q > 0 && textPackSize(p.key)) packSum.set(p.key.toLowerCase(), (packSum.get(p.key.toLowerCase()) ?? 0) + q);
+    const size = textPackSize(p.key);
+    if (!(q > 0 && size)) continue;
+    const key = p.key.toLowerCase();
+    const full = size * q;
+    const texts = p.remaining === undefined || !Number.isFinite(p.remaining) ? full : Math.min(full, Math.max(0, Math.floor(p.remaining)));
+    const g = groups.get(`${key}|${p.window ?? ""}`) ?? { key, quantity: 0, texts: 0 };
+    g.quantity += q;
+    g.texts += texts;
+    groups.set(`${key}|${p.window ?? ""}`, g);
   }
-  const packs: AddonQuantity[] = [];
-  for (const [key, raw] of packSum) {
-    const q = Math.min(raw, addonMaxQuantity(key, env));
-    total.monthlyTexts += textPackSize(key)! * q;
-    packs.push({ key, quantity: q });
+  const perKey = new Map<string, number>();
+  let packTexts = 0;
+  for (const g of groups.values()) {
+    const max = addonMaxQuantity(g.key, env);
+    const q = Math.min(g.quantity, max);
+    // Above the cap (a row written outside our code): count at most the cap's worth of texts for that window.
+    const texts = Math.min(g.texts, textPackSize(g.key)! * q);
+    packTexts += texts;
+    perKey.set(g.key, (perKey.get(g.key) ?? 0) + q);
   }
-  return { ...total, planKey, source, addons: counted.sort((a, b) => a.key.localeCompare(b.key)), packs: packs.sort((a, b) => a.key.localeCompare(b.key)) };
+  total.monthlyTexts += packTexts;
+  const packs: AddonQuantity[] = [...perKey].map(([key, quantity]) => ({ key, quantity }));
+  return { ...total, planKey, source, addons: counted.sort((a, b) => a.key.localeCompare(b.key)), packs: packs.sort((a, b) => a.key.localeCompare(b.key)), includedTexts, packTexts };
 }
 
 export interface MirroredItem {
@@ -254,7 +282,7 @@ export function classifyItems<T extends MirroredItem>(items: readonly T[], env: 
 }
 
 /** items (as mirrored) → entitlements. */
-export function entitlementsFromItems(items: readonly MirroredItem[], env: Env = process.env, packQuantities: readonly AddonQuantity[] = []): Entitlements {
+export function entitlementsFromItems(items: readonly MirroredItem[], env: Env = process.env, packQuantities: readonly PackQuantity[] = []): Entitlements {
   const c = classifyItems(items, env);
   if (!c.plan) return computeEntitlements(null, [], env);
   // A plan item whose price is not configured as a plan still has a (fallback) tier: it is a live subscription.

@@ -7,6 +7,8 @@ import { findLiveStripeSubscription, getOrCreateCustomer } from "@/lib/billing/c
 import { getEntitlements } from "@/lib/billing/org-entitlements";
 import { getScheduledChanges } from "@/lib/billing/scheduled";
 import { getStripe } from "@/lib/billing/stripe";
+import { getDb, schema } from "@/lib/db";
+import { eq } from "drizzle-orm";
 import { requireApi } from "@/lib/server/context";
 import { badRequest, readJson } from "@/lib/server/validation";
 
@@ -37,9 +39,11 @@ export async function GET(req: Request) {
 /**
  * Owner or Admin sets a RECURRING add-on's quantity (seat, location, branding; text packs are one-time, see text-packs/route.ts) on the org's existing subscription (0 removes it).
  * The quantity may not exceed the add-on's maximum (400; see `addonMaxQuantity`).
- * Never a mid-cycle charge or credit (`proration_behavior: "none"`). An increase or new add-on applies now and is
- * first billed at the next renewal; a decrease or removal stays active until the period ends, then drops
- * (a subscription schedule's next phase; see addons.ts).
+ * An increase or new add-on is CHARGED NOW, prorated for the rest of the current period (Stripe `always_invoice`;
+ * during a free trial the rest of the trial at the add-on's rate, on its own invoice) and applies only once that
+ * charge is paid: a declined card (or no card on file in a trial) → 402 with a portal pointer, nothing added.
+ * A decrease or removal stays active until the period ends, then drops (a subscription schedule's next phase;
+ * see addons.ts). No refund, no credit. Changes for one org are serialised (row lock) so a double click can't double-charge.
  * The mirrored tables update through the customer.subscription.updated webhook, not here.
  * 404 unless BILLING_ENABLED=true; 403 for staff; 409 without an active subscription.
  */
@@ -62,8 +66,12 @@ export async function POST(req: Request) {
   const live = await findLiveStripeSubscription(customer);
   if (!live) return Response.json({ error: "No subscription yet. Subscribe to a plan first." }, { status: 409 });
   try {
-    const result = await setAddonQuantity({ stripe: getStripe(), subscription: live, addon: parsed.data.addon, quantity: parsed.data.quantity });
-    if (!result.ok) return Response.json({ error: result.error }, { status: result.status });
+    // One add-on change per org at a time (row lock on the organization, as for text packs).
+    const result = await getDb().transaction(async (tx) => {
+      await tx.select({ id: schema.organization.id }).from(schema.organization).where(eq(schema.organization.id, ctx.org.id)).for("update");
+      return setAddonQuantity({ stripe: getStripe(), subscription: live, addon: parsed.data.addon, quantity: parsed.data.quantity });
+    });
+    if (!result.ok) return Response.json({ error: result.error, ...(result.code ? { code: result.code } : {}), ...(result.portal ? { portal: "/api/billing/portal" } : {}) }, { status: result.status });
     const effectiveAt = result.effectiveAt ? new Date(result.effectiveAt * 1000).toISOString() : null;
     const note =
       result.action === "scheduled"
@@ -72,7 +80,9 @@ export async function POST(req: Request) {
           ? "The scheduled reduction was cancelled; nothing changes at renewal."
           : result.action === "unchanged"
             ? effectiveAt ? `Already scheduled for ${effectiveAt}.` : "No change."
-            : "Active now; first billed at the next renewal (no mid-cycle charge).";
+            : result.charge
+              ? `Active now. Charged ${(result.charge.amountPaid / 100).toFixed(2)} ${result.charge.currency.toUpperCase()} now, prorated ${result.charge.kind === "trial_proration" ? "for the rest of the free trial" : "for the rest of this billing period"}; full price from the next renewal.`
+              : "Active now; full price from the next renewal.";
     return Response.json({ ...result, effectiveAt, billing: note });
   } catch (err) {
     if (err instanceof Stripe.errors.StripeInvalidRequestError) {
