@@ -1,8 +1,8 @@
 // Offline billing checks (no network, no database): `npm run test:billing`
 import Stripe from "stripe";
 import { addonByKey, addonByPriceId, addons, isLiveKey, planByKey, planByPriceId, plans } from "../src/lib/billing/config";
-import { addonEffect, classifyItems, computeEntitlements, entitlementsFromItems, parsePlanLimits, planLimits, DEFAULT_PLAN_LIMITS } from "../src/lib/billing/entitlements";
-import { phaseItems, retrieveSubscriptionComplete, scheduledChanges, setAddonQuantity, type AddonStripe } from "../src/lib/billing/addons";
+import { addonEffect, addonMaxQuantity, resetAddonMaxWarnings, classifyItems, computeEntitlements, entitlementsFromItems, parsePlanLimits, planLimits, DEFAULT_PLAN_LIMITS } from "../src/lib/billing/entitlements";
+import { configuredAddons, phaseItems, retrieveSubscriptionComplete, scheduledChanges, setAddonQuantity, validateAddonQuantity, type AddonStripe } from "../src/lib/billing/addons";
 import { findLiveSubscription, hasPaidAccess, normalizeStatus } from "../src/lib/billing/status";
 import {
   billingExemptOrgIds,
@@ -122,6 +122,53 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
   check("entitlements: same add-on summed (case-insensitive); negative/NaN ignored; fractions floored", e.seats === 3 + 1 + 2 + 1, e);
   e = computeEntitlements("starter", [{ key: "voice_agent", quantity: 2 }], {});
   check("entitlements: add-on with no known effect changes nothing", e.seats === 3 && e.addons.length === 0, e);
+  // ── per-add-on maximum quantities (abuse guard) ──
+  const aenvCaps = { STRIPE_PRICE_STARTER: "price_s", STRIPE_ADDON_PRICE_SEAT: "price_seat", STRIPE_ADDON_PRICE_TEXTS_1000: "price_t1k" };
+  const warns: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...a: unknown[]) => void warns.push(a.join(" "));
+  resetAddonMaxWarnings();
+  check("add-on caps: defaults seat 50, location 10, texts_1000 10, branding 1", addonMaxQuantity("seat", {}) === 50 && addonMaxQuantity("location", {}) === 10 && addonMaxQuantity("texts_1000", {}) === 10 && addonMaxQuantity("branding", {}) === 1);
+  check("add-on caps: other keys fall back to 10; keys are case-insensitive", addonMaxQuantity("texts_5000", {}) === 10 && addonMaxQuantity("voice_agent", {}) === 10 && addonMaxQuantity("SEAT", {}) === 50);
+  check("add-on caps: STRIPE_ADDON_MAX_<KEY> overrides (and can lower), whitespace trimmed", addonMaxQuantity("seat", { STRIPE_ADDON_MAX_SEAT: "200" }) === 200 && addonMaxQuantity("texts_1000", { STRIPE_ADDON_MAX_TEXTS_1000: " 3 " }) === 3 && addonMaxQuantity("texts_5000", { STRIPE_ADDON_MAX_TEXTS_5000: "4" }) === 4);
+  check("add-on caps: valid override / empty override → no warning", warns.length === 0 && addonMaxQuantity("seat", { STRIPE_ADDON_MAX_SEAT: "" }) === 50 && warns.length === 0, warns);
+  for (const bad of ["0", "-5", "1.5", "abc", "10x", "1001", "99999999999", "1e3", "0x10"]) {
+    check(`add-on caps: invalid override "${bad}" falls back to the default`, addonMaxQuantity("location", { STRIPE_ADDON_MAX_LOCATION: bad }) === 10, bad);
+  }
+  check("add-on caps: each invalid value warns once, naming the variable, never the whole env", warns.length === 9 && warns.every((w) => w.includes("STRIPE_ADDON_MAX_LOCATION") && !w.includes("sk_")), warns);
+  addonMaxQuantity("location", { STRIPE_ADDON_MAX_LOCATION: "abc" });
+  addonMaxQuantity("location", { STRIPE_ADDON_MAX_LOCATION: "abc" });
+  check("add-on caps: the same invalid value does not warn again", warns.length === 9, warns.length);
+  addonMaxQuantity("seat", { STRIPE_ADDON_MAX_SEAT: "nope" });
+  check("add-on caps: a different bad variable warns", warns.length === 10 && warns[9].includes("STRIPE_ADDON_MAX_SEAT"), warns);
+  console.warn = origWarn;
+
+  e = computeEntitlements("starter", [{ key: "seat", quantity: 1000 }, { key: "location", quantity: 99 }, { key: "texts_1000", quantity: 1000 }, { key: "branding", quantity: 7 }], {});
+  check("entitlements clamp: mirrored seat 1000 / location 99 / texts_1000 1000 never grant more than the cap", e.seats === 3 + 50 && e.locations === 1 + 10 && e.monthlyTexts === 500 + 10 * 1000 && e.brandingRemoved, e);
+  check("entitlements clamp: `addons` reports the quantity counted (the cap), not the raw one", JSON.stringify(e.addons) === JSON.stringify([{ key: "branding", quantity: 1 }, { key: "location", quantity: 10 }, { key: "seat", quantity: 50 }, { key: "texts_1000", quantity: 10 }]), e.addons);
+  e = computeEntitlements("starter", [{ key: "seat", quantity: 40 }, { key: "SEAT", quantity: 40 }], {});
+  check("entitlements clamp: the same add-on listed twice is capped after summing", e.seats === 3 + 50, e);
+  e = computeEntitlements("starter", [{ key: "seat", quantity: 50 }, { key: "texts_1000", quantity: 10 }], {});
+  check("entitlements clamp: a quantity exactly at the cap is granted in full", e.seats === 53 && e.monthlyTexts === 10500, e);
+  e = computeEntitlements("starter", [{ key: "seat", quantity: 1000 }, { key: "texts_1000", quantity: 1000 }], { STRIPE_ADDON_MAX_SEAT: "5", STRIPE_ADDON_MAX_TEXTS_1000: "20" });
+  check("entitlements clamp: follows the STRIPE_ADDON_MAX_* override", e.seats === 8 && e.monthlyTexts === 500 + 20000, e);
+  e = entitlementsFromItems([{ priceId: "price_s", quantity: 1 }, { priceId: "price_seat", quantity: 1000 }, { priceId: "price_t1k", quantity: 1000 }], aenvCaps);
+  check("entitlementsFromItems clamps too", e.seats === 53 && e.monthlyTexts === 10500, e);
+  e = entitlementsFromItems([{ priceId: "price_unlisted", quantity: 1 }, { priceId: "price_seat", quantity: 1000 }], aenvCaps);
+  check("entitlementsFromItems clamps on the fallback-plan path as well (unknown plan item)", e.source === "fallback" && e.seats === 53, e);
+  check("scheduledChanges' entitlementsAtRenewal clamps too", scheduledChanges({ id: "sub_sched", status: "active", current_phase: { start_date: 100, end_date: 200 }, phases: [
+    { start_date: 100, end_date: 200, items: [{ price: "price_s", quantity: 1 }] },
+    { start_date: 200, end_date: 300, items: [{ price: "price_s", quantity: 1 }, { price: "price_seat", quantity: 1000 }] },
+  ] } as unknown as Stripe.SubscriptionSchedule, aenvCaps)?.entitlementsAtRenewal.seats === 53);
+
+  check("validateAddonQuantity: within cap / at cap / zero are fine", validateAddonQuantity("seat", 50, {}) === null && validateAddonQuantity("seat", 0, {}) === null && validateAddonQuantity("branding", 1, {}) === null);
+  const over = validateAddonQuantity("texts_1000", 1000, {});
+  check("validateAddonQuantity: over the cap → 400 with a clear message", over?.status === 400 && /texts_1000/.test(over.error) && /maximum of 10/.test(over.error) && /1000/.test(over.error), over);
+  check("validateAddonQuantity: negative / fractional / NaN → 400", [-1, 1.5, Number.NaN, Infinity].every((q) => validateAddonQuantity("seat", q, {})?.status === 400));
+  check("validateAddonQuantity: env override raises the cap", validateAddonQuantity("seat", 80, { STRIPE_ADDON_MAX_SEAT: "100" }) === null && validateAddonQuantity("seat", 101, { STRIPE_ADDON_MAX_SEAT: "100" })?.status === 400);
+  const cfgAddons = configuredAddons({ ...aenvCaps, STRIPE_ADDON_PRICE_LOCATION: "price_loc", STRIPE_ADDON_MAX_SEAT: "7" });
+  check("configuredAddons includes each add-on's max", JSON.stringify(cfgAddons.map((a) => [a.key, a.max])) === JSON.stringify([["location", 10], ["seat", 7], ["texts_1000", 10]]), cfgAddons);
+
   e = computeEntitlements(null, [{ key: "seat", quantity: 2 }], {});
   check("entitlements: no plan → nothing (source none)", e.seats === 0 && e.monthlyTexts === 0 && !e.brandingRemoved && e.source === "none", e);
   e = computeEntitlements("starter", [], { PLAN_LIMITS_STARTER: "seats=4" });
@@ -250,6 +297,9 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
     ["fractional quantity", { addon: "seat", quantity: 1.5 }, 400],
     ["huge quantity", { addon: "seat", quantity: 5000 }, 400],
     ["branding quantity > 1", { addon: "branding", quantity: 2 }, 400],
+    ["seat above its cap (51 > 50)", { addon: "seat", quantity: 51 }, 400],
+    ["texts_1000 above its cap (1000 > 10)", { addon: "texts_1000", quantity: 1000 }, 400],
+    ["location above its cap (11 > 10)", { addon: "location", quantity: 11 }, 400],
   ] as const) {
     r = await setAddonQuantity({ stripe: mkStripe(baseSub), subscription: act, env: { ...aenv, STRIPE_ADDON_PRICE_NOPE: "" }, ...input });
     check(`add-on rejected: ${label} → ${status}, nothing sent to Stripe`, !r.ok && r.status === status && calls.length === n0, r);

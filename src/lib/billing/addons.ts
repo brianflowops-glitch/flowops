@@ -12,11 +12,20 @@
  */
 import type Stripe from "stripe";
 import { addonByKey, addons } from "./config";
-import { addonEffect, classifyItems, entitlementsFromItems, planLimits, type Entitlements } from "./entitlements";
+import { addonEffect, addonMaxQuantity, classifyItems, entitlementsFromItems, planLimits, type Entitlements } from "./entitlements";
 
 type Env = Record<string, string | undefined>;
 
-export const MAX_ADDON_QUANTITY = 1000;
+/**
+ * Quantity checks that need no Stripe call (so the route can run them before touching Stripe). null = fine.
+ * An unknown add-on is not judged here. The per-add-on maximum comes from `addonMaxQuantity` (defaults + STRIPE_ADDON_MAX_<KEY>).
+ */
+export function validateAddonQuantity(addon: string, quantity: number, env: Env = process.env): { ok: false; status: 400; error: string } | null {
+  const max = addonMaxQuantity(addon, env);
+  if (!Number.isInteger(quantity) || quantity < 0) return { ok: false, status: 400, error: `Quantity must be a whole number from 0 to ${max}` };
+  if (quantity > max) return { ok: false, status: 400, error: `Quantity ${quantity} is above the maximum of ${max} for the "${addon.toLowerCase()}" add-on. Choose ${max} or fewer.` };
+  return null;
+}
 /** Only these subscription statuses may add or change add-ons (a locked / past_due org must fix the payment first). */
 export const ADDON_CHANGE_STATUSES = ["active", "trialing"] as const;
 
@@ -170,9 +179,8 @@ const hasUnsupportedPhaseSettings = (p: Stripe.SubscriptionSchedule.Phase) => Bo
 export async function setAddonQuantity({ stripe, subscription, addon, quantity, env = process.env }: ChangeAddonInput): Promise<AddonChangeResult> {
   const cfg = addonByKey(addon, env);
   if (!cfg) return { ok: false, status: 400, error: "Unknown add-on" };
-  if (!Number.isInteger(quantity) || quantity < 0 || quantity > MAX_ADDON_QUANTITY) return { ok: false, status: 400, error: `Quantity must be a whole number from 0 to ${MAX_ADDON_QUANTITY}` };
-  const max = addonEffect(cfg.key)?.maxQuantity;
-  if (max !== undefined && quantity > max) return { ok: false, status: 400, error: `At most ${max} of this add-on` };
+  const invalid = validateAddonQuantity(cfg.key, quantity, env);
+  if (invalid) return invalid;
   if (!(ADDON_CHANGE_STATUSES as readonly string[]).includes(subscription.status))
     return { ok: false, status: 409, error: "Add-ons can only be changed on an active subscription. Fix the payment in the billing portal first." };
 
@@ -247,8 +255,8 @@ export async function setAddonQuantity({ stripe, subscription, addon, quantity, 
   return cleared || quantity === currentQty ? done("schedule_cleared") : done("scheduled", ph!.current.end_date);
 }
 
-/** Add-ons currently configured, for UI/GET: key + price id (no amounts: those live in Stripe). */
+/** Add-ons currently configured, for UI/GET: key + price id + the most one subscription may hold (no amounts: those live in Stripe). */
 export function configuredAddons(env: Env = process.env) {
-  return addons(env).map((a) => ({ key: a.key, priceId: a.priceId, known: addonEffect(a.key) !== null }));
+  return addons(env).map((a) => ({ key: a.key, priceId: a.priceId, known: addonEffect(a.key) !== null, max: addonMaxQuantity(a.key, env) }));
 }
 

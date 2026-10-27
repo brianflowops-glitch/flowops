@@ -110,16 +110,53 @@ export function planLimits(planKey: string | null | undefined, env: Env = proces
 }
 
 /** What one unit of an add-on adds. `texts_<n>` is generic (texts_1000, texts_5000 …). */
-export type AddonEffect = Partial<Record<"seats" | "locations" | "monthlyTexts", number>> & { brandingRemoved?: true; maxQuantity?: number };
+export type AddonEffect = Partial<Record<"seats" | "locations" | "monthlyTexts", number>> & { brandingRemoved?: true };
 
 export function addonEffect(key: string): AddonEffect | null {
   const k = key.toLowerCase();
   if (k === "seat") return { seats: 1 };
   if (k === "location") return { locations: 1 };
-  if (k === "branding") return { brandingRemoved: true, maxQuantity: 1 };
+  if (k === "branding") return { brandingRemoved: true };
   const t = /^texts_(\d{1,7})$/.exec(k);
   if (t && Number(t[1]) > 0) return { monthlyTexts: Number(t[1]) };
   return null; // unknown add-on keys have no effect (still billed, still mirrored)
+}
+
+/**
+ * Maximum quantity of each add-on one subscription may hold (abuse guard: an Owner could otherwise set
+ * `texts_1000` to 1,000, i.e. a million texts we pay Twilio for). Product limits, overridable per add-on with
+ * `STRIPE_ADDON_MAX_<KEY>` (e.g. `STRIPE_ADDON_MAX_TEXTS_1000=20`).
+ */
+export const DEFAULT_ADDON_MAX: Readonly<Record<string, number>> = { seat: 50, location: 10, texts_1000: 10, branding: 1 };
+/** Any other add-on key (texts_5000, a new add-on …) gets this unless overridden. */
+export const FALLBACK_ADDON_MAX = 10;
+/** Hard ceiling for an override: the same bound `POST /api/billing/addons` has always had. */
+export const ADDON_MAX_CEILING = 1000;
+
+const warnedMax = new Set<string>();
+/** Test hook: forget which invalid overrides were already warned about. */
+export const resetAddonMaxWarnings = () => warnedMax.clear();
+
+/**
+ * The cap for one add-on key: `STRIPE_ADDON_MAX_<KEY>` when it is a positive whole number up to 1000,
+ * else the built-in default. An invalid override (0, negative, fraction, text, > 1000) never raises or removes
+ * the cap: it falls back to the default and warns once per distinct bad value.
+ */
+export function addonMaxQuantity(key: string, env: Env = process.env): number {
+  const k = key.toLowerCase();
+  const fallback = DEFAULT_ADDON_MAX[k] ?? FALLBACK_ADDON_MAX;
+  const name = `STRIPE_ADDON_MAX_${k.toUpperCase()}`;
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const text = raw.trim();
+  const n = /^\d{1,7}$/.test(text) ? Number(text) : NaN;
+  if (Number.isInteger(n) && n >= 1 && n <= ADDON_MAX_CEILING) return n;
+  const id = `${name}=${text}`;
+  if (!warnedMax.has(id)) {
+    warnedMax.add(id);
+    console.warn(`[billing] ignoring ${name}="${text}": must be a whole number from 1 to ${ADDON_MAX_CEILING}; using the default ${fallback}`);
+  }
+  return fallback;
 }
 
 export interface AddonQuantity {
@@ -138,15 +175,16 @@ export interface Entitlements extends PlanLimits {
 /**
  * plan + add-on quantities → totals. Quantities are clamped to integers ≥ 0; the same add-on listed
  * twice is summed; add-ons with no known effect are ignored. `branding` is OR-ed (plan includes it
- * or an add-on unlocks it); a branding add-on never counts more than once.
+ * or an add-on unlocks it). Each add-on's summed quantity is capped at `addonMaxQuantity` (so a quantity
+ * set directly in Stripe never grants more than the cap); `addons` reports the quantity actually counted.
  */
 export function computeEntitlements(planKey: string | null | undefined, addonQuantities: readonly AddonQuantity[] = [], env: Env = process.env): Entitlements {
   if (!planKey) return { ...NO_LIMITS, planKey: null, source: "none", addons: [] };
   const { source, ...limits } = planLimits(planKey, env);
-  return applyAddons(limits, planKey.toLowerCase(), source, addonQuantities);
+  return applyAddons(limits, planKey.toLowerCase(), source, addonQuantities, env);
 }
 
-function applyAddons(limits: PlanLimits, planKey: string | null, source: Entitlements["source"], addonQuantities: readonly AddonQuantity[]): Entitlements {
+function applyAddons(limits: PlanLimits, planKey: string | null, source: Entitlements["source"], addonQuantities: readonly AddonQuantity[], env: Env): Entitlements {
   const merged = new Map<string, number>();
   for (const a of addonQuantities) {
     const q = Number.isFinite(a.quantity) ? Math.max(0, Math.floor(a.quantity)) : 0;
@@ -157,12 +195,12 @@ function applyAddons(limits: PlanLimits, planKey: string | null, source: Entitle
   for (const [key, raw] of merged) {
     const fx = addonEffect(key);
     if (!fx) continue;
-    const q = Math.min(raw, fx.maxQuantity ?? raw);
+    const q = Math.min(raw, addonMaxQuantity(key, env));
     total.seats += (fx.seats ?? 0) * q;
     total.locations += (fx.locations ?? 0) * q;
     total.monthlyTexts += (fx.monthlyTexts ?? 0) * q;
     if (fx.brandingRemoved) total.brandingRemoved = true;
-    counted.push({ key, quantity: raw });
+    counted.push({ key, quantity: q });
   }
   return { ...total, planKey, source, addons: counted.sort((a, b) => a.key.localeCompare(b.key)) };
 }
@@ -205,6 +243,6 @@ export function entitlementsFromItems(items: readonly MirroredItem[], env: Env =
   const c = classifyItems(items, env);
   if (!c.plan) return computeEntitlements(null, [], env);
   // A plan item whose price is not configured as a plan still has a (fallback) tier: it is a live subscription.
-  if (c.plan.planKey === null) return applyAddons(FALLBACK_PLAN_LIMITS, null, "fallback", c.addons);
+  if (c.plan.planKey === null) return applyAddons(FALLBACK_PLAN_LIMITS, null, "fallback", c.addons, env);
   return computeEntitlements(c.plan.planKey, c.addons, env);
 }

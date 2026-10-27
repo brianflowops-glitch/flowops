@@ -1,7 +1,7 @@
 import Stripe from "stripe";
 import { z } from "zod";
-import { billingConfigured, billingEnabled } from "@/lib/billing/config";
-import { configuredAddons, setAddonQuantity } from "@/lib/billing/addons";
+import { addonByKey, billingConfigured, billingEnabled } from "@/lib/billing/config";
+import { configuredAddons, setAddonQuantity, validateAddonQuantity } from "@/lib/billing/addons";
 import { findLiveStripeSubscription, getOrCreateCustomer } from "@/lib/billing/checkout";
 import { getEntitlements } from "@/lib/billing/org-entitlements";
 import { getScheduledChanges } from "@/lib/billing/scheduled";
@@ -9,7 +9,7 @@ import { getStripe } from "@/lib/billing/stripe";
 import { requireApi } from "@/lib/server/context";
 import { badRequest, readJson } from "@/lib/server/validation";
 
-const body = z.object({ addon: z.string().min(1).max(64), quantity: z.number().int().min(0).max(1000) });
+const body = z.object({ addon: z.string().min(1).max(64), quantity: z.number().int().min(0) });
 
 /**
  * Owner/Admin: configured add-ons, what the org is entitled to right now, and what is already scheduled for the
@@ -31,6 +31,7 @@ export async function GET(req: Request) {
 
 /**
  * Owner or Admin sets an add-on's quantity on the org's existing subscription (0 removes it).
+ * The quantity may not exceed the add-on's maximum (400; see `addonMaxQuantity`).
  * Never a mid-cycle charge or credit (`proration_behavior: "none"`). An increase or new add-on applies now and is
  * first billed at the next renewal; a decrease or removal stays active until the period ends, then drops
  * (a subscription schedule's next phase; see addons.ts).
@@ -44,6 +45,12 @@ export async function POST(req: Request) {
   if (ctx instanceof Response) return ctx;
   const parsed = body.safeParse(await readJson(req));
   if (!parsed.success) return badRequest(parsed.error);
+
+  // Per-add-on maximum (docs/BILLING.md §11): rejected here, before any Stripe call.
+  if (addonByKey(parsed.data.addon)) {
+    const invalid = validateAddonQuantity(parsed.data.addon, parsed.data.quantity);
+    if (invalid) return Response.json({ error: invalid.error }, { status: invalid.status });
+  }
 
   const customer = await getOrCreateCustomer(ctx);
   const live = await findLiveStripeSubscription(customer);

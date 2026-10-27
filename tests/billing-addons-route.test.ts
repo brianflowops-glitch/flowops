@@ -44,6 +44,8 @@ describe("POST/GET /api/billing/addons guards", () => {
       vi.stubEnv("STRIPE_SECRET_KEY", "sk_test_dummy_never_used");
       vi.stubEnv("STRIPE_PRICE_STARTER", "price_x_starter");
       vi.stubEnv("STRIPE_ADDON_PRICE_SEAT", "price_x_seat");
+      vi.stubEnv("STRIPE_ADDON_PRICE_TEXTS_1000", "price_x_t1k");
+      vi.stubEnv("STRIPE_ADDON_PRICE_BRANDING", "price_x_brand");
     });
 
     it("401 without a session", async () => {
@@ -64,12 +66,36 @@ describe("POST/GET /api/billing/addons guards", () => {
       }
     });
 
+    it("400 with a clear message above the add-on's maximum (Owner and Admin), before any Stripe call", async () => {
+      for (const u of [owner, admin]) {
+        for (const [addon, quantity, max] of [["seat", 51, 50], ["texts_1000", 1000, 10], ["texts_1000", 11, 10], ["branding", 2, 1]] as const) {
+          const res = await post(u, { addon, quantity });
+          expect(res.status).toBe(400);
+          const j = await res.json();
+          expect(j.error).toContain(`maximum of ${max}`);
+          expect(j.error).toContain(addon);
+        }
+      }
+    });
+
+    it("an env override changes the cap used by the route (STRIPE_ADDON_MAX_TEXTS_1000=3 → 4 is refused)", async () => {
+      vi.stubEnv("STRIPE_ADDON_MAX_TEXTS_1000", "3");
+      const res = await post(owner, { addon: "texts_1000", quantity: 4 });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toContain("maximum of 3");
+      vi.stubEnv("STRIPE_ADDON_MAX_TEXTS_1000", "");
+    });
+
     it("GET works for Owner and Admin even though the org is locked (no subscription); lists add-ons, no prices", async () => {
       for (const u of [owner, admin]) {
         const res = await get(u);
         expect(res.status).toBe(200);
         const j = await res.json();
-        expect(j.addons).toEqual([{ key: "seat", priceId: "price_x_seat", known: true }]);
+        expect(j.addons).toEqual([
+          { key: "branding", priceId: "price_x_brand", known: true, max: 1 },
+          { key: "seat", priceId: "price_x_seat", known: true, max: 50 },
+          { key: "texts_1000", priceId: "price_x_t1k", known: true, max: 10 },
+        ]);
         expect(j.entitlements).toMatchObject({ enforced: true, reason: "no_subscription", entitlements: { seats: 0 } });
         expect(JSON.stringify(j)).not.toMatch(/amount|unit_amount|\$/);
         expect(j.scheduled).toBeNull(); // no Stripe customer yet → nothing pending, and no Stripe call

@@ -289,6 +289,19 @@ const row = async (id: string) => (await getDb().select().from(schema.subscripti
   r = await ent();
   check("renewal event applies the scheduled decrease: seat 5 → 2 and the texts bundle pruned → 12 seats / 2000 texts", JSON.stringify(await items()) === JSON.stringify(["si_plan2:price_t_pro:1", "si_seat:price_t_seat:2"]) && JSON.stringify(plain(r)) === JSON.stringify({ reason: "ok", seats: 12, locations: 1, texts: 2000, branding: true, plan: "pro" }), { items: await items(), r: plain(r) });
 
+  // A quantity above the cap mirrored from Stripe (set directly there, bypassing our route) never grants more than the cap.
+  stripeState.set(SA, asub("active", [{ id: "si_plan2", price: "price_t_pro" }, { id: "si_seat", price: "price_t_seat", q: 1000 }, { id: "si_loc", price: "price_t_loc", q: 99 }, { id: "si_t", price: "price_t_t1k", q: 1000 }, { id: "si_b", price: "price_t_brand", q: 7 }]));
+  const capEv = await run(ev("customer.subscription.updated", asub("active", []), AT + 36));
+  r = await ent();
+  check("add-on caps: the mirror keeps the raw quantities (seat 1000, texts_1000 1000)", capEv.status === "processed" && JSON.stringify(await items()) === JSON.stringify(["si_b:price_t_brand:7", "si_loc:price_t_loc:99", "si_plan2:price_t_pro:1", "si_seat:price_t_seat:1000", "si_t:price_t_t1k:1000"]), await items());
+  check("add-on caps: entitlements clamp to the defaults (pro 10 + 50 seats, 1 + 10 locations, 2000 + 10×1000 texts)", JSON.stringify(plain(r)) === JSON.stringify({ reason: "ok", seats: 60, locations: 11, texts: 12000, branding: true, plan: "pro" }), plain(r));
+  r = await ent({ BILLING_ENABLED: "true", STRIPE_ADDON_MAX_SEAT: "20", STRIPE_ADDON_MAX_TEXTS_1000: "bad" });
+  check("add-on caps: STRIPE_ADDON_MAX_SEAT=20 applies; an invalid override falls back to the default", r.enforced && r.entitlements.seats === 30 && r.entitlements.monthlyTexts === 12000, r);
+  stripeState.set(SA, asub("active", [{ id: "si_plan2", price: "price_t_pro" }, { id: "si_seat", price: "price_t_seat", q: 2 }]));
+  await run(ev("customer.subscription.updated", asub("active", []), AT + 38));
+  r = await ent();
+  check("add-on caps: lowering the mirrored quantity below the cap grants exactly that (12 seats)", r.enforced && r.entitlements.seats === 12 && r.entitlements.monthlyTexts === 2000, plain(r));
+
   // Failed card: locked org → zero entitlements (the lock already blocks it).
   stripeState.set(SA, asub("past_due", [{ id: "si_plan2", price: "price_t_pro" }, { id: "si_seat", price: "price_t_seat", q: 5 }]));
   await run(ev("invoice.payment_failed", { id: "in_pf2", parent: { subscription_details: { subscription: SA } } }, AT + 40));
