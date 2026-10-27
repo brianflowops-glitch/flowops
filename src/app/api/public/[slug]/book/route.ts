@@ -1,5 +1,6 @@
 import { and, eq, gte, sql } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
+import { phoneE164Sql } from "@/lib/db/phone-sql";
 import { orgBySlug } from "@/lib/server/public-org";
 import { runPipeline } from "@/lib/server/pipeline";
 import { toE164 } from "@/lib/phone";
@@ -42,6 +43,29 @@ export async function POST(req: Request, { params }: { params: Promise<{ slug: s
       ),
     );
   if (n >= 5) return Response.json({ error: "Too many bookings for this email today — please contact the business." }, { status: 429 });
+
+  // SMS abuse guard: every business texts from the same FlowOps number, so cap public bookings that opt a phone
+  // into texts at 5 per number per 24h across ALL businesses. Stops someone rotating emails/IPs to flood a stranger's
+  // phone (harassment, A2P complaints, Twilio cost). Uses booking_phone_e164_idx (migration 0007).
+  const smsPhone = p.smsConsent && p.phone ? toE164(p.phone) : null;
+  if (smsPhone) {
+    const [{ n: textsToPhone }] = await db
+      .select({ n: sql<number>`count(*)::int` })
+      .from(schema.booking)
+      .where(
+        and(
+          sql`${phoneE164Sql(schema.booking.phone)} = ${smsPhone}`,
+          eq(schema.booking.source, "public"),
+          eq(schema.booking.smsConsent, true),
+          gte(schema.booking.createdAt, new Date(Date.now() - 86_400_000)),
+        ),
+      );
+    if (textsToPhone >= 5)
+      return Response.json(
+        { error: "Too many text-message sign-ups for this phone number today. Uncheck text updates to book, or contact the business." },
+        { status: 429 },
+      );
+  }
 
   const result = await runPipeline(
     org,
