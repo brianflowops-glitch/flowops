@@ -4,7 +4,7 @@ import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { nextCookies } from "better-auth/next-js";
 import { APIError } from "better-auth/api";
 import { getDb, schema } from "@/lib/db";
-import { ensureMembership } from "@/lib/tenancy/membership";
+import { claimLegacyInviteAfterVerification, ensureMembership } from "@/lib/tenancy/membership";
 import { findUsableInvite } from "@/lib/tenancy/invites";
 import { emailVerificationRequired, resendConfigured, sendAccountEmail } from "@/lib/server/integrations/notify";
 
@@ -58,6 +58,14 @@ function createAuth() {
       sendOnSignIn: emailVerificationRequired(),
       autoSignInAfterVerification: true,
       expiresIn: 24 * 60 * 60,
+      // A legacy email-match staff invite is only honored once the address is proven.
+      afterEmailVerification: async (user) => {
+        try {
+          await claimLegacyInviteAfterVerification({ id: user.id, email: user.email });
+        } catch {
+          console.error("legacy invite claim after verification failed");
+        }
+      },
       sendVerificationEmail: async ({ user, url }) => {
         await sendAccountEmail(
           user.email,
@@ -100,7 +108,7 @@ function createAuth() {
           },
           after: async (u, ctx) => {
             const businessName = (u as { businessName?: string | null }).businessName ?? null;
-            await ensureMembership({ id: u.id, email: u.email, name: u.name, businessName, inviteToken: inviteTokenFrom(ctx) });
+            await ensureMembership({ id: u.id, email: u.email, name: u.name, emailVerified: Boolean(u.emailVerified), businessName, inviteToken: inviteTokenFrom(ctx) });
           },
         },
       },

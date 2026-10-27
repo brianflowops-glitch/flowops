@@ -34,8 +34,7 @@ export default function PrivacyPage() {
         in the dashboard, or by FlowAI on a user&apos;s request. If the customer opts in to text messages, we also store that choice and when it was made.
       </p>
       <p>
-        <strong className="text-white">Text messages (SMS).</strong> If you text with us, we collect your mobile phone number, the content of messages you send us
-        and that we send you, message delivery status, and consent records (whether you opted in, when and how, and any STOP/START requests). See section 2 below.
+        <strong className="text-white">Text messages (SMS).</strong> When a customer opts in on the booking form, we collect their mobile phone number, the appointment texts we send, message delivery status, and consent records (whether they opted in, when and how, and any STOP/START requests). See section 2 below.
       </p>
       <p>
         <strong className="text-white">Activity and audit records.</strong> A log of booking actions (created, rescheduled, cancelled, conflicts, failures) with the
@@ -48,26 +47,21 @@ export default function PrivacyPage() {
 
       <H2>2. SMS / text messaging</H2>
       <p>
-        {COMPANY_NAME} runs the &ldquo;FlowOps texts&rdquo; program. We text people in two ways:
+        {COMPANY_NAME} runs the &ldquo;FlowOps texts&rdquo; program. The booking-form checkbox is the only way to opt in:
       </p>
       <UL>
         <li>
-          <strong className="text-white">Opt-in on the booking form.</strong> Appointment texts (confirmations, reschedules, cancellations and reminders) are sent
+          <strong className="text-white">Opt-in on the booking form.</strong> Appointment texts (confirmations, reschedules and cancellations) are sent
           only when a customer enters a mobile number <em>and</em> ticks the text-message opt-in checkbox on a FlowOps booking page (for example{" "}
-          <a className="text-cyan-300 hover:underline" href="https://flowopsagent.ai/book/flowops-demo">flowopsagent.ai/book/flowops-demo</a>), or otherwise
-          tells the business they agree. The box is never pre-ticked, and texting is not required to book. Consent is not a condition of purchase.
-        </li>
-        <li>
-          <strong className="text-white">People who text us first.</strong> If you text our FlowOps number with questions about FlowOps, its features, pricing or
-          sales, we reply to you in that conversation. By texting us you agree to receive those replies.
+          <a className="text-cyan-300 hover:underline" href="https://flowopsagent.ai/book/flowops-demo">flowopsagent.ai/book/flowops-demo</a>). The box is never pre-ticked, and texting is not required to book. Consent is not a condition of purchase.
         </li>
       </UL>
       <p>
-        <strong className="text-white">What we collect:</strong> your mobile phone number, the content of the messages exchanged, message dates and delivery status,
+        <strong className="text-white">What we collect:</strong> your mobile phone number, the appointment texts we send, message dates and delivery status,
         and consent records (opt-in time and method, and opt-out/opt-in keyword requests).
       </p>
       <p>
-        <strong className="text-white">How we use it:</strong> only to send the appointment messages you asked for, to answer your questions, to honor STOP and HELP
+        <strong className="text-white">How we use it:</strong> only to send the appointment messages you asked for, to honor STOP and HELP
         requests, to keep records of consent, and to troubleshoot delivery.
       </p>
       <p>
@@ -122,7 +116,7 @@ export default function PrivacyPage() {
       <H2>4. How we use information</H2>
       <UL>
         <li>To provide the Service: accounts, workspaces, booking pages, availability checks, calendar sync and notifications.</li>
-        <li>To send appointment text messages to customers who opted in, and to reply to people who text our number (see section 2).</li>
+        <li>To send appointment text messages to customers who opted in on the booking form.</li>
         <li>To send service emails: email verification, password resets, team invitations, and booking confirmations, changes and cancellations.</li>
         <li>To run FlowAI when a workspace user asks it to (see section 5).</li>
         <li>To secure the Service: rate limiting, preventing abuse, and investigating problems.</li>
@@ -148,7 +142,7 @@ export default function PrivacyPage() {
         <li><strong className="text-white">Resend</strong> — delivers our emails (verification, password reset, invites and booking notifications).</li>
         <li><strong className="text-white">Google</strong> — Google Calendar, only for workspaces that connect it.</li>
         <li><strong className="text-white">AI model providers</strong> (currently OpenAI, via Vercel AI Gateway) — generate FlowAI replies.</li>
-        <li><strong className="text-white">Twilio</strong> — delivers our text messages (appointment texts to customers who opted in, and replies to people who text us) and handles STOP/HELP replies. Twilio processes this data only to deliver our messages.</li>
+        <li><strong className="text-white">Twilio</strong> — delivers our text messages (appointment texts to customers who opted in) and handles STOP/HELP replies. Twilio processes this data only to deliver our messages.</li>
         <li><strong className="text-white">Cloudflare</strong> — DNS for our domain.</li>
       </UL>
       <p>We may also disclose information if required by law, to protect the rights and safety of users or the public, or as part of a merger or sale of the business.</p>

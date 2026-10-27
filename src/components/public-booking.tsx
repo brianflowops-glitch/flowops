@@ -4,7 +4,8 @@ import { useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
 import { CalendarCheck, CheckCircle2 } from "lucide-react";
 import { clsx } from "./clsx";
-import { SMS_CONSENT_TEXT, toE164 } from "@/lib/phone";
+import { toE164 } from "@/lib/phone";
+import { BookingPhoneField, SmsConsentCheckbox, bookingFieldClass } from "@/components/sms-consent-checkbox";
 
 type Info = {
   org: { slug: string; name: string; timeZone: string; hours: Record<string, { open: string; close: string } | null> };
@@ -13,8 +14,6 @@ type Info = {
 };
 type Done = { id: string; service: string; date: string; time: string; durationMin: number; notifications: string };
 
-const inputCls =
-  "w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm text-white placeholder:text-slate-600 focus:border-cyan-400/50 focus:outline-none focus:ring-2 focus:ring-cyan-400/10";
 const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 function addDays(ymd: string, n: number) {
@@ -232,20 +231,13 @@ export function PublicBooking() {
           </section>
           <section className="space-y-3">
             <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-500">4 · Your details</h2>
-            <input name="name" required placeholder="Full name" autoComplete="name" className={inputCls} />
+            <input name="name" required placeholder="Full name" autoComplete="name" className={bookingFieldClass} />
             <div className="grid gap-3 sm:grid-cols-2">
-              <input name="email" type="email" required placeholder="Email" autoComplete="email" className={inputCls} />
-              <input name="phone" type="tel" placeholder="Phone (optional)" autoComplete="tel" className={inputCls} />
+              <input name="email" type="email" required placeholder="Email" autoComplete="email" className={bookingFieldClass} />
+              <BookingPhoneField />
             </div>
-            <label className="flex items-start gap-2 text-xs leading-relaxed text-slate-400">
-              <input name="smsConsent" type="checkbox" defaultChecked={false} className="mt-0.5 h-4 w-4 shrink-0 accent-cyan-400" />
-              <span>
-                {SMS_CONSENT_TEXT} See our{" "}
-                <a href="/terms" target="_blank" rel="noopener" className="text-cyan-300 hover:underline">Terms</a> and{" "}
-                <a href="/privacy" target="_blank" rel="noopener" className="text-cyan-300 hover:underline">Privacy Policy</a>.
-              </span>
-            </label>
-            <textarea name="notes" rows={2} placeholder="Anything we should know? (optional)" className={inputCls} />
+            <SmsConsentCheckbox name="smsConsent" />
+            <textarea name="notes" rows={2} placeholder="Anything we should know? (optional)" className={bookingFieldClass} />
             <input name="website" tabIndex={-1} autoComplete="off" className="hidden" aria-hidden />
           </section>
           {error && <p className="rounded-lg border border-amber-400/30 bg-amber-400/[0.07] px-3 py-2 text-sm text-amber-100">{error}</p>}

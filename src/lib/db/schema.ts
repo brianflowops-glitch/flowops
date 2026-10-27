@@ -6,10 +6,13 @@
  * - Tenancy: organization (tenant), member (user ↔ org, role owner|admin|staff),
  *   team_invite (token invites, v2.1), staff_invite (legacy email-match invites)
  * - Booking data, all scoped by organization_id: service, booking, audit_entry, notification
+ * - Reliability: notification_failure (final send failures after retries; redacted),
+ *   provider_webhook_event (dedupe), message_delivery_event, sms_opt_out
  */
 import { relations } from "drizzle-orm";
 import { bigint, boolean, index, integer, jsonb, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
 import type { DayHours } from "@/lib/booking/types";
+import { phoneE164Sql } from "./phone-sql";
 
 // ───────────────────────────── Better Auth core ─────────────────────────────
 
@@ -208,7 +211,12 @@ export const booking = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
   },
-  (t) => [index("booking_org_date_idx").on(t.organizationId, t.date), index("booking_org_status_idx").on(t.organizationId, t.status)],
+  (t) => [
+    index("booking_org_date_idx").on(t.organizationId, t.date),
+    index("booking_org_status_idx").on(t.organizationId, t.status),
+    /** STOP/START match on the normalized phone (migration 0007). Must stay identical to the query's phoneE164Sql. */
+    index("booking_phone_e164_idx").on(phoneE164Sql(t.phone)),
+  ],
 );
 
 export const auditEntry = pgTable(
@@ -243,11 +251,135 @@ export const notification = pgTable(
     subject: text("subject").notNull(),
     deliveryStatus: text("delivery_status").notNull(),
     detail: text("detail"),
+    /** v2.4 sweeper lease: set atomically when the recovery cron claims a stale "queued" row. */
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    /** v2.4: how many times the recovery cron has claimed this row (capped, so it can't loop). */
+    sweepAttempts: integer("sweep_attempts").notNull().default(0),
   },
-  (t) => [index("notification_org_at_idx").on(t.organizationId, t.at)],
+  (t) => [index("notification_org_at_idx").on(t.organizationId, t.at), index("notification_status_at_idx").on(t.deliveryStatus, t.at)],
 );
+
+/**
+ * Final outbound-notification failures (after retries), v2.4. Additive only.
+ * Never stores message bodies, links or full contact details: `target` is masked (•••1234 / j•••@example.com)
+ * and `detail` is scrubbed of links, emails and phone numbers. organization_id is null for account emails.
+ */
+export const notificationFailure = pgTable(
+  "notification_failure",
+  {
+    id: text("id").primaryKey(),
+    organizationId: text("organization_id").references(() => organization.id, { onDelete: "cascade" }),
+    channel: text("channel").notNull(), // "sms" | "email"
+    tag: text("tag").notNull(), // e.g. "booking:BK-123", "account_email"
+    target: text("target").notNull(), // redacted
+    failureKind: text("failure_kind").notNull(), // "permanent" | "transient_exhausted" | "ambiguous"
+    detail: text("detail"),
+    attempts: integer("attempts").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("notification_failure_org_created_idx").on(t.organizationId, t.createdAt), index("notification_failure_created_idx").on(t.createdAt)],
+);
+
+/** Inbound provider webhook dedupe (v2.4): one row per (provider, event key); a replay hits the unique index. */
+export const providerWebhookEvent = pgTable(
+  "provider_webhook_event",
+  {
+    id: text("id").primaryKey(),
+    provider: text("provider").notNull(), // "twilio" | "resend"
+    eventKey: text("event_key").notNull(), // Twilio MessageSid[:MessageStatus], Resend svix-id
+    eventType: text("event_type").notNull(),
+    receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("provider_webhook_event_key_uq").on(t.provider, t.eventKey)],
+);
+
+/** Delivery status callbacks (Twilio StatusCallback, Resend email.* events). Append-only. */
+export const messageDeliveryEvent = pgTable(
+  "message_delivery_event",
+  {
+    id: text("id").primaryKey(),
+    provider: text("provider").notNull(),
+    messageId: text("message_id").notNull(), // Twilio SM…/MM… sid or Resend email id
+    status: text("status").notNull(), // e.g. delivered, undelivered, failed, email.bounced
+    errorCode: text("error_code"),
+    detail: text("detail"), // scrubbed
+    occurredAt: timestamp("occurred_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("message_delivery_event_msg_idx").on(t.provider, t.messageId)],
+);
+
+/**
+ * Carrier-level SMS opt-out state per phone (E.164) for the FlowOps sender. STOP applies to every org that
+ * texts from the shared number, so this is not org-scoped. Checked before every outbound SMS.
+ */
+export const smsOptOut = pgTable("sms_opt_out", {
+  phone: text("phone").primaryKey(),
+  optedOut: boolean("opted_out").notNull(),
+  keyword: text("keyword").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 // Relations (used by Better Auth joins and Drizzle relational queries)
 export const userRelations = relations(user, ({ many }) => ({ sessions: many(session), accounts: many(account) }));
 export const sessionRelations = relations(session, ({ one }) => ({ user: one(user, { fields: [session.userId], references: [user.id] }) }));
 export const accountRelations = relations(account, ({ one }) => ({ user: one(user, { fields: [account.userId], references: [user.id] }) }));
+
+// ───────────────────────────── Billing (Stripe, v2.4, additive 0006) ─────────────────────────────
+// See docs/BILLING.md. Stripe is the source of truth; these rows mirror it from webhooks.
+// Plain text status column (no DB enum), matching the member.role convention.
+
+/** One Stripe customer per organization. */
+export const billingCustomer = pgTable(
+  "billing_customer",
+  {
+    organizationId: text("organization_id")
+      .primaryKey()
+      .references(() => organization.id, { onDelete: "cascade" }),
+    stripeCustomerId: text("stripe_customer_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("billing_customer_stripe_customer_unique").on(t.stripeCustomerId)],
+);
+
+export const SUBSCRIPTION_STATUSES = [
+  "trialing",
+  "active",
+  "past_due",
+  "canceled",
+  "incomplete",
+  "incomplete_expired",
+  "unpaid",
+  "paused",
+] as const;
+export type SubscriptionStatus = (typeof SUBSCRIPTION_STATUSES)[number];
+
+/** Mirror of a Stripe subscription, scoped to one organization. */
+export const subscription = pgTable(
+  "subscription",
+  {
+    id: text("id").primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organization.id, { onDelete: "cascade" }),
+    stripeSubscriptionId: text("stripe_subscription_id").notNull(),
+    status: text("status", { enum: SUBSCRIPTION_STATUSES }).notNull(),
+    /** Stripe price id (price_…); mapped to a plan key via STRIPE_PRICE_* env vars. */
+    priceId: text("price_id"),
+    currentPeriodEnd: timestamp("current_period_end", { withTimezone: true }),
+    cancelAtPeriodEnd: boolean("cancel_at_period_end").notNull().default(false),
+    /** `created` of the Stripe event that last wrote this row (out-of-order guard). */
+    lastEventCreated: timestamp("last_event_created", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("subscription_stripe_subscription_unique").on(t.stripeSubscriptionId), index("subscription_org_idx").on(t.organizationId)],
+);
+
+/** Processed Stripe webhook events (idempotency: Stripe retries and may deliver an event more than once). */
+export const stripeEvent = pgTable("stripe_event", {
+  id: text("id").primaryKey(), // evt_…
+  type: text("type").notNull(),
+  processedAt: timestamp("processed_at", { withTimezone: true }).notNull().defaultNow(),
+});

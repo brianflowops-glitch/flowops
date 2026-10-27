@@ -43,6 +43,7 @@ export function SiteFooter() {
         <div className="flex flex-wrap gap-x-5 gap-y-2 sm:ml-auto">
           <Link href="/terms" className="hover:text-slate-200">Terms</Link>
           <Link href="/privacy" className="hover:text-slate-200">Privacy</Link>
+          <Link href="/sms-consent" className="hover:text-slate-200">SMS consent</Link>
           <a href={`mailto:${CONTACT_EMAIL}`} className="hover:text-slate-200">Contact</a>
           <Link href="/sign-in" className="hover:text-slate-200">Sign in</Link>
         </div>

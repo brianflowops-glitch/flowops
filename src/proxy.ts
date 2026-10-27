@@ -18,5 +18,5 @@ export function proxy(request: NextRequest) {
 
 export const config = {
   // Everything except public pages, auth/API routes and static assets.
-  matcher: ["/((?!api/|book/|home|terms|privacy|sign-in|sign-up|forgot-password|reset-password|verify-email|invite/|_next/static|_next/image|favicon.ico|.*\\.(?:png|jpg|svg|ico|webp|txt|xml)$).*)"],
+  matcher: ["/((?!api/|book/|home|terms|privacy|sms-consent|sign-in|sign-up|forgot-password|reset-password|verify-email|invite/|_next/static|_next/image|favicon.ico|.*\\.(?:png|jpg|svg|ico|webp|txt|xml)$).*)"],
 };
