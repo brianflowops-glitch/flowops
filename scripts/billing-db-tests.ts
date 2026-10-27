@@ -12,6 +12,8 @@ import { textPackExpiry } from "../src/lib/billing/text-pack-rules";
 import { trialEligibility } from "../src/lib/billing/checkout";
 import { subscriptionFields } from "../src/lib/billing/webhook";
 import { DEMO_ORG_ID, defaultHours } from "../src/lib/tenancy/defaults";
+import { dbAddonChargeLedger, lockOrgForAddonChange, sweepAddonCharges } from "../src/lib/billing/addon-charges-db";
+import { setAddonQuantity, type AddonStripe } from "../src/lib/billing/addons";
 
 if (/neon\.tech|vercel|amazonaws/.test(process.env.DATABASE_URL ?? "")) throw new Error("Refusing to run against a hosted database");
 
@@ -537,6 +539,123 @@ const expectUnique = async (db: ReturnType<typeof getDb>, invoiceId: string) => 
     await db.insert(schema.subscription).values({ id: `sr_${n}`, organizationId: TORG, stripeSubscriptionId: `sub_t_${n}`, status: "canceled", priceId: "price_t_starter" } as typeof schema.subscription.$inferInsert);
     check("trial: a cancelled subscription in OUR mirror (Stripe list empty) → no trial", (await trialEligibility(TORG, "cus_t", { db, stripe: fs })).eligible === false);
     await db.delete(schema.organization).where(eq(schema.organization.id, TORG));
+  }
+
+
+  // ── 0005: trial add-on charge attempts (addon_charge, migration 0011): ledger, crash → row survives, sweep ──
+  {
+    const CORG = `org_charge_${n}`;
+    await db.insert(schema.organization).values({ id: CORG, slug: `charge-${n}`, name: "Charge test", hours: defaultHours() });
+    const L = dbAddonChargeLedger(db, CORG);
+    const base = { subscriptionId: `sub_c_${n}`, customerId: `cus_c_${n}`, addon: "seat", priceId: "price_c_seat", fromQuantity: 0, toQuantity: 2, amount: 467, currency: "usd", paymentMethod: "pm_card" };
+    const T = schema.addonCharge;
+    const rowOf = async (id: string) => (await db.select().from(T).where(eq(T.id, id)))[0];
+    const age = (id: string) => db.update(T).set({ createdAt: new Date(Date.now() - 3600_000) }).where(eq(T.id, id));
+
+    // Fake Stripe: subscription items, invoices (by id, list by metadata), credit notes with idempotency keys.
+    const fx = { qty: 0, inv: new Map<string, { status: string; amount: number; metadata: Record<string, string> }>(), cns: [] as { id: string; invoice: string; metadata: Record<string, string> }[], cnKeys: new Map<string, string>(), throwItem: false, cnDown: 0, nInv: 0 };
+    const fstripe = {
+      subscriptions: { retrieve: async (id: string) => ({ id, status: "trialing", customer: base.customerId, trial_end: T0 + 7 * 86400, default_payment_method: "pm_card", latest_invoice: null, schedule: null, items: { has_more: false, data: [{ id: "si_plan", price: { id: "price_c_plan", unit_amount: 9900, recurring: { interval: "month" } }, quantity: 1, current_period_end: T0 + 7 * 86400 }, ...(fx.qty ? [{ id: "si_seat", price: { id: "price_c_seat", unit_amount: 1000 }, quantity: fx.qty, current_period_end: T0 + 7 * 86400 }] : [])] } }) as unknown as Stripe.Subscription },
+      subscriptionItems: {
+        list: () => ({ autoPagingToArray: async () => [] }),
+        create: async (q: Stripe.SubscriptionItemCreateParams) => { if (fx.throwItem) throw new Error("crash"); fx.qty = q.quantity ?? 1; return { id: "si_seat" } as Stripe.SubscriptionItem; },
+        update: async (id: string, q: Stripe.SubscriptionItemUpdateParams) => { fx.qty = q.quantity ?? fx.qty; return { id } as Stripe.SubscriptionItem; },
+      },
+      subscriptionSchedules: { retrieve: async () => { throw new Error("n/a"); }, create: async () => { throw new Error("n/a"); }, update: async () => { throw new Error("n/a"); }, release: async () => { throw new Error("n/a"); } },
+      invoices: {
+        create: async (q: Stripe.InvoiceCreateParams) => { const id = `in_c_${n}_${++fx.nInv}`; fx.inv.set(id, { status: "draft", amount: 0, metadata: q.metadata as Record<string, string> }); return { id, status: "draft" } as Stripe.Invoice; },
+        finalizeInvoice: async (id: string) => (fx.inv.get(id)!.status = "open", { id, status: "open" } as Stripe.Invoice),
+        pay: async (id: string) => { const v = fx.inv.get(id)!; v.status = "paid"; return { id, status: "paid", amount_paid: v.amount, currency: "usd" } as Stripe.Invoice; },
+        retrieve: async (id: string) => { const v = fx.inv.get(id); return { id, status: v?.status ?? "void", amount_paid: v?.status === "paid" ? v.amount : 0, currency: "usd" } as Stripe.Invoice; },
+        voidInvoice: async (id: string) => (fx.inv.get(id)!.status = "void", { id, status: "void" } as Stripe.Invoice),
+        del: async () => ({}),
+        list: async () => ({ data: [...fx.inv].map(([id, v]) => ({ id, status: v.status, amount_paid: v.status === "paid" ? v.amount : 0, metadata: v.metadata })) }),
+      },
+      invoiceItems: { create: async (q: Stripe.InvoiceItemCreateParams) => (fx.inv.get(q.invoice as string)!.amount = q.amount!, { id: "ii" } as Stripe.InvoiceItem) },
+      prices: { retrieve: async (id: string) => ({ id, unit_amount: 1000, currency: "usd" }) as Stripe.Price },
+      customers: { retrieve: async (id: string) => ({ id, invoice_settings: { default_payment_method: "pm_card" } }) as unknown as Stripe.Customer },
+      creditNotes: {
+        list: async (q: Stripe.CreditNoteListParams) => ({ data: fx.cns.filter((c) => c.invoice === q.invoice).map((c) => ({ ...c, status: "issued" })) }) as unknown as Stripe.ApiList<Stripe.CreditNote>,
+        create: async (q: Stripe.CreditNoteCreateParams, o?: Stripe.RequestOptions) => {
+          if (fx.cnDown > 0) { fx.cnDown--; throw new Error("unreachable"); }
+          const seen = fx.cnKeys.get(o?.idempotencyKey ?? "");
+          if (seen) return { id: seen } as Stripe.CreditNote;
+          const id = `cn_c_${fx.cns.length + 1}`;
+          fx.cns.push({ id, invoice: q.invoice, metadata: q.metadata as Record<string, string> });
+          fx.cnKeys.set(o?.idempotencyKey ?? "", id);
+          return { id } as Stripe.CreditNote;
+        },
+      },
+    } as unknown as AddonStripe;
+
+    await L.insert({ ...base, id: `adc_a_${n}` });
+    await L.update(`adc_a_${n}`, { invoiceId: `in_dup_${n}` });
+    let r0 = await rowOf(`adc_a_${n}`);
+    check("addon_charge: inserted pending, invoice id stored, listed as unresolved", r0?.status === "pending" && r0.stripeInvoiceId === `in_dup_${n}` && (await L.unresolved()).some((x) => x.id === `adc_a_${n}`), r0);
+    await L.insert({ ...base, id: `adc_b_${n}` });
+    const dup = await L.update(`adc_b_${n}`, { invoiceId: `in_dup_${n}` }).then(() => "no error", (e: Error) => (e as { cause?: { code?: string } }).cause?.code ?? (e as { code?: string }).code ?? e.message);
+    check("addon_charge: one Stripe invoice can belong to only one attempt (unique index)", dup === "23505", dup);
+    await db.delete(T).where(eq(T.organizationId, CORG));
+
+    // Crash INSIDE the route's lock transaction: the tx rolls back, the charge row (written outside it) survives as paid.
+    fx.throwItem = true; fx.cnDown = 1;
+    let attemptId = "";
+    const crashed = await db
+      .transaction(async (tx) => {
+        await lockOrgForAddonChange(tx, CORG);
+        return setAddonQuantity({ stripe: fstripe, subscription: { id: base.subscriptionId, status: "trialing" }, addon: "seat", quantity: 2, env: { STRIPE_ADDON_PRICE_SEAT: "price_c_seat", STRIPE_PRICE_PRO: "price_c_plan" }, now: new Date(T0 * 1000), ledger: L, newAttemptId: () => (attemptId = `adc_crash_${n}`) });
+      })
+      .then(() => "no error", (e: Error) => e.message);
+    r0 = await rowOf(attemptId);
+    check("crash after the trial charge (item write fails, refund unreachable): lock tx rolled back, addon_charge row survives as PAID", crashed === "crash" && r0?.status === "paid" && !!r0.stripeInvoiceId && fx.inv.get(r0.stripeInvoiceId!)?.status === "paid" && fx.qty === 0 && fx.cns.length === 0, { crashed, r0 });
+    fx.throwItem = false;
+    let sw = await sweepAddonCharges(db, fstripe);
+    check("sweep: a fresh (< 10 min) attempt is left alone (a live request may own it)", !sw.some((x) => x.id === attemptId) && (await rowOf(attemptId))?.status === "paid", sw);
+    await age(attemptId);
+    // also: an old pending attempt whose invoice was paid but never recorded, and an old paid attempt that WAS applied
+    await L.insert({ ...base, id: `adc_lost_${n}` });
+    fx.inv.set(`in_lost_${n}`, { status: "paid", amount: 300, metadata: { flowops_addon_charge_id: `adc_lost_${n}` } });
+    await age(`adc_lost_${n}`);
+    sw = await sweepAddonCharges(db, fstripe);
+    const st = async (id: string) => (await rowOf(id))?.status;
+    check("sweep: old paid attempt without the add-on → refunded (credit note on its invoice, full amount)", (await st(attemptId)) === "refunded" && fx.cns.some((c) => c.invoice === r0?.stripeInvoiceId && c.metadata.flowops_addon_charge_id === attemptId) && !!(await rowOf(attemptId))?.stripeCreditNoteId, { sw, cns: fx.cns });
+    check("sweep: old pending attempt whose invoice was paid (found by metadata) → refunded, invoice id recorded", (await st(`adc_lost_${n}`)) === "refunded" && (await rowOf(`adc_lost_${n}`))?.stripeInvoiceId === `in_lost_${n}`, await rowOf(`adc_lost_${n}`));
+    const cnBefore = fx.cns.length;
+    await db.update(T).set({ status: "paid" }).where(eq(T.id, attemptId)); // simulate a lost DB update after the refund
+    await age(attemptId);
+    sw = await sweepAddonCharges(db, fstripe);
+    check("sweep: idempotent: re-running (even with a stale paid row) never refunds twice", fx.cns.length === cnBefore && (await st(attemptId)) === "refunded", { sw, cns: fx.cns });
+    fx.qty = 2;
+    await L.insert({ ...base, id: `adc_ok_${n}` });
+    await L.update(`adc_ok_${n}`, { status: "paid", invoiceId: `in_ok_${n}` });
+    fx.inv.set(`in_ok_${n}`, { status: "paid", amount: 467, metadata: {} });
+    await age(`adc_ok_${n}`);
+    sw = await sweepAddonCharges(db, fstripe);
+    check("sweep: old paid attempt whose add-on IS on the subscription → applied, no refund (never takes back a granted add-on)", (await st(`adc_ok_${n}`)) === "applied" && fx.cns.length === cnBefore, sw);
+    fx.qty = 0;
+
+    // The sweep takes the org row lock: it waits while a request holds it.
+    await L.insert({ ...base, id: `adc_lock_${n}` });
+    await age(`adc_lock_${n}`);
+    let released = false;
+    let sweptWhileLocked = false;
+    let release!: () => void;
+    const holding = db.transaction(async (tx) => {
+      await lockOrgForAddonChange(tx, CORG);
+      await new Promise<void>((res) => (release = res));
+      released = true;
+    });
+    await new Promise((res) => setTimeout(res, 100));
+    const sweeping = sweepAddonCharges(db, fstripe).then((x) => { sweptWhileLocked = !released; return x; });
+    await new Promise((res) => setTimeout(res, 300));
+    const stillPending = (await st(`adc_lock_${n}`)) === "pending";
+    release();
+    await holding;
+    await sweeping;
+    check("sweep: waits for the org row lock (never settles an attempt while a request of that org is in flight)", stillPending && !sweptWhileLocked && (await st(`adc_lock_${n}`)) === "failed", { stillPending, sweptWhileLocked });
+
+    await db.delete(schema.organization).where(eq(schema.organization.id, CORG));
+    check("org delete cascades addon_charge rows", (await db.select().from(T).where(eq(T.organizationId, CORG))).length === 0);
   }
 
   // Failed card: locked org → zero entitlements (the lock already blocks it).

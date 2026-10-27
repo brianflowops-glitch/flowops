@@ -7,8 +7,8 @@ import { findLiveStripeSubscription, getOrCreateCustomer } from "@/lib/billing/c
 import { getEntitlements } from "@/lib/billing/org-entitlements";
 import { getScheduledChanges } from "@/lib/billing/scheduled";
 import { getStripe } from "@/lib/billing/stripe";
-import { getDb, schema } from "@/lib/db";
-import { eq } from "drizzle-orm";
+import { getDb } from "@/lib/db";
+import { dbAddonChargeLedger, lockOrgForAddonChange } from "@/lib/billing/addon-charges-db";
 import { requireApi } from "@/lib/server/context";
 import { badRequest, readJson } from "@/lib/server/validation";
 
@@ -66,10 +66,11 @@ export async function POST(req: Request) {
   const live = await findLiveStripeSubscription(customer);
   if (!live) return Response.json({ error: "No subscription yet. Subscribe to a plan first." }, { status: 409 });
   try {
-    // One add-on change per org at a time (row lock on the organization, as for text packs).
+    // One add-on change per org at a time (row lock on the organization; FOR NO KEY UPDATE, see lockOrgForAddonChange).
     const result = await getDb().transaction(async (tx) => {
-      await tx.select({ id: schema.organization.id }).from(schema.organization).where(eq(schema.organization.id, ctx.org.id)).for("update");
-      return setAddonQuantity({ stripe: getStripe(), subscription: live, addon: parsed.data.addon, quantity: parsed.data.quantity });
+      await lockOrgForAddonChange(tx, ctx.org.id);
+      // The trial-charge ledger writes outside this transaction (a collected charge's row must survive a rollback).
+      return setAddonQuantity({ stripe: getStripe(), subscription: live, addon: parsed.data.addon, quantity: parsed.data.quantity, ledger: dbAddonChargeLedger(getDb(), ctx.org.id) });
     });
     if (!result.ok) return Response.json({ error: result.error, ...(result.code ? { code: result.code } : {}), ...(result.portal ? { portal: "/api/billing/portal" } : {}) }, { status: result.status });
     const effectiveAt = result.effectiveAt ? new Date(result.effectiveAt * 1000).toISOString() : null;

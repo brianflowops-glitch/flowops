@@ -7,6 +7,7 @@
 import Stripe from "stripe";
 import { eq } from "drizzle-orm";
 import { getDb, getConn, schema } from "../src/lib/db";
+import { dbAddonChargeLedger } from "../src/lib/billing/addon-charges-db";
 import { processStripeEvent } from "../src/lib/billing/webhook";
 import { retrieveSubscriptionComplete, scheduledChanges, setAddonQuantity } from "../src/lib/billing/addons";
 import { getEntitlements } from "../src/lib/billing/org-entitlements";
@@ -85,7 +86,7 @@ async function world(label: string, pm = "pm_card_visa") {
   };
   const buy = async (quantity: number, subscription?: { id: string; status: Stripe.Subscription.Status }, env?: Record<string, string | undefined>) =>
     purchaseTextPack({ stripe: stripe as unknown as PackStripe, db, orgId: ORG, customerId: customer.id, subscription: subscription ?? (await live()), pack: "texts_1000", quantity, now: await now(), ...(env ? { env } : {}) });
-  const apply = async (addon: string, quantity: number, env?: Record<string, string | undefined>) => setAddonQuantity({ stripe, subscription: await live(), addon, quantity, ...(env ? { env } : {}) });
+  const apply = async (addon: string, quantity: number, env?: Record<string, string | undefined>) => setAddonQuantity({ stripe, subscription: await live(), addon, quantity, ...(env ? { env } : {}), ledger: dbAddonChargeLedger(db, ORG) });
   return { clock, ORG, customer, drain, now, subs, live, invoices, mirrored, ent, buy, apply };
 }
 

@@ -449,3 +449,37 @@ export const stripeEvent = pgTable("stripe_event", {
   type: text("type").notNull(),
   processedAt: timestamp("processed_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+/**
+ * One attempt to charge a trial add-on increase (docs/BILLING.md §11, patch 0005). Written `pending` before any
+ * Stripe call so a crash between the charge and the add-on being applied can be settled (refund or confirm) by
+ * `reconcileAddonCharges` / `sweepAddonCharges`. Statuses: pending → paid → applied | refunded; pending → failed.
+ */
+export const ADDON_CHARGE_STATUSES = ["pending", "paid", "applied", "failed", "refunded"] as const;
+export const addonCharge = pgTable(
+  "addon_charge",
+  {
+    /** Attempt id (adc_…); also in the invoice metadata (`flowops_addon_charge_id`) and the idempotency key. */
+    id: text("id").primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organization.id, { onDelete: "cascade" }),
+    stripeSubscriptionId: text("stripe_subscription_id").notNull(),
+    stripeCustomerId: text("stripe_customer_id").notNull(),
+    addonKey: text("addon_key").notNull(),
+    priceId: text("price_id").notNull(),
+    fromQuantity: integer("from_quantity").notNull(),
+    toQuantity: integer("to_quantity").notNull(),
+    /** What we asked Stripe to collect, smallest currency unit. */
+    amount: integer("amount").notNull(),
+    currency: text("currency").notNull(),
+    paymentMethod: text("payment_method").notNull(),
+    status: text("status", { enum: ADDON_CHARGE_STATUSES }).notNull().default("pending"),
+    stripeInvoiceId: text("stripe_invoice_id"),
+    stripeCreditNoteId: text("stripe_credit_note_id"),
+    note: text("note"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("addon_charge_stripe_invoice_unique").on(t.stripeInvoiceId), index("addon_charge_org_status_idx").on(t.organizationId, t.status)],
+);

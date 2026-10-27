@@ -78,6 +78,13 @@
       "when": 1793139698522,
       "tag": "0010_text_pack_rollover",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1793141598157,
+      "tag": "0011_addon_charge",
+      "breakpoints": true
     }
   ]
 }

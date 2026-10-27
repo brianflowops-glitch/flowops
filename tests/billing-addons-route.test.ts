@@ -156,6 +156,8 @@ describe("POST/GET /api/billing/addons guards", () => {
       expect(j).toMatchObject({ action: "created", proration: "always_invoice", charge: { invoiceId: "in_1", amountPaid: 1032 } });
       expect(j.billing).toContain("Charged 10.32 USD now, prorated for the rest of this billing period");
       expect(set.mock.calls[0][0]).toMatchObject({ addon: "seat", quantity: 2, subscription: { id: "sub_x" } });
+      // 0005: the trial-charge ledger for THIS org is passed (attempt rows + reconciliation under the org lock)
+      expect(set.mock.calls[0][0].ledger?.orgId).toBeTruthy();
     });
 
     it("200 in a trial: says it covers the rest of the free trial", async () => {

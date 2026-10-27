@@ -13,13 +13,37 @@
  *   - Decrease / removal (unchanged): the add-on stays active until the current period ends, then drops at renewal.
  *     Done with a subscription schedule whose next phase holds the lower quantity. No refund, no proration credit.
  *   - A later change replaces a pending one (see `setAddonQuantity`).
+ *   - What happens to an increase DURING A TRIAL is decided in exactly one place: `TRIAL_ADDON_POLICY` below.
  */
 import type Stripe from "stripe";
 import { addonByKey, addonPrice, isTextPackKey, plans, recurringAddons, type BillingInterval } from "./config";
 import { addonEffect, addonMaxQuantity, classifyItems, entitlementsFromItems, planLimits, type Entitlements } from "./entitlements";
-import { chargeOneOff, inspectProrationOutcome, trialProrationAmount, type ChargeStripe } from "./addon-charge";
+import { abandonInvoice, chargeOneOff, inspectProrationOutcome, refundAddonCharge, trialProrationAmount, type AddonChargeLedger, type AddonChargeRecord, type ChargeStripe, type RefundStripe } from "./addon-charge";
 
 type Env = Record<string, string | undefined>;
+
+// ───────────────────────── trial add-on policy: THE switch point ─────────────────────────
+
+/**
+ * What an add-on INCREASE during a free trial costs:
+ *   "charge_now"   → the add-on's rate for the rest of the trial is charged immediately on a standalone invoice, and
+ *                    the quantity is applied only once that is paid (Brian, 2026-10-27; the default).
+ *   "at_trial_end" → applied now with no charge; the first invoice at the end of the trial bills it in full.
+ * Decreases/removals are the same under both (scheduled for the renewal, no credit).
+ */
+export type TrialAddonPolicy = "charge_now" | "at_trial_end";
+
+/**
+ * THE ONE PLACE to flip the trial add-on rule. Deliberately a code constant reviewed in a PR, NOT an env var or a
+ * runtime setting (billing rules must not be flippable at runtime). Changing it also requires updating the guard
+ * test in scripts/billing-tests.ts ("TRIAL_ADDON_POLICY is charge_now") and docs/BILLING.md §11.
+ */
+export const TRIAL_ADDON_POLICY: TrialAddonPolicy = "charge_now";
+
+/** How a trial increase is handled under a policy (pure; both branches are tested). */
+export function trialIncreaseHandling(policy: TrialAddonPolicy): "charge_rest_of_trial_now" | "apply_free_until_trial_end" {
+  return policy === "at_trial_end" ? "apply_free_until_trial_end" : "charge_rest_of_trial_now";
+}
 
 /**
  * Quantity checks that need no Stripe call (so the route can run them before touching Stripe). null = fine.
@@ -54,7 +78,7 @@ export interface AddonStripe {
   /** Trial charge: the add-on's unit price and the card on file. */
   prices?: { retrieve(id: string): Promise<Stripe.Price> };
   customers?: { retrieve(id: string): Promise<Stripe.Customer | Stripe.DeletedCustomer> };
-  creditNotes?: { create(p: Stripe.CreditNoteCreateParams): Promise<Stripe.CreditNote> };
+  creditNotes?: RefundStripe["creditNotes"];
 }
 
 /**
@@ -180,16 +204,35 @@ export interface ChangeAddonInput {
   env?: Env;
   /** "Now" for the trial proration (a test clock's frozen time in the sandbox). Default: the real clock. */
   now?: Date;
+  /**
+   * Required for trial increases under "charge_now": the per-attempt `addon_charge` record (addon-charges-db.ts in
+   * the app). The CALLER MUST HOLD THE ORG ROW LOCK (the route does): unresolved attempts of this org are settled
+   * first (`reconcileAddonCharges`), which is only safe when no other request of the org is in flight.
+   */
+  ledger?: AddonChargeLedger;
+  /** Attempt id generator (tests). Default: a random UUID. */
+  newAttemptId?: () => string;
 }
 
 type PhaseParam = Stripe.SubscriptionScheduleUpdateParams.Phase;
 
-function phaseParam(p: Stripe.SubscriptionSchedule.Phase, items: PhaseItem[]): PhaseParam {
-  return { start_date: p.start_date, end_date: p.end_date, items, proration_behavior: "none", ...(p.metadata && Object.keys(p.metadata).length ? { metadata: p.metadata } : {}) };
+/**
+ * A phase rewritten with new items. Everything we rewrite is carried over: dates, metadata and the phase's
+ * `trial_end` (0005: without it, rewriting a trialing subscription's current phase would end the trial early).
+ */
+export function phaseParam(p: Stripe.SubscriptionSchedule.Phase, items: PhaseItem[]): PhaseParam {
+  return {
+    start_date: p.start_date,
+    end_date: p.end_date,
+    items,
+    proration_behavior: "none",
+    ...(p.trial_end ? { trial_end: p.trial_end } : {}),
+    ...(p.metadata && Object.keys(p.metadata).length ? { metadata: p.metadata } : {}),
+  };
 }
 
-/** Phases we can't safely rewrite (they'd lose settings we don't copy): refuse instead of dropping them. */
-const hasUnsupportedPhaseSettings = (p: Stripe.SubscriptionSchedule.Phase) => Boolean((p.discounts && p.discounts.length) || (p.add_invoice_items && p.add_invoice_items.length) || p.trial_end);
+/** Phases we can't safely rewrite (they'd lose settings we don't copy): refuse instead of dropping them. (`trial_end` is carried, 0005.) */
+const hasUnsupportedPhaseSettings = (p: Stripe.SubscriptionSchedule.Phase) => Boolean((p.discounts && p.discounts.length) || (p.add_invoice_items && p.add_invoice_items.length));
 
 /**
  * Set an add-on's quantity (absolute). Validates against config, plan and status first; nothing is
@@ -203,7 +246,15 @@ const hasUnsupportedPhaseSettings = (p: Stripe.SubscriptionSchedule.Phase) => Bo
  *                             identical to the current phase); otherwise nothing to do.
  * Other add-ons' pending changes, and a portal-scheduled plan downgrade, are kept.
  */
-export async function setAddonQuantity({ stripe, subscription, addon, quantity, env = process.env, now = new Date() }: ChangeAddonInput): Promise<AddonChangeResult> {
+export async function setAddonQuantity(input: ChangeAddonInput): Promise<AddonChangeResult> {
+  return setAddonQuantityUnderPolicy(TRIAL_ADDON_POLICY, input);
+}
+
+/**
+ * `setAddonQuantity` with an explicit trial policy. TESTS ONLY (so both branches stay tested): app code calls
+ * `setAddonQuantity`, which always uses the `TRIAL_ADDON_POLICY` constant.
+ */
+export async function setAddonQuantityUnderPolicy(policy: TrialAddonPolicy, { stripe, subscription, addon, quantity, env = process.env, now = new Date(), ledger, newAttemptId }: ChangeAddonInput): Promise<AddonChangeResult> {
   // Text bundles are one-time packs now (text-packs.ts / POST /api/billing/text-packs), never a recurring add-on.
   if (isTextPackKey(addon)) return { ok: false, status: 400, error: "Text bundles are one-time packs now. Buy them with POST /api/billing/text-packs; they are not a recurring add-on." };
   const known = addonByKey(addon, env);
@@ -212,6 +263,9 @@ export async function setAddonQuantity({ stripe, subscription, addon, quantity, 
   if (invalid) return invalid;
   if (!(ADDON_CHANGE_STATUSES as readonly string[]).includes(subscription.status))
     return { ok: false, status: 409, error: "Add-ons can only be changed on an active subscription. Fix the payment in the billing portal first." };
+
+  // Settle attempts a crashed request left behind before anything new is charged (we hold the org lock).
+  if (ledger) await reconcileAddonCharges(stripe, ledger);
 
   const sub = await retrieveSubscriptionComplete(stripe, subscription.id);
   const items = sub.items.data;
@@ -247,18 +301,28 @@ export async function setAddonQuantity({ stripe, subscription, addon, quantity, 
   const increase = quantity > currentQty;
   const trialing = sub.status === "trialing";
 
-  // ── Trial increase: charge the rest of the trial at the add-on's rate FIRST (standalone invoice); apply only once paid ──
-  if (increase && trialing) {
-    const paid = await chargeTrialIncrease(stripe, { sub, priceId: cfg.priceId, price: existing?.price ?? null, addon: cfg.key, from: currentQty, to: quantity, interval: interval as BillingInterval, now });
+  // ── Trial increase under "charge_now": charge the rest of the trial at the add-on's rate FIRST (standalone invoice,
+  //    one `addon_charge` attempt row written before any Stripe call); apply only once paid. Under "at_trial_end"
+  //    the increase is applied with no charge and the trial-end invoice bills it (TRIAL_ADDON_POLICY). ──
+  if (increase && trialing && trialIncreaseHandling(policy) === "charge_rest_of_trial_now") {
+    if (!ledger) throw new Error("setAddonQuantity: a trial increase needs the addon_charge ledger (and the org row lock)");
+    const paid = await chargeTrialIncrease(stripe, ledger, { sub, priceId: cfg.priceId, price: existing?.price ?? null, addon: cfg.key, from: currentQty, to: quantity, interval: interval as BillingInterval, now, attemptId: (newAttemptId ?? defaultAttemptId)() });
     if (!paid.ok) return paid;
     charge = paid.charge;
-    // From here on the money is taken: if applying the quantity fails, refund it (a paid charge never stays without the add-on).
+    if (!paid.record) return applyChange(); // nothing was charged (no trial time left)
+    const rec = paid.record;
+    // From here on the money is taken. Applied → record `applied`. If applying fails or throws, settle the attempt from
+    // Stripe's state (applied after all → keep; not applied → refund once). A crash here is settled the same way later.
+    let result: AddonChangeResult;
     try {
-      return await applyChange();
+      result = await applyChange();
     } catch (err) {
-      if (charge) await refundCharge(stripe, charge, "the add-on could not be applied after the trial charge");
+      await reconcileAddonCharges(stripe, ledger, [rec]).catch((e) => console.error("[billing] add-on charge left for the sweep", rec.id, e instanceof Error ? e.message : e));
       throw err;
     }
+    if (result.ok) await ledger.update(rec.id, { status: "applied" });
+    else await reconcileAddonCharges(stripe, ledger, [rec]);
+    return result;
   }
   return applyChange();
 
@@ -274,6 +338,8 @@ export async function setAddonQuantity({ stripe, subscription, addon, quantity, 
       : (await stripe.subscriptionItems.create({ subscription: sub.id, price: c.priceId, quantity, ...extra })).id;
     if (!prorate) return { ok: true, itemId };
     const out = await inspectProrationOutcome(stripe, sub.id, before);
+    if (!out.ok && out.reason === "unidentified")
+      return { ok: false, status: 502, code: "stripe_error", portal: true, error: "Stripe didn't confirm the prorated charge, so nothing was added. Check the billing portal for an open invoice before trying again." };
     if (!out.ok) return { ok: false, status: 402, code: "payment_failed", portal: true, error: `The prorated charge for the added ${c.key === "branding" ? "branding removal" : `${c.key}s`} was declined, so nothing was added and the invoice was cancelled. Update your card in the billing portal and try again.` };
     if (out.invoice) charge = { kind: "proration", invoiceId: out.invoice.id, amountPaid: out.invoice.amountPaid, currency: out.invoice.currency, lines: out.invoice.lines };
     return { ok: true, itemId: existing?.id ?? itemId };
@@ -339,26 +405,23 @@ export async function setAddonQuantity({ stripe, subscription, addon, quantity, 
   }
 }
 
-/** Best effort: give back a trial charge whose add-on could not be applied (credit note with a refund to the card). */
-async function refundCharge(stripe: AddonStripe, charge: AddonCharge, why: string) {
-  try {
-    if (!stripe.creditNotes) throw new Error("no creditNotes client");
-    await stripe.creditNotes.create({ invoice: charge.invoiceId, amount: charge.amountPaid, refund_amount: charge.amountPaid, memo: `Refund: ${why}` });
-  } catch (err) {
-    console.error("[billing] could not refund an add-on charge; refund it manually", charge.invoiceId, err instanceof Error ? err.message : err);
-  }
-}
+const defaultAttemptId = () => `adc_${globalThis.crypto.randomUUID()}`;
 
 /**
  * Trial increase: the add-on's rate for the rest of the trial (`trialProrationAmount`), charged now on a standalone
- * invoice to the card on file. No card → 402 no_payment_method (nothing created). Declined → invoice voided, 402.
- * Idempotency key = subscription + price + trial end + from→to: within one period an add-on's current quantity only
- * goes up (decreases are scheduled), so a transition happens once; a retried / doubled request reuses the same invoice.
+ * invoice to the card on file. No card → 402 no_payment_method (nothing created, no row). Declined → invoice voided,
+ * row `failed`, 402.
+ *
+ * Every attempt gets its own `addon_charge` row (written BEFORE any Stripe call) and its own idempotency key
+ * (attempt id + payment method, 0005): a retry after a decline is a new attempt with a fresh invoice, never a replay
+ * of the voided one. Double clicks can't double-charge: the route serialises per org, and after a success the
+ * current quantity is the target (no increase left to charge).
  */
 async function chargeTrialIncrease(
   stripe: AddonStripe,
-  p: { sub: Stripe.Subscription; priceId: string; price: Stripe.Price | null; addon: string; from: number; to: number; interval: BillingInterval; now: Date },
-): Promise<{ ok: true; charge: AddonCharge | null } | Extract<AddonChangeResult, { ok: false }>> {
+  ledger: AddonChargeLedger,
+  p: { sub: Stripe.Subscription; priceId: string; price: Stripe.Price | null; addon: string; from: number; to: number; interval: BillingInterval; now: Date; attemptId: string },
+): Promise<{ ok: true; charge: AddonCharge | null; record: AddonChargeRecord | null } | Extract<AddonChangeResult, { ok: false }>> {
   if (!stripe.invoices || !stripe.invoiceItems || !stripe.customers || !stripe.prices) throw new Error("setAddonQuantity: the Stripe client needs invoices, invoiceItems, customers and prices for trial increases");
   const customerId = priceIdOf(p.sub.customer as string | { id: string });
   const customer = await stripe.customers.retrieve(customerId);
@@ -370,24 +433,102 @@ async function chargeTrialIncrease(
   const periodEnd = p.sub.trial_end ?? p.sub.items.data[0]?.current_period_end ?? 0;
   const nowSec = Math.floor(p.now.getTime() / 1000);
   const amount = trialProrationAmount({ unitAmount: price.unit_amount ?? 0, delta: p.to - p.from, now: nowSec, periodEnd, interval: p.interval });
-  if (amount <= 0) return { ok: true, charge: null }; // the trial ends now: the renewal invoice bills it in full
+  if (amount <= 0) return { ok: true, charge: null, record: null }; // the trial ends now: the renewal invoice bills it in full
+  const currency = price.currency ?? "usd";
+  const record = { id: p.attemptId, subscriptionId: p.sub.id, customerId, addon: p.addon, priceId: p.priceId, fromQuantity: p.from, toQuantity: p.to, amount, currency, paymentMethod: pm };
+  await ledger.insert(record);
   const label = p.addon === "branding" ? "Branding removal" : p.addon === "seat" ? "Extra seat" : p.addon === "location" ? "Extra location" : p.addon;
   const end = new Date(periodEnd * 1000).toISOString().slice(0, 10);
   const out = await chargeOneOff(stripe as ChargeStripe, {
     customer: customerId,
     paymentMethod: pm,
     amount,
-    currency: price.currency ?? "usd",
+    currency,
     description: `FlowOps ${label}: +${p.to - p.from} during the free trial, prorated until ${end}`,
-    metadata: { flowops_addon_charge: "trial_proration", subscription: p.sub.id, addon: p.addon, from: String(p.from), to: String(p.to) },
-    idempotencyKey: `flowops-trial-addon-${p.sub.id}-${p.priceId}-${periodEnd}-${p.from}-${p.to}`,
+    metadata: { flowops_addon_charge: "trial_proration", flowops_addon_charge_id: p.attemptId, subscription: p.sub.id, addon: p.addon, from: String(p.from), to: String(p.to) },
+    idempotencyKey: trialChargeIdempotencyKey(p.attemptId, pm),
     period: { start: nowSec, end: periodEnd },
+    onInvoiceCreated: (invoiceId) => ledger.update(p.attemptId, { invoiceId }),
   });
-  if (!out.ok)
+  if (!out.ok) {
+    // Voided / deleted (or never created): nothing was collected. If the void itself failed, leave the row pending for the sweep.
+    if (out.final !== "unknown") await ledger.update(p.attemptId, { status: "failed", note: out.code });
     return out.code === "payment_failed"
       ? { ok: false, status: 402, code: "payment_failed", portal: true, error: "Your card was declined, so nothing was charged and nothing was added. Update your card in the billing portal and try again." }
       : { ok: false, status: 502, code: "stripe_error", portal: true, error: "The add-on could not be charged, so nothing was added. Try again, or check your payment method in the billing portal." };
-  return { ok: true, charge: { kind: "trial_proration", invoiceId: out.invoiceId, amountPaid: out.amountPaid, currency: out.currency } };
+  }
+  await ledger.update(p.attemptId, { status: "paid", invoiceId: out.invoiceId });
+  return { ok: true, charge: { kind: "trial_proration", invoiceId: out.invoiceId, amountPaid: out.amountPaid, currency: out.currency }, record: { ...record, orgId: ledger.orgId, status: "paid", invoiceId: out.invoiceId, creditNoteId: null, createdAt: p.now } };
+}
+
+/** Idempotency key of one trial-charge attempt: unique per attempt and payment method (never reused after a decline). */
+export const trialChargeIdempotencyKey = (attemptId: string, paymentMethod: string) => `flowops-trial-addon-${attemptId}-${paymentMethod}`;
+
+/**
+ * Settle trial add-on charge attempts that a crashed or failed request left `pending` / `paid` (0005). Idempotent;
+ * never grants anything (it never writes a subscription item) and never refunds twice (`refundAddonCharge`).
+ * CALLER MUST HOLD THE ORG ROW LOCK (so no attempt of this org is in flight):
+ *   pending → find its invoice (stored id, else by `flowops_addon_charge_id` metadata): paid → treat as paid;
+ *             open/draft → void it → failed; none → failed.
+ *   paid    → the add-on is applied iff the subscription item for the price has at least `to_quantity` → applied;
+ *             otherwise refund the invoice with a credit note → refunded (Stripe unreachable → stays paid, retried).
+ * Pass `rows` to settle specific attempts; default = every unresolved attempt of the ledger's org.
+ */
+export async function reconcileAddonCharges(stripe: AddonStripe, ledger: AddonChargeLedger, rows?: AddonChargeRecord[]): Promise<{ id: string; status: string }[]> {
+  const todo = rows ?? (await ledger.unresolved());
+  const out: { id: string; status: string }[] = [];
+  for (const r of todo) {
+    try {
+      out.push(await reconcileOne(stripe, ledger, r));
+    } catch (err) {
+      // One bad attempt (e.g. its customer is gone) must not block the others; it stays unresolved for the next run.
+      console.error("[billing] could not reconcile add-on charge", r.id, err instanceof Error ? err.message : err);
+      out.push({ id: r.id, status: "error" });
+    }
+  }
+  return out;
+}
+
+async function reconcileOne(stripe: AddonStripe, ledger: AddonChargeLedger, r: AddonChargeRecord): Promise<{ id: string; status: string }> {
+  {
+    let status = r.status;
+    let invoiceId = r.invoiceId;
+    let amountPaid = r.amount;
+    if (status === "pending") {
+      let inv: Stripe.Invoice | null = null;
+      if (invoiceId && stripe.invoices) inv = await stripe.invoices.retrieve(invoiceId);
+      else if (stripe.invoices?.list) {
+        // Newest first; the attempt is recent, so its invoice is among the customer's latest. (No `created` filter:
+        // invoice timestamps follow a test clock's frozen time, not the wall clock our row was written with.)
+        const list = await stripe.invoices.list({ customer: r.customerId, limit: 100 });
+        inv = list.data.find((i) => i.metadata?.flowops_addon_charge_id === r.id) ?? null;
+      }
+      let final = inv?.status ?? "none";
+      if (inv && final !== "paid" && stripe.invoices) final = await abandonInvoice({ invoices: stripe.invoices }, inv.id!);
+      if (final === "paid" && inv) {
+        status = "paid";
+        invoiceId = inv.id!;
+        await ledger.update(r.id, { status: "paid", invoiceId });
+      } else if (final === "unknown") {
+        return { id: r.id, status: "pending" }; // couldn't void it yet: try again later
+      } else {
+        await ledger.update(r.id, { status: "failed", ...(inv ? { invoiceId: inv.id! } : {}), note: `reconciled: invoice ${final}` });
+        return { id: r.id, status: "failed" };
+      }
+    }
+    if (status !== "paid") return { id: r.id, status };
+    const sub = await retrieveSubscriptionComplete(stripe, r.subscriptionId);
+    const qty = sub.status === "canceled" || sub.status === "incomplete_expired" ? 0 : (sub.items.data.find((i) => i.price?.id === r.priceId)?.quantity ?? 0);
+    if (qty >= r.toQuantity) {
+      await ledger.update(r.id, { status: "applied", note: "reconciled: add-on found on the subscription" });
+      return { id: r.id, status: "applied" };
+    }
+    if (invoiceId && stripe.invoices) amountPaid = (await stripe.invoices.retrieve(invoiceId)).amount_paid ?? amountPaid;
+    const cn = await refundAddonCharge(stripe, { id: r.id, invoiceId, amount: r.amount }, amountPaid, "the add-on could not be applied after the trial charge");
+    if (!cn) return { id: r.id, status: "paid" }; // Stripe unreachable: retried by the next run
+    await ledger.update(r.id, { status: "refunded", creditNoteId: cn });
+    return { id: r.id, status: "refunded" };
+  }
 }
 
 /** Recurring add-ons currently configured, for UI/GET: key + price ids per interval + the most one subscription may hold (no amounts: those live in Stripe). Text packs are listed separately. */

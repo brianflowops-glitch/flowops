@@ -8,6 +8,7 @@
 import Stripe from "stripe";
 import { eq } from "drizzle-orm";
 import { getDb, getConn, schema } from "../src/lib/db";
+import { dbAddonChargeLedger } from "../src/lib/billing/addon-charges-db";
 import { processStripeEvent } from "../src/lib/billing/webhook";
 import { retrieveSubscriptionComplete, setAddonQuantity } from "../src/lib/billing/addons";
 import { getEntitlements } from "../src/lib/billing/org-entitlements";
@@ -87,7 +88,7 @@ async function world(label: string) {
   const live = async () => findLiveSubscription((await stripe.subscriptions.list({ customer: customer.id, status: "all", limit: 10 })).data)!;
   const invoices = async () => (await stripe.invoices.list({ customer: customer.id, limit: 30 })).data;
   const seats = async () => { const r = await getEntitlements(ORG, { now: await now(), env }); return r.enforced ? r.entitlements.seats : -1; };
-  const apply = async (addon: string, quantity: number) => setAddonQuantity({ stripe, subscription: await live(), addon, quantity, env, now: await now() });
+  const apply = async (addon: string, quantity: number) => setAddonQuantity({ stripe, subscription: await live(), addon, quantity, env, now: await now(), ledger: dbAddonChargeLedger(db, ORG) });
   const qty = async (price: string) => (await stripe.subscriptions.retrieve((await live()).id)).items.data.find((i) => i.price.id === price)?.quantity ?? 0;
   return { clock, ORG, customer, drain, now, live, invoices, seats, apply, qty };
 }

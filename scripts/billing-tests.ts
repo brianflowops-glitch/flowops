@@ -2,10 +2,10 @@
 import Stripe from "stripe";
 import { addonByKey, addonByPriceId, addonPrice, addons, isLiveKey, isTextPackKey, planByKey, planByPriceId, plans, textPackByKey, textPackSize, trialDays } from "../src/lib/billing/config";
 import { addMonthsUTC, allocatePackTexts, splitTextUsage, textPackExpiry, textPackWindow, validateTextPackRequest } from "../src/lib/billing/text-pack-rules";
-import { trialProrationAmount } from "../src/lib/billing/addon-charge";
+import { inspectProrationOutcome, memoryAddonChargeLedger, refundAddonCharge, trialProrationAmount } from "../src/lib/billing/addon-charge";
 import { checkoutSessionParams } from "../src/lib/billing/checkout-params";
 import { addonEffect, addonMaxQuantity, resetAddonMaxWarnings, classifyItems, computeEntitlements, entitlementsFromItems, parsePlanLimits, planLimits, DEFAULT_PLAN_LIMITS } from "../src/lib/billing/entitlements";
-import { configuredAddons, phaseItems, retrieveSubscriptionComplete, scheduledChanges, setAddonQuantity, validateAddonQuantity, type AddonStripe } from "../src/lib/billing/addons";
+import { configuredAddons, phaseItems, phaseParam, reconcileAddonCharges, retrieveSubscriptionComplete, scheduledChanges, setAddonQuantity, setAddonQuantityUnderPolicy, TRIAL_ADDON_POLICY, trialChargeIdempotencyKey, trialIncreaseHandling, validateAddonQuantity, type AddonStripe } from "../src/lib/billing/addons";
 import { findLiveSubscription, hasPaidAccess, normalizeStatus } from "../src/lib/billing/status";
 import {
   billingExemptOrgIds,
@@ -402,41 +402,65 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
   // ───── 0004: increases charged now (prorated), failed charge grants nothing, trial adds charged, removals unchanged ─────
   {
     const T0 = 1795000000; // "now" in the fake
-    type Opt = { status?: string; pending?: boolean; newInvoice?: boolean; pm?: string | null; payStatus?: "paid" | "decline"; schedule?: Stripe.SubscriptionSchedule | null; items?: { id: string; price: string; q?: number }[] };
+    type Opt = { status?: string; pending?: boolean; newInvoice?: boolean; freshReason?: string; pm?: string | null; payStatus?: "paid" | "decline"; schedule?: Stripe.SubscriptionSchedule | null; items?: { id: string; price: string; q?: number }[]; itemWriteThrows?: boolean; creditNoteDown?: number };
     const mk = (o: Opt = {}) => {
       const log: string[] = [];
       let sched = o.schedule ?? null;
       let applied = false;
+      let pm = o.pm === undefined ? "pm_card" : o.pm;
+      let cnDown = o.creditNoteDown ?? 0;
       const sub = { ...fakeSub(o.items ?? [{ id: "si_plan", price: "price_p" }]), status: o.status ?? "active", customer: "cus_1", latest_invoice: "in_old", trial_end: o.status === "trialing" ? T0 + 7 * 86400 : null, default_payment_method: null } as unknown as Stripe.Subscription;
-      const invState: Record<string, { status: string; amount: number }> = {};
+      const invState: Record<string, { status: string; amount: number; metadata?: Record<string, string> }> = {};
+      const byKey = new Map<string, string>(); // idempotency key → invoice id (Stripe replays the original object)
+      const keys: string[] = [];
+      const creditNotes: { id: string; invoice: string; amount: number; metadata: Record<string, string> }[] = [];
+      const cnByKey = new Map<string, string>();
+      let nInv = 0;
       const client: AddonStripe = {
         subscriptions: {
           retrieve: async (_id, params) => {
             if (!params?.expand) return { ...sub, schedule: sched?.id ?? null } as Stripe.Subscription;
             log.push("sub.retrieve(expand latest_invoice)");
             const fresh = o.newInvoice !== false;
-            const inv = fresh ? { id: "in_prorate", status: o.pending ? "open" : "paid", amount_paid: o.pending ? 0 : 1032, currency: "usd", lines: { data: [{ description: "Remaining time on 2 × seat after 11 Nov", amount: 1032 }] } } : { id: "in_old" };
+            const inv = fresh ? { id: "in_prorate", billing_reason: o.freshReason ?? "subscription_update", status: o.pending ? "open" : "paid", amount_paid: o.pending ? 0 : 1032, currency: "usd", lines: { data: [{ description: "Remaining time on 2 × seat after 11 Nov", amount: 1032 }] } } : { id: "in_old" };
             invState["in_prorate"] ??= { status: inv.status ?? "paid", amount: 1032 };
             return { ...sub, latest_invoice: inv, pending_update: o.pending ? { expires_at: T0 + 82800, subscription_items: [] } : null } as unknown as Stripe.Subscription;
           },
         },
         subscriptionItems: {
           list: () => ({ autoPagingToArray: async () => sub.items.data }),
-          create: async (p) => (log.push(`create ${p.price} x${p.quantity} ${p.proration_behavior}${p.payment_behavior ? `/${p.payment_behavior}` : ""}`), (applied = !o.pending || p.proration_behavior === "none"), { id: "si_new" } as Stripe.SubscriptionItem),
+          create: async (p) => {
+            log.push(`create ${p.price} x${p.quantity} ${p.proration_behavior}${p.payment_behavior ? `/${p.payment_behavior}` : ""}`);
+            if (o.itemWriteThrows) throw new Error("connection reset");
+            applied = !o.pending || p.proration_behavior === "none";
+            if (applied) (sub.items.data as unknown as { id: string; price: { id: string }; quantity: number }[]).push({ id: "si_new", price: { id: p.price as string }, quantity: p.quantity ?? 1 });
+            return { id: "si_new" } as Stripe.SubscriptionItem;
+          },
           update: async (id, p) => (log.push(`update ${id} x${p.quantity} ${p.proration_behavior}${p.payment_behavior ? `/${p.payment_behavior}` : ""}`), (applied = !o.pending), { id } as Stripe.SubscriptionItem),
         },
         subscriptionSchedules: {
           retrieve: async () => sched!,
-          create: async () => (log.push("schedule.create"), (sched = mkSchedule([{ start_date: START, end_date: END, items: sub.items.data.map((i) => ({ price: i.price.id, quantity: i.quantity ?? 1 })) }])), sched),
-          update: async (_id, p) => (log.push(`schedule.update ${p.proration_behavior} ` + (p.phases ?? []).map((ph) => (ph.items ?? []).map((i) => `${i.price}x${i.quantity}`).join("+")).join(" | ")), pushPhases(sched!, p.phases ?? []), sched!),
+          create: async () => (log.push("schedule.create"), (sched = mkSchedule([{ start_date: START, end_date: END, items: sub.items.data.map((i) => ({ price: i.price.id, quantity: i.quantity ?? 1 })), ...(sub.trial_end ? { trial_end: sub.trial_end } : {}) }])), sched),
+          update: async (_id, p) => (log.push(`schedule.update ${p.proration_behavior} ` + (p.phases ?? []).map((ph) => (ph.items ?? []).map((i) => `${i.price}x${i.quantity}`).join("+") + (ph.trial_end ? ` trial_end=${ph.trial_end}` : "")).join(" | ")), pushPhases(sched!, p.phases ?? []), sched!),
           release: async () => (log.push("schedule.release"), (sched = null), {} as Stripe.SubscriptionSchedule),
         },
         invoices: {
-          create: async (p) => (log.push(`invoice.create ${(p.metadata as Record<string, string> | undefined)?.flowops_addon_charge} pm=${p.default_payment_method} excl=${p.pending_invoice_items_behavior}`), (invState["in_trial"] = { status: "draft", amount: 0 }), { id: "in_trial", status: "draft" } as Stripe.Invoice),
+          create: async (p, ro) => {
+            const key = ro?.idempotencyKey ?? "";
+            keys.push(key);
+            const seen = byKey.get(key);
+            if (seen) return (log.push(`invoice.create(replay ${seen})`), { id: seen, status: invState[seen].status, amount_paid: 0, currency: "usd" } as Stripe.Invoice);
+            const id = nInv++ === 0 ? "in_trial" : `in_trial_${nInv}`;
+            byKey.set(key, id);
+            log.push(`invoice.create ${(p.metadata as Record<string, string> | undefined)?.flowops_addon_charge} pm=${p.default_payment_method} excl=${p.pending_invoice_items_behavior}`);
+            invState[id] = { status: "draft", amount: 0, metadata: p.metadata as Record<string, string> };
+            return { id, status: "draft" } as Stripe.Invoice;
+          },
+          list: async () => ({ data: Object.entries(invState).map(([id, v]) => ({ id, status: v.status, amount_paid: v.status === "paid" ? v.amount : 0, metadata: v.metadata ?? {} })) }) as unknown as Stripe.ApiList<Stripe.Invoice>,
           finalizeInvoice: async (id) => (log.push(`finalize ${id}`), (invState[id].status = "open"), { id, status: "open" } as Stripe.Invoice),
           pay: async (id) => {
             log.push(`pay ${id}`);
-            if (o.payStatus === "decline") throw Object.assign(new Error("declined"), { type: "StripeCardError" });
+            if (o.payStatus === "decline" || pm === "pm_fail") throw Object.assign(new Error("declined"), { type: "StripeCardError" });
             invState[id].status = "paid";
             return { id, status: "paid", amount_paid: invState[id].amount, currency: "usd" } as Stripe.Invoice;
           },
@@ -446,9 +470,23 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
         },
         invoiceItems: { create: async (p) => (log.push(`invoiceItem ${p.amount} ${p.currency} period=${p.period?.start}-${p.period?.end}`), (invState[p.invoice as string].amount = p.amount!), { id: "ii_1" } as Stripe.InvoiceItem) },
         prices: { retrieve: async (id) => ({ id, unit_amount: id === "price_brand" ? 1500 : id === "price_loc" ? 2900 : 1000, currency: "usd" }) as Stripe.Price },
-        customers: { retrieve: async () => ({ id: "cus_1", invoice_settings: { default_payment_method: o.pm === undefined ? "pm_card" : o.pm } }) as unknown as Stripe.Customer },
+        customers: { retrieve: async () => ({ id: "cus_1", invoice_settings: { default_payment_method: pm } }) as unknown as Stripe.Customer },
+        creditNotes: {
+          list: async (q) => ({ data: creditNotes.filter((c) => c.invoice === q.invoice).map((c) => ({ ...c, status: "issued" })) }) as unknown as Stripe.ApiList<Stripe.CreditNote>,
+          create: async (q, ro) => {
+            if (cnDown > 0) { cnDown--; throw new Error("stripe unreachable"); }
+            const k = ro?.idempotencyKey ?? "";
+            const seen = cnByKey.get(k);
+            if (seen) return (log.push(`creditNote(replay ${seen})`), { id: seen } as Stripe.CreditNote);
+            const id = `cn_${creditNotes.length + 1}`;
+            creditNotes.push({ id, invoice: q.invoice, amount: q.amount ?? 0, metadata: (q.metadata ?? {}) as Record<string, string> });
+            cnByKey.set(k, id);
+            log.push(`creditNote ${q.invoice} ${q.amount} refund=${q.refund_amount}`);
+            return { id } as Stripe.CreditNote;
+          },
+        },
       };
-      return { client, log, applied: () => applied, sched: () => sched };
+      return { client, log, applied: () => applied, sched: () => sched, keys, invState, creditNotes, sub, setPm: (x: string | null) => (pm = x) };
     };
     const now = new Date(T0 * 1000);
 
@@ -477,15 +515,15 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
 
     // trial add charging
     f = mk({ status: "trialing" });
-    r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now });
+    r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now, ledger: memoryAddonChargeLedger("org_t") });
     const expectTrial = Math.round(1000 * 2 * (7 * 86400) / ((addMonthsUTC(now, 1).getTime() - now.getTime()) / 1000));
     check("0004 trial add: the rest of the trial at the seat rate is charged NOW on a standalone invoice (pending items excluded), and only then the item is written with proration none", r4.ok && r4.action === "created" && r4.charge?.kind === "trial_proration" && r4.charge.amountPaid === expectTrial && f.log.join("|") === `invoice.create trial_proration pm=pm_card excl=exclude|invoiceItem ${expectTrial} usd period=${T0}-${T0 + 7 * 86400}|finalize in_trial|pay in_trial|create price_seat x2 none`, { r4, log: f.log, expectTrial });
     check("0004 trial add: amount ≈ 7/30 of 2 × $10 (≈ $4.60)", expectTrial > 440 && expectTrial < 480, expectTrial);
     f = mk({ status: "trialing", pm: null });
-    r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now });
+    r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now, ledger: memoryAddonChargeLedger("org_t") });
     check("0004 trial add with no card on file → 402 no_payment_method, no invoice, no item write", !r4.ok && r4.status === 402 && r4.code === "no_payment_method" && f.log.length === 0, { r4, log: f.log });
     f = mk({ status: "trialing", payStatus: "decline" });
-    r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now });
+    r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now, ledger: memoryAddonChargeLedger("org_t") });
     check("0004 trial add with a declined card → invoice voided, 402 payment_failed, no item write", !r4.ok && r4.status === 402 && r4.code === "payment_failed" && f.log.includes("void in_trial") && !f.log.some((l) => l.startsWith("create ") || l.startsWith("update ")), { r4, log: f.log });
     check("trialProrationAmount: full interval left → full price; nothing left → 0; annual uses a year", trialProrationAmount({ unitAmount: 1000, delta: 2, now: T0, periodEnd: T0 + 10 * 365 * 86400, interval: "month" }) === 2000 && trialProrationAmount({ unitAmount: 1000, delta: 2, now: T0, periodEnd: T0, interval: "month" }) === 0 && Math.abs(trialProrationAmount({ unitAmount: 10000, delta: 1, now: T0, periodEnd: T0 + 14 * 86400, interval: "year" }) - Math.round(10000 * 14 / 365)) <= 2);
 
@@ -496,6 +534,148 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
     f = mk({ status: "trialing", items: [{ id: "si_plan", price: "price_p" }, { id: "si_seat", price: "price_seat", q: 4 }] });
     r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 0, env: aenv, now });
     check("0004 removal in a trial: scheduled, nothing charged or refunded", r4.ok && r4.action === "scheduled" && !f.log.some((l) => l.startsWith("invoice") || l.startsWith("pay")), { r4, log: f.log });
+
+    // ───── 0005 (review on PR #20) ─────
+    const trialIn = (o: Opt = {}) => mk({ status: "trialing", ...o });
+    let n5 = 0;
+    const ids = () => `adc_t${++n5}`;
+    const tr = (fk: ReturnType<typeof mk>, ledger: ReturnType<typeof memoryAddonChargeLedger>, quantity = 2) =>
+      setAddonQuantity({ stripe: fk.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity, env: aenv, now, ledger, newAttemptId: ids });
+
+    // Fix 1: per-attempt idempotency key → decline, then retry with a good card → paid
+    {
+      const fk = trialIn({ pm: "pm_fail" });
+      const L = memoryAddonChargeLedger("org_t");
+      const a = await tr(fk, L);
+      const firstInv = [...L.rows.values()][0]?.invoiceId;
+      check("0005 fix1: declined trial add → 402 payment_failed, its invoice voided, attempt row failed, nothing written", !a.ok && a.status === 402 && a.code === "payment_failed" && fk.invState[firstInv ?? ""]?.status === "void" && [...L.rows.values()][0]?.status === "failed" && !fk.log.some((l) => l.startsWith("create ")), { a, rows: [...L.rows.values()], log: fk.log });
+      fk.setPm("pm_card");
+      const b = await tr(fk, L);
+      const rows = [...L.rows.values()];
+      check("0005 fix1: retry with a good card → a NEW invoice (no replay of the voided one), paid, add-on applied", b.ok && b.action === "created" && b.charge?.kind === "trial_proration" && b.charge.invoiceId !== firstInv && fk.invState[b.charge.invoiceId].status === "paid" && fk.applied() && !fk.log.some((l) => l.startsWith("invoice.create(replay")), { b, log: fk.log });
+      check("0005 fix1: two attempts → two rows (failed, applied) and two distinct keys, each with the attempt id + payment method", rows.length === 2 && rows[0].status === "failed" && rows[1].status === "applied" && fk.keys.length === 2 && fk.keys[0] !== fk.keys[1] && fk.keys[0] === `${trialChargeIdempotencyKey(rows[0].id, "pm_fail")}-invoice` && fk.keys[1] === `${trialChargeIdempotencyKey(rows[1].id, "pm_card")}-invoice`, { rows, keys: fk.keys });
+      // same attempt id + same pm (what the OLD key effectively did on a retry): Stripe replays the voided invoice → never paid
+      const fk2 = trialIn({ pm: "pm_fail" });
+      const L2 = memoryAddonChargeLedger("org_t");
+      await setAddonQuantity({ stripe: fk2.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now, ledger: L2, newAttemptId: () => "adc_same" }).catch(() => null);
+      const L3 = memoryAddonChargeLedger("org_t2");
+      const c = await setAddonQuantity({ stripe: fk2.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now, ledger: L3, newAttemptId: () => "adc_same" });
+      check("0005 fix1: a replayed key that returns a voided invoice is never paid → 502 stripe_error, nothing written (guard in chargeOneOff)", !c.ok && c.status === 502 && fk2.log.some((l) => l.startsWith("invoice.create(replay")) && fk2.log.filter((l) => l.startsWith("pay ")).length === 1 && !fk2.log.some((l) => l.startsWith("create ")), { c, log: fk2.log });
+    }
+
+    // Fix 2: void only the invoice this write created
+    {
+      let fk = mk({ pending: true, newInvoice: false });
+      let r5 = await setAddonQuantity({ stripe: fk.client, subscription: { id: "sub_x", status: "active" }, addon: "seat", quantity: 2, env: aenv, now });
+      check("0005 fix2: pending update but latest_invoice is the OLD invoice → nothing voided, 502 stripe_error, nothing granted", !r5.ok && r5.status === 502 && r5.code === "stripe_error" && !fk.log.some((l) => l.startsWith("void")) && !fk.applied(), { r5, log: fk.log });
+      fk = mk({ pending: true, freshReason: "subscription_cycle" });
+      r5 = await setAddonQuantity({ stripe: fk.client, subscription: { id: "sub_x", status: "active" }, addon: "seat", quantity: 2, env: aenv, now });
+      check("0005 fix2: a new latest invoice that is NOT a subscription_update (e.g. a renewal) is never voided → 502", !r5.ok && r5.status === 502 && !fk.log.some((l) => l.startsWith("void")), { r5, log: fk.log });
+      fk = mk({ pending: true });
+      const out = await inspectProrationOutcome(fk.client as never, "sub_x", "in_old");
+      check("0005 fix2: our own subscription_update invoice (id ≠ before) is the one voided → declined", !out.ok && out.reason === "declined" && out.invoiceId === "in_prorate" && fk.log.includes("void in_prorate"), { out, log: fk.log });
+      const otherSub = await inspectProrationOutcome({ subscriptions: { retrieve: async () => ({ id: "sub_x", pending_update: {}, latest_invoice: { id: "in_z", billing_reason: "subscription_update", parent: { subscription_details: { subscription: "sub_other" } } } }) as unknown as Stripe.Subscription }, invoices: fk.client.invoices }, "sub_x", "in_old");
+      check("0005 fix2: an invoice of another subscription is never voided", !otherSub.ok && otherSub.reason === "unidentified", otherSub);
+    }
+
+    // Fix 3: crash between the trial charge and the item write → reconciliation
+    {
+      // (a) item write throws → settled inline: not applied → refunded exactly once
+      let fk = trialIn({ itemWriteThrows: true });
+      let L = memoryAddonChargeLedger("org_t");
+      const thrown = await tr(fk, L).then(() => null, (e: Error) => e.message);
+      let row = [...L.rows.values()][0];
+      check("0005 fix3: charge paid then the item write throws → refunded (one credit note, full amount), row refunded, error rethrown", thrown === "connection reset" && row.status === "refunded" && fk.creditNotes.length === 1 && fk.creditNotes[0].amount === row.amount && fk.creditNotes[0].metadata.flowops_addon_charge_id === row.id, { thrown, row, cns: fk.creditNotes });
+      await reconcileAddonCharges(fk.client, L);
+      await reconcileAddonCharges(fk.client, L, [{ ...row, status: "paid" }]); // a stale "paid" copy (lost DB update) is still not refunded twice
+      check("0005 fix3: reconciling again (incl. a stale paid copy) never refunds twice", fk.creditNotes.length === 1, fk.creditNotes);
+
+      // (b) crash: item write throws AND Stripe is unreachable for the refund → row stays paid; the next request settles it first
+      fk = trialIn({ itemWriteThrows: true, creditNoteDown: 1 });
+      L = memoryAddonChargeLedger("org_t");
+      await tr(fk, L).catch(() => null);
+      row = [...L.rows.values()][0];
+      check("0005 fix3: refund impossible at crash time → row left paid (money held, add-on not granted)", row.status === "paid" && fk.creditNotes.length === 0 && !fk.applied(), row);
+      const nx = await setAddonQuantity({ stripe: fk.client, subscription: { id: "sub_x", status: "trialing" }, addon: "location", quantity: 0, env: aenv, now, ledger: L });
+      check("0005 fix3: the org's next add-on request settles the leftover attempt first (refunded once)", [...L.rows.values()][0].status === "refunded" && fk.creditNotes.length === 1 && nx.ok, { rows: [...L.rows.values()], nx });
+
+      // (c) crash after the item was written but before "applied" was recorded → applied, NO refund
+      fk = trialIn();
+      L = memoryAddonChargeLedger("org_t");
+      await tr(fk, L);
+      const done = [...L.rows.values()][0];
+      L.rows.set(done.id, { ...done, status: "paid" });
+      const res = await reconcileAddonCharges(fk.client, L);
+      check("0005 fix3: paid row whose add-on IS on the subscription → applied, no credit note", res[0]?.status === "applied" && fk.creditNotes.length === 0, { res });
+
+      // (d) crash after pay() but before "paid" was recorded (row pending, invoice paid on Stripe, no item) → refunded
+      fk = trialIn();
+      L = memoryAddonChargeLedger("org_t");
+      await L.insert({ id: "adc_crash", subscriptionId: "sub_x", customerId: "cus_1", addon: "seat", priceId: "price_seat", fromQuantity: 0, toQuantity: 2, amount: 467, currency: "usd", paymentMethod: "pm_card" });
+      fk.invState["in_lost"] = { status: "paid", amount: 467, metadata: { flowops_addon_charge_id: "adc_crash" } };
+      let rr = await reconcileAddonCharges(fk.client, L);
+      check("0005 fix3: pending row, invoice found by metadata and PAID, add-on missing → refunded (never granted)", rr[0]?.status === "refunded" && L.rows.get("adc_crash")!.invoiceId === "in_lost" && fk.creditNotes.length === 1 && !fk.log.some((l) => l.startsWith("create ")), { rr, cns: fk.creditNotes });
+      rr = await reconcileAddonCharges(fk.client, L);
+      check("0005 fix3: idempotent: second pass finds nothing to do", rr.length === 0 && fk.creditNotes.length === 1, rr);
+
+      // (e) crash with the invoice still open (finalized, not paid) → voided, failed, no refund; (f) no invoice at all → failed
+      fk = trialIn();
+      L = memoryAddonChargeLedger("org_t");
+      await L.insert({ id: "adc_open", subscriptionId: "sub_x", customerId: "cus_1", addon: "seat", priceId: "price_seat", fromQuantity: 0, toQuantity: 2, amount: 467, currency: "usd", paymentMethod: "pm_card" });
+      await L.update("adc_open", { invoiceId: "in_open" });
+      fk.invState["in_open"] = { status: "open", amount: 467 };
+      await L.insert({ id: "adc_none", subscriptionId: "sub_x", customerId: "cus_1", addon: "seat", priceId: "price_seat", fromQuantity: 0, toQuantity: 2, amount: 467, currency: "usd", paymentMethod: "pm_card" });
+      rr = await reconcileAddonCharges(fk.client, L);
+      check("0005 fix3: pending + open invoice → voided → failed; pending + no invoice → failed; nothing refunded or granted", JSON.stringify(rr) === JSON.stringify([{ id: "adc_open", status: "failed" }, { id: "adc_none", status: "failed" }]) && fk.invState["in_open"].status === "void" && fk.creditNotes.length === 0 && !fk.log.some((l) => l.startsWith("create ")), { rr, log: fk.log });
+
+      // (f2) one broken attempt (its subscription is gone) doesn't block the others; it stays unresolved
+      fk = trialIn();
+      L = memoryAddonChargeLedger("org_t");
+      for (const [id, sid] of [["adc_gone", "sub_gone"], ["adc_fine", "sub_x"]]) {
+        await L.insert({ id, subscriptionId: sid, customerId: "cus_1", addon: "seat", priceId: "price_seat", fromQuantity: 0, toQuantity: 2, amount: 467, currency: "usd", paymentMethod: "pm_card" });
+        await L.update(id, { status: "paid", invoiceId: `in_${id}` });
+        fk.invState[`in_${id}`] = { status: "paid", amount: 467 };
+      }
+      const flaky = { ...fk.client, subscriptions: { retrieve: async (id: string, p?: Stripe.SubscriptionRetrieveParams) => { if (id === "sub_gone") throw new Error("No such subscription"); return fk.client.subscriptions.retrieve(id, p); } } } as AddonStripe;
+      rr = await reconcileAddonCharges(flaky, L);
+      check("0005 fix3: a failing attempt is reported as error and left paid; the next one is still settled (refunded)", JSON.stringify(rr) === JSON.stringify([{ id: "adc_gone", status: "error" }, { id: "adc_fine", status: "refunded" }]) && L.rows.get("adc_gone")!.status === "paid", rr);
+
+      // (g) a credit note already exists (DB update lost after refunding) → found by metadata, not re-created
+      fk = trialIn();
+      fk.creditNotes.push({ id: "cn_prev", invoice: "in_x", amount: 467, metadata: { flowops_addon_charge_id: "adc_g" } });
+      const again = await refundAddonCharge(fk.client, { id: "adc_g", invoiceId: "in_x", amount: 467 }, 467, "t");
+      check("0005 fix3: refundAddonCharge finds an existing credit note for the attempt and doesn't create another", again === "cn_prev" && fk.creditNotes.length === 1, { again, cns: fk.creditNotes });
+      const ok = await tr(trialIn(), memoryAddonChargeLedger("org_t"));
+      check("0005 fix3: happy path still one row → applied", ok.ok, ok);
+      const noLedger = await setAddonQuantity({ stripe: trialIn().client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now }).then(() => "no error", (e: Error) => e.message);
+      check("0005 fix3: a trial increase without a ledger is refused before any Stripe charge", /ledger/.test(noLedger), noLedger);
+    }
+
+    // Fix 4: trial_end carried through schedule phases
+    {
+      const ph = { start_date: START, end_date: END, trial_end: END, items: [], metadata: {}, discounts: [], add_invoice_items: [] } as unknown as Stripe.SubscriptionSchedule.Phase;
+      check("0005 fix4: phaseParam keeps the phase's trial_end", phaseParam(ph, [{ price: "price_p", quantity: 1 }]).trial_end === END && phaseParam({ ...ph, trial_end: null }, []).trial_end === undefined);
+      const fk = trialIn({ items: [{ id: "si_plan", price: "price_p" }, { id: "si_seat", price: "price_seat", q: 4 }] });
+      const r5 = await setAddonQuantity({ stripe: fk.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 0, env: aenv, now });
+      const te = T0 + 7 * 86400;
+      check("0005 fix4: removal during a trial → schedule written with the current phase's trial_end unchanged; next phase has none", r5.ok && r5.action === "scheduled" && fk.log.includes(`schedule.update none price_px1+price_seatx4 trial_end=${te} | price_px1`) && fk.sched()!.phases[0].trial_end === te, { r5, log: fk.log });
+    }
+
+    // Policy switch (one constant, not an env var)
+    {
+      check("TRIAL_ADDON_POLICY is charge_now (flipping it is a reviewed code change: update this test + docs/BILLING.md §11)", TRIAL_ADDON_POLICY === "charge_now");
+      check("trialIncreaseHandling: charge_now → charge the rest of the trial now; at_trial_end → apply free until the trial ends", trialIncreaseHandling("charge_now") === "charge_rest_of_trial_now" && trialIncreaseHandling("at_trial_end") === "apply_free_until_trial_end");
+      const fk = trialIn();
+      const L = memoryAddonChargeLedger("org_t");
+      const r5 = await setAddonQuantityUnderPolicy("at_trial_end", { stripe: fk.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now, ledger: L });
+      check("policy at_trial_end (other branch): trial add applied now with proration none, NO invoice, no attempt row, charge null", r5.ok && r5.action === "created" && r5.charge === null && fk.log.join("|") === "create price_seat x2 none" && L.rows.size === 0, { r5, log: fk.log });
+      const fa = mk();
+      const r6 = await setAddonQuantityUnderPolicy("at_trial_end", { stripe: fa.client, subscription: { id: "sub_x", status: "active" }, addon: "seat", quantity: 2, env: aenv, now });
+      check("policy at_trial_end does not change ACTIVE subscriptions (still prorated + charged now)", r6.ok && r6.charge?.kind === "proration" && fa.log[0] === "create price_seat x2 always_invoice/pending_if_incomplete", { r6, log: fa.log });
+      const { readFileSync } = await import("node:fs");
+      const src = readFileSync(new URL("../src/lib/billing/addons.ts", import.meta.url), "utf8");
+      check("policy is not read from the environment", !/env\.[A-Z_]*TRIAL_ADDON|process\.env\.[A-Z_]*TRIAL/.test(src));
+    }
   }
 
   // ───── 0004: text pack rollover (one extra period, then expiry) + consumption order ─────
