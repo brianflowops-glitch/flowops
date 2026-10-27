@@ -57,3 +57,37 @@ describe("SMS templates match the A2P campaign samples", () => {
     );
   });
 });
+
+describe("business name in texts is sanitized (shared sending number)", () => {
+  const when = { date: "2026-10-27", time: "10:00" };
+  const plain = "FlowOps: Your appointment is confirmed for Tue Oct 27 at 10:00 AM. Reply STOP to opt out, HELP for help.";
+
+  it.each([
+    "Claim your prize at bit.ly/xyz",
+    "Visit https://evil.example",
+    "www.free-stuff.net deals",
+    "Win now freeprize.com",
+    "Email me: a@b.co",
+    "Call 570-555-0199",
+    "Call (570) 555 0199",
+    "Code 123456",
+  ])("drops an unsafe name: %s", (name) => {
+    expect(smsText("confirmed", when, name)).toBe(plain);
+  });
+
+  it("strips line breaks and control characters", () => {
+    expect(smsText("confirmed", when, "Ace\nBarbers\u0007\u200b")).toBe(
+      "FlowOps: Your appointment with Ace Barbers is confirmed for Tue Oct 27 at 10:00 AM. Reply STOP to opt out, HELP for help.",
+    );
+  });
+
+  it("caps the name at 40 characters", () => {
+    const t = smsText("confirmed", when, "A".repeat(80));
+    expect(t).toContain(`with ${"A".repeat(40)} is confirmed`);
+  });
+
+  it("keeps ordinary names, including a few digits and punctuation", () => {
+    expect(smsText("confirmed", when, "Joe's Cuts & Co. 24/7")).toContain("with Joe's Cuts & Co. 24/7 is confirmed");
+    expect(smsText("confirmed", when, "Studio 54")).toContain("with Studio 54 is confirmed");
+  });
+});

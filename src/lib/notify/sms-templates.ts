@@ -39,8 +39,30 @@ export function smsKindFromSubject(subject: string): SmsKind | null {
   return null;
 }
 
+const MAX_NAME = 40;
+
+/**
+ * Business names are free text set by any sign-up and go out from our shared number, so only a plain
+ * name is ever put in a text. Anything that could carry a link, contact detail or a code (URL, domain,
+ * email, phone number, 4+ digits in a row) drops the name entirely and the text says "Your appointment".
+ * Line breaks and control characters are removed, whitespace collapsed, and the name capped at 40 chars.
+ */
+export function safeSmsBusinessName(raw?: string | null): string | null {
+  if (!raw) return null;
+  const name = raw.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/g, " ").replace(/\s+/g, " ").trim();
+  if (!name) return null;
+  const unsafe =
+    /https?:|www\.|:\/\//i.test(name) ||
+    /[a-z0-9-]\.(com|net|org|io|ai|co|ly|me|app|link|info|biz|xyz|us|gl|gd|to|cc|tk|site|online|click|top)\b/i.test(name) ||
+    /\S@\S/.test(name) ||
+    (name.match(/\d/g)?.length ?? 0) >= 7 || // phone number however it's punctuated
+    /\d{4,}/.test(name); // codes, short codes
+  if (unsafe) return null;
+  return name.length > MAX_NAME ? name.slice(0, MAX_NAME).trimEnd() : name;
+}
+
 export function smsText(kind: SmsKind, b: { date: string; time: string }, businessName?: string | null): string {
-  const name = businessName?.trim();
+  const name = safeSmsBusinessName(businessName);
   const appt = name ? `Your appointment with ${name}` : "Your appointment";
   const when = formatSmsWhen(b.date, b.time);
   switch (kind) {
