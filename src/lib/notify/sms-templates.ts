@@ -53,7 +53,7 @@ export function safeSmsBusinessName(raw?: string | null): string | null {
   if (!name) return null;
   const unsafe =
     /https?:|www\.|:\/\//i.test(name) ||
-    /[a-z0-9-]\.(com|net|org|io|ai|co|ly|me|app|link|info|biz|xyz|us|gl|gd|to|cc|tk|site|online|click|top)\b/i.test(name) ||
+    /[\p{L}\p{N}][.\uff0e\u3002\uff61]\p{L}{2,}/u.test(name) || // any domain (win.shop, promo.vip), incl. full-width dots
     /\S@\S/.test(name) ||
     (name.match(/\d/g)?.length ?? 0) >= 7 || // phone number however it's punctuated
     /\d{4,}/.test(name); // codes, short codes
