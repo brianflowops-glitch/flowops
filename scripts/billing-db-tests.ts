@@ -2,7 +2,7 @@
 //   DATABASE_URL=postgres://…/scratch npm run test:billing:db
 // Requires migrations applied to that database (npm run db:migrate) — uses the demo org.
 import type Stripe from "stripe";
-import { asc, eq } from "drizzle-orm";
+import { asc, eq, sql } from "drizzle-orm";
 import { getDb, getConn, schema } from "../src/lib/db";
 import { processStripeEvent, type SubscriptionFetcher } from "../src/lib/billing/webhook";
 import { getBillingAccess, requireBillingAccess } from "../src/lib/billing/access";
@@ -12,7 +12,9 @@ import { textPackExpiry } from "../src/lib/billing/text-pack-rules";
 import { trialEligibility } from "../src/lib/billing/checkout";
 import { subscriptionFields } from "../src/lib/billing/webhook";
 import { DEMO_ORG_ID, defaultHours } from "../src/lib/tenancy/defaults";
-import { dbAddonChargeLedger, lockOrgForAddonChange, sweepAddonCharges } from "../src/lib/billing/addon-charges-db";
+import { AddonChangeBusy, addonLockFailureResponse, dbAddonChargeLedger, sweepAddonCharges, withAddonChangeLock } from "../src/lib/billing/addon-charges-db";
+import { Pool } from "pg";
+import { connectSession, getSessionPool, isPoolTimeout, type SessionClient } from "../src/lib/db";
 import { setAddonQuantity, type AddonStripe } from "../src/lib/billing/addons";
 
 if (/neon\.tech|vercel|amazonaws/.test(process.env.DATABASE_URL ?? "")) throw new Error("Refusing to run against a hosted database");
@@ -597,17 +599,14 @@ const expectUnique = async (db: ReturnType<typeof getDb>, invoiceId: string) => 
     check("addon_charge: one Stripe invoice can belong to only one attempt (unique index)", dup === "23505", dup);
     await db.delete(T).where(eq(T.organizationId, CORG));
 
-    // Crash INSIDE the route's lock transaction: the tx rolls back, the charge row (written outside it) survives as paid.
+    // Crash INSIDE the route's locked section (0006: advisory lock + autocommit writes on one connection): the row survives as paid.
     fx.throwItem = true; fx.cnDown = 1;
     let attemptId = "";
-    const crashed = await db
-      .transaction(async (tx) => {
-        await lockOrgForAddonChange(tx, CORG);
-        return setAddonQuantity({ stripe: fstripe, subscription: { id: base.subscriptionId, status: "trialing" }, addon: "seat", quantity: 2, env: { STRIPE_ADDON_PRICE_SEAT: "price_c_seat", STRIPE_PRICE_PRO: "price_c_plan" }, now: new Date(T0 * 1000), ledger: L, newAttemptId: () => (attemptId = `adc_crash_${n}`) });
-      })
-      .then(() => "no error", (e: Error) => e.message);
+    const crashed = await withAddonChangeLock(CORG, (ledger) =>
+      setAddonQuantity({ stripe: fstripe, subscription: { id: base.subscriptionId, status: "trialing" }, addon: "seat", quantity: 2, env: { STRIPE_ADDON_PRICE_SEAT: "price_c_seat", STRIPE_PRICE_PRO: "price_c_plan" }, now: new Date(T0 * 1000), ledger, newAttemptId: () => (attemptId = `adc_crash_${n}`) }),
+    ).then(() => "no error", (e: Error) => e.message);
     r0 = await rowOf(attemptId);
-    check("crash after the trial charge (item write fails, refund unreachable): lock tx rolled back, addon_charge row survives as PAID", crashed === "crash" && r0?.status === "paid" && !!r0.stripeInvoiceId && fx.inv.get(r0.stripeInvoiceId!)?.status === "paid" && fx.qty === 0 && fx.cns.length === 0, { crashed, r0 });
+    check("crash after the trial charge (item write fails, refund unreachable): error surfaces, lock released, addon_charge row survives as PAID", crashed === "crash" && r0?.status === "paid" && !!r0.stripeInvoiceId && fx.inv.get(r0.stripeInvoiceId!)?.status === "paid" && fx.qty === 0 && fx.cns.length === 0, { crashed, r0 });
     fx.throwItem = false;
     let sw = await sweepAddonCharges(db, fstripe);
     check("sweep: a fresh (< 10 min) attempt is left alone (a live request may own it)", !sw.some((x) => x.id === attemptId) && (await rowOf(attemptId))?.status === "paid", sw);
@@ -634,28 +633,183 @@ const expectUnique = async (db: ReturnType<typeof getDb>, invoiceId: string) => 
     check("sweep: old paid attempt whose add-on IS on the subscription → applied, no refund (never takes back a granted add-on)", (await st(`adc_ok_${n}`)) === "applied" && fx.cns.length === cnBefore, sw);
     fx.qty = 0;
 
-    // The sweep takes the org row lock: it waits while a request holds it.
+    // The sweep takes the org's add-on lock: while a request holds it the org is skipped ("busy"), never settled underneath it.
     await L.insert({ ...base, id: `adc_lock_${n}` });
     await age(`adc_lock_${n}`);
-    let released = false;
-    let sweptWhileLocked = false;
     let release!: () => void;
-    const holding = db.transaction(async (tx) => {
-      await lockOrgForAddonChange(tx, CORG);
+    let entered!: () => void;
+    const inside = new Promise<void>((res) => (entered = res));
+    const holding = withAddonChangeLock(CORG, async () => {
+      entered();
       await new Promise<void>((res) => (release = res));
-      released = true;
     });
-    await new Promise((res) => setTimeout(res, 100));
-    const sweeping = sweepAddonCharges(db, fstripe).then((x) => { sweptWhileLocked = !released; return x; });
-    await new Promise((res) => setTimeout(res, 300));
+    await inside;
+    sw = await sweepAddonCharges(db, fstripe);
     const stillPending = (await st(`adc_lock_${n}`)) === "pending";
     release();
     await holding;
-    await sweeping;
-    check("sweep: waits for the org row lock (never settles an attempt while a request of that org is in flight)", stillPending && !sweptWhileLocked && (await st(`adc_lock_${n}`)) === "failed", { stillPending, sweptWhileLocked });
+    check("sweep: an org whose add-on lock is held by a request is skipped (busy), its attempt untouched", stillPending && sw.some((x) => x.orgId === CORG && x.status === "busy"), sw);
+    sw = await sweepAddonCharges(db, fstripe);
+    check("sweep: next run (lock free) settles it (pending, no invoice → failed)", (await st(`adc_lock_${n}`)) === "failed", sw);
+    await L.insert({ ...base, id: `adc_exempt_${n}` });
+    await age(`adc_exempt_${n}`);
+    sw = await sweepAddonCharges(db, fstripe, { skipOrgIds: new Set([CORG]) });
+    check("sweep: exempt/demo orgs passed in skipOrgIds are never touched", sw.some((x) => x.orgId === CORG && x.status === "skipped_exempt") && (await st(`adc_exempt_${n}`)) === "pending", sw);
+    sw = await sweepAddonCharges(db, fstripe, { deadline: Date.now() - 1 });
+    check("sweep: past its time budget the remaining orgs are deferred to the next run, untouched", sw.some((x) => x.orgId === CORG && x.status === "deferred") && (await st(`adc_exempt_${n}`)) === "pending", sw);
 
     await db.delete(schema.organization).where(eq(schema.organization.id, CORG));
     check("org delete cascades addon_charge rows", (await db.select().from(T).where(eq(T.organizationId, CORG))).length === 0);
+  }
+
+
+  // ── 0006: one connection per add-on request (session advisory lock + autocommit ledger writes on that connection) ──
+  {
+    const ENV = { STRIPE_ADDON_PRICE_SEAT: "price_k_seat", STRIPE_PRICE_PRO: "price_k_plan" };
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    // A minimal trial subscription per org (Stripe calls take ~30 ms each, so requests really overlap).
+    const mkFake = (org: string) => {
+      const f = { qty: 0, paid: [] as string[], nInv: 0, inv: new Map<string, { status: string; amount: number }>() };
+      const d = async <X>(x: X) => (await sleep(30), x);
+      const stripe = {
+        subscriptions: { retrieve: async (id: string) => d({ id, status: "trialing", customer: `cus_${org}`, trial_end: T0 + 7 * 86400, default_payment_method: "pm_card", latest_invoice: null, schedule: null, items: { has_more: false, data: [{ id: "si_plan", price: { id: "price_k_plan", unit_amount: 9900, recurring: { interval: "month" } }, quantity: 1, current_period_end: T0 + 7 * 86400 }, ...(f.qty ? [{ id: "si_seat", price: { id: "price_k_seat", unit_amount: 1000 }, quantity: f.qty, current_period_end: T0 + 7 * 86400 }] : [])] } } as unknown as Stripe.Subscription) },
+        subscriptionItems: {
+          list: () => ({ autoPagingToArray: async () => [] }),
+          create: async (q: Stripe.SubscriptionItemCreateParams) => { await sleep(30); f.qty = q.quantity ?? 1; return { id: "si_seat" } as Stripe.SubscriptionItem; },
+          update: async (id: string, q: Stripe.SubscriptionItemUpdateParams) => { await sleep(30); f.qty = q.quantity ?? f.qty; return { id } as Stripe.SubscriptionItem; },
+        },
+        subscriptionSchedules: { retrieve: async () => { throw new Error("n/a"); }, create: async () => { throw new Error("n/a"); }, update: async () => { throw new Error("n/a"); }, release: async () => { throw new Error("n/a"); } },
+        invoices: {
+          create: async () => { const id = `in_${org}_${++f.nInv}`; f.inv.set(id, { status: "draft", amount: 0 }); return d({ id, status: "draft" } as Stripe.Invoice); },
+          finalizeInvoice: async (id: string) => (f.inv.get(id)!.status = "open", d({ id, status: "open" } as Stripe.Invoice)),
+          pay: async (id: string) => { const v = f.inv.get(id)!; v.status = "paid"; f.paid.push(id); return d({ id, status: "paid", amount_paid: v.amount, currency: "usd" } as Stripe.Invoice); },
+          retrieve: async (id: string) => { const v = f.inv.get(id); return { id, status: v?.status ?? "void", amount_paid: v?.status === "paid" ? v.amount : 0, currency: "usd" } as Stripe.Invoice; },
+          voidInvoice: async (id: string) => (f.inv.get(id)!.status = "void", { id, status: "void" } as Stripe.Invoice),
+          del: async () => ({}),
+          list: async () => ({ data: [] }),
+        },
+        invoiceItems: { create: async (q: Stripe.InvoiceItemCreateParams) => (f.inv.get(q.invoice as string)!.amount = q.amount!, d({ id: "ii" } as Stripe.InvoiceItem)) },
+        prices: { retrieve: async (id: string) => ({ id, unit_amount: 1000, currency: "usd" }) as Stripe.Price },
+        customers: { retrieve: async (id: string) => ({ id, invoice_settings: { default_payment_method: "pm_card" } }) as unknown as Stripe.Customer },
+        creditNotes: { list: async () => ({ data: [] }), create: async () => { throw new Error("no refunds expected"); } },
+      } as unknown as AddonStripe;
+      return { f, stripe };
+    };
+    const ORGS = ["a", "b", "c", "d"].map((k) => `org_conc_${k}_${n}`);
+    for (const [i, id] of ORGS.entries()) await db.insert(schema.organization).values({ id, slug: `conc-${i}-${n}`, name: `Concurrency ${i}`, hours: defaultHours() });
+    const fakes = new Map(ORGS.map((o) => [o, mkFake(o)]));
+    const active = new Map<string, number>();
+    const maxActive = new Map<string, number>();
+    let global = 0;
+    let maxGlobal = 0;
+    const sessionPool = getSessionPool();
+    let maxCheckedOut = 0;
+    const sampler = setInterval(() => (maxCheckedOut = Math.max(maxCheckedOut, sessionPool.totalCount - sessionPool.idleCount)), 5);
+    // Exactly what POST /api/billing/addons does after its guards: lock → setAddonQuantity with the ledger → unlock.
+    const request = (org: string, quantity: number) =>
+      withAddonChangeLock(org, async (ledger) => {
+        active.set(org, (active.get(org) ?? 0) + 1);
+        maxActive.set(org, Math.max(maxActive.get(org) ?? 0, active.get(org)!));
+        maxGlobal = Math.max(maxGlobal, ++global);
+        try {
+          return await setAddonQuantity({ stripe: fakes.get(org)!.stripe, subscription: { id: `sub_${org}`, status: "trialing" }, addon: "seat", quantity, env: ENV, now: new Date(T0 * 1000), ledger });
+        } finally {
+          active.set(org, active.get(org)! - 1);
+          global--;
+        }
+      }).then((r) => (r.ok ? r.action : `${r.status}`), (e: Error) => addonLockFailureResponse(e)?.status ?? `threw ${e.message}`);
+    // 8 at once: 5 double-clicks for org A (all "seat → 2"), one each for B, C, D.
+    const plan = [ORGS[0], ORGS[0], ORGS[1], ORGS[0], ORGS[2], ORGS[0], ORGS[3], ORGS[0]];
+    const t0 = Date.now();
+    const HANG = Symbol("hang");
+    const outcome = await Promise.race([Promise.all(plan.map((o) => request(o, 2))), sleep(20_000).then(() => HANG)]);
+    const took = Date.now() - t0;
+    clearInterval(sampler);
+    check("0006 concurrency: 8 simultaneous add-on requests (5 for one org, 3 for others) all finish, no hang", outcome !== HANG && took < 15_000, { took, outcome });
+    const res = outcome === HANG ? [] : (outcome as (string | number)[]);
+    const aRes = res.filter((_, i) => plan[i] === ORGS[0]);
+    const A = fakes.get(ORGS[0])!.f;
+    const rowsA = await db.select().from(schema.addonCharge).where(eq(schema.addonCharge.organizationId, ORGS[0]));
+    check("0006 concurrency: same org strictly serialised (never two of its requests inside the lock at once)", maxActive.get(ORGS[0]) === 1 && ORGS.every((o) => maxActive.get(o) === 1), Object.fromEntries(maxActive));
+    check("0006 concurrency: no double charge: org A charged exactly once (1 paid invoice, 1 attempt row → applied); the other 4 clicks are 'unchanged'", A.paid.length === 1 && A.qty === 2 && rowsA.length === 1 && rowsA[0].status === "applied" && aRes.filter((x) => x === "created").length === 1 && aRes.filter((x) => x === "unchanged").length === 4, { paid: A.paid, rowsA: rowsA.map((r) => r.status), aRes });
+    let othersOk = true;
+    for (const o of ORGS.slice(1)) {
+      const rows = await db.select().from(schema.addonCharge).where(eq(schema.addonCharge.organizationId, o));
+      othersOk &&= fakes.get(o)!.f.paid.length === 1 && rows.length === 1 && rows[0].status === "applied";
+    }
+    check("0006 concurrency: orgs B, C, D each charged once and applied; different orgs ran in parallel", othersOk && maxGlobal > 1, { maxGlobal });
+    check(`0006 concurrency: never more than ${sessionPool.options.max} session connections in use (one per request holding the lock; waiters hold none)`, maxCheckedOut >= 1 && maxCheckedOut <= (sessionPool.options.max ?? 0), { maxCheckedOut });
+    console.log(`  0006 concurrency: 8 requests in ${took} ms, results ${JSON.stringify(res)}, max in-lock at once ${maxGlobal}, max session connections in use ${maxCheckedOut}/${sessionPool.options.max}`);
+    await sleep(50);
+    const [{ held }] = (await db.execute(sql`select count(*)::int as held from pg_locks where locktype = 'advisory' and objsubid = 2`)).rows as { held: number }[];
+    check("0006 concurrency: afterwards every connection is back in the pool (none checked out, none waiting) and no advisory lock is held", sessionPool.totalCount === sessionPool.idleCount && sessionPool.waitingCount === 0 && getConn().pool.waitingCount === 0 && held === 0, { total: sessionPool.totalCount, idle: sessionPool.idleCount, waiting: sessionPool.waitingCount, held });
+
+    // Error inside the locked section → the lock is still released (finally) and the connection returned.
+    const boom = await withAddonChangeLock(ORGS[1], async () => { throw new Error("boom"); }).catch((e: Error) => e.message);
+    const again = await withAddonChangeLock(ORGS[1], async () => "got it", { waitMs: 0 }).catch((e: Error) => e.constructor.name);
+    check("0006 lock: an error inside the locked section releases the lock (next request gets it at once) and the connection", boom === "boom" && again === "got it" && sessionPool.totalCount === sessionPool.idleCount, { boom, again });
+
+    // Lock held longer than the wait → AddonChangeBusy → 409 change_in_progress (and nothing ran).
+    let releaseA!: () => void;
+    let inA!: () => void;
+    const entered = new Promise<void>((r) => (inA = r));
+    const holder = withAddonChangeLock(ORGS[0], async () => { inA(); await new Promise<void>((r) => (releaseA = r)); });
+    await entered;
+    let ran = false;
+    const busy = await withAddonChangeLock(ORGS[0], async () => { ran = true; }, { waitMs: 300 }).catch((e: unknown) => e);
+    const busyRes = addonLockFailureResponse(busy);
+    const otherOrg = await withAddonChangeLock(ORGS[2], async () => "free", { waitMs: 0 });
+    releaseA();
+    await holder;
+    check("0006 lock: same org busy beyond the wait → 409 change_in_progress, nothing ran; another org is not blocked", busy instanceof AddonChangeBusy && busyRes?.status === 409 && (await busyRes.json()).code === "change_in_progress" && !ran && otherOrg === "free", { busy: String(busy), status: busyRes?.status });
+
+    // No free connection within connectionTimeoutMillis → clean 503 (real pg-pool timeout on a pool of 1).
+    const tiny = new Pool({ connectionString: process.env.DATABASE_URL, max: 1, connectionTimeoutMillis: 200 });
+    const hog = await tiny.connect();
+    const connect = async (): Promise<SessionClient> => { const c = await tiny.connect(); return { db: db, query: (t, p) => c.query(t, p) as never, release: (x) => c.release(x ? true : undefined) }; };
+    const t1 = Date.now();
+    const starved = await withAddonChangeLock(ORGS[3], async () => "ran", { connect }).catch((e: unknown) => e);
+    const starvedRes = addonLockFailureResponse(starved);
+    check("0006 pool: no connection within connectionTimeoutMillis → 503 db_unavailable within ~the timeout (no hang), nothing ran", starvedRes?.status === 503 && (await starvedRes.json()).code === "db_unavailable" && Date.now() - t1 < 2_000, { starved: String(starved), ms: Date.now() - t1 });
+    check("0006 pool: isPoolTimeout recognises pg-pool's timeout error", isPoolTimeout(new Error("timeout exceeded when trying to connect")) && !isPoolTimeout(new Error("other")));
+    hog.release();
+    await tiny.end();
+
+    // For contrast, the 0005 shape (lock held in a transaction + ledger write on a SECOND connection of the same pool of 5):
+    // 5 at once each hold one connection and wait for a second. Without a timeout that is a permanent hang; here a 1 s
+    // timeout shows every one of them is stuck.
+    const old = new Pool({ connectionString: process.env.DATABASE_URL, max: 5, connectionTimeoutMillis: 1_000 });
+    const oldShape = async () => {
+      const c = await old.connect();
+      try {
+        await c.query("begin");
+        await sleep(100); // all five now hold their first connection
+        const c2 = await old.connect(); // the ledger write's second connection
+        c2.release();
+        return "ok";
+      } catch (e) {
+        return isPoolTimeout(e) ? "stuck" : `err ${(e as Error).message}`;
+      } finally {
+        await c.query("rollback").catch(() => undefined);
+        c.release();
+      }
+    };
+    const oldRes = await Promise.all([1, 2, 3, 4, 5].map(oldShape));
+    await old.end();
+    check("0006 contrast: the 0005 two-connection shape with 5 concurrent requests on a pool of 5 gets stuck (every request waits for a 2nd connection)", oldRes.every((x) => x === "stuck"), oldRes);
+
+    // The session pool refuses Neon's pooled (PgBouncer transaction-mode) URL: a session lock there would leak.
+    const { sessionDatabaseUrl } = await import("../src/lib/db");
+    const pooled = "postgres://u:p@ep-cool-123-pooler.us-east-2.aws.neon.tech/db";
+    const direct = "postgres://u:p@ep-cool-123.us-east-2.aws.neon.tech/db";
+    const refused = (() => { try { sessionDatabaseUrl({ DATABASE_URL: pooled }); return false; } catch { return true; } })();
+    check("0006 session URL: DATABASE_URL_UNPOOLED preferred; a Neon -pooler DATABASE_URL alone is refused; a direct/local one is used", refused && sessionDatabaseUrl({ DATABASE_URL: pooled, DATABASE_URL_UNPOOLED: direct }) === direct && sessionDatabaseUrl({ DATABASE_URL: direct }) === direct);
+    const s1 = await connectSession();
+    const v = (await s1.query<{ idle_session_timeout: string }>("show idle_session_timeout")).rows[0]?.idle_session_timeout;
+    s1.release();
+    check("0006 session connections set idle_session_timeout (server drops a lock held by a frozen/killed function)", v === "2min" || v === "120s", v);
+
+    for (const id of ORGS) await db.delete(schema.organization).where(eq(schema.organization.id, id));
   }
 
   // Failed card: locked org → zero entitlements (the lock already blocks it).
@@ -679,5 +833,6 @@ const expectUnique = async (db: ReturnType<typeof getDb>, invoiceId: string) => 
 
   console.log(`\n${failed ? `${failed} failed` : "all passed"} (billing, local database, Stripe mocked)`);
   await getConn().pool.end();
+  await getSessionPool().end();
   process.exit(failed ? 1 : 0);
 })();

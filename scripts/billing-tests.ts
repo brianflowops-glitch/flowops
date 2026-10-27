@@ -402,7 +402,7 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
   // ───── 0004: increases charged now (prorated), failed charge grants nothing, trial adds charged, removals unchanged ─────
   {
     const T0 = 1795000000; // "now" in the fake
-    type Opt = { status?: string; pending?: boolean; newInvoice?: boolean; freshReason?: string; pm?: string | null; payStatus?: "paid" | "decline"; schedule?: Stripe.SubscriptionSchedule | null; items?: { id: string; price: string; q?: number }[]; itemWriteThrows?: boolean; creditNoteDown?: number };
+    type Opt = { status?: string; pending?: boolean; newInvoice?: boolean; freshReason?: string; pm?: string | null; payStatus?: "paid" | "decline"; schedule?: Stripe.SubscriptionSchedule | null; items?: { id: string; price: string; q?: number }[]; itemWriteThrows?: boolean; creditNoteDown?: number; schedRetrieveThrowsAfterItem?: boolean };
     const mk = (o: Opt = {}) => {
       const log: string[] = [];
       let sched = o.schedule ?? null;
@@ -439,7 +439,10 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
           update: async (id, p) => (log.push(`update ${id} x${p.quantity} ${p.proration_behavior}${p.payment_behavior ? `/${p.payment_behavior}` : ""}`), (applied = !o.pending), { id } as Stripe.SubscriptionItem),
         },
         subscriptionSchedules: {
-          retrieve: async () => sched!,
+          retrieve: async () => {
+            if (o.schedRetrieveThrowsAfterItem && log.some((l) => /^(create|update) /.test(l))) throw new Error("schedule read failed");
+            return sched!;
+          },
           create: async () => (log.push("schedule.create"), (sched = mkSchedule([{ start_date: START, end_date: END, items: sub.items.data.map((i) => ({ price: i.price.id, quantity: i.quantity ?? 1 })), ...(sub.trial_end ? { trial_end: sub.trial_end } : {}) }])), sched),
           update: async (_id, p) => (log.push(`schedule.update ${p.proration_behavior} ` + (p.phases ?? []).map((ph) => (ph.items ?? []).map((i) => `${i.price}x${i.quantity}`).join("+") + (ph.trial_end ? ` trial_end=${ph.trial_end}` : "")).join(" | ")), pushPhases(sched!, p.phases ?? []), sched!),
           release: async () => (log.push("schedule.release"), (sched = null), {} as Stripe.SubscriptionSchedule),
@@ -649,6 +652,41 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
       check("0005 fix3: happy path still one row → applied", ok.ok, ok);
       const noLedger = await setAddonQuantity({ stripe: trialIn().client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now }).then(() => "no error", (e: Error) => e.message);
       check("0005 fix3: a trial increase without a ledger is refused before any Stripe charge", /ledger/.test(noLedger), noLedger);
+    }
+
+    // 0006 fix 3: the attempt row is marked applied as soon as Stripe confirms the item write, before any later step
+    {
+      // Trial, pending decrease 4 → 1 at the trial end (a schedule with a next phase), then an increase to 6: charge,
+      // item write OK, then re-reading the schedule fails → the add-on IS active, so the row must be applied (never refunded).
+      const fk = trialIn({ items: [{ id: "si_plan", price: "price_p" }, { id: "si_seat", price: "price_seat", q: 4 }], schedRetrieveThrowsAfterItem: true });
+      const L = memoryAddonChargeLedger("org_t");
+      const dec = await tr(fk, L, 1);
+      const order: string[] = [];
+      const upd = L.update.bind(L);
+      L.update = async (id, patch) => (patch.status && order.push(`${patch.status}@${fk.log.length}`), upd(id, patch));
+      const thrown = await tr(fk, L, 6).then(() => "no error", (e: Error) => e.message);
+      const row = [...L.rows.values()][0];
+      const itemAt = fk.log.findIndex((l) => l.startsWith("update si_seat x6"));
+      check("0006 fix3: item confirmed by Stripe, then a later step (schedule re-read) fails → row already APPLIED, no refund, error surfaces", dec.ok && dec.action === "scheduled" && thrown === "schedule read failed" && row?.status === "applied" && fk.creditNotes.length === 0 && itemAt >= 0, { dec, thrown, row, log: fk.log, cns: fk.creditNotes });
+      check("0006 fix3: 'applied' is written right after the item write (before any schedule call)", order.includes(`applied@${itemAt + 1}`), { order, itemAt, log: fk.log });
+      // Even if the quantity is later lowered (portal / schedule) the sweep never refunds it: an applied row is not unresolved.
+      (fk.sub.items.data as unknown as { price: { id: string }; quantity: number }[]).find((i) => i.price.id === "price_seat")!.quantity = 1;
+      const rr = await reconcileAddonCharges(fk.client, L);
+      check("0006 fix3: later reconcile/sweep with the quantity lowered → nothing to settle, never refunded (closes the 0005 edge case)", rr.length === 0 && fk.creditNotes.length === 0 && [...L.rows.values()][0].status === "applied", { rr, cns: fk.creditNotes });
+    }
+    {
+      // The 'applied' DB write itself fails: the change still succeeds for the user, the row stays paid, and the sweep
+      // later finds the add-on on the subscription → applied (no refund).
+      const fk = trialIn();
+      const L = memoryAddonChargeLedger("org_t");
+      const upd = L.update.bind(L);
+      L.update = async (id, patch) => { if (patch.status === "applied" && patch.note === "item confirmed by Stripe") throw new Error("db down"); return upd(id, patch); };
+      const r = await tr(fk, L, 2);
+      const row = [...L.rows.values()][0];
+      check("0006 fix3: if recording 'applied' fails the add-on still succeeds (charged once); the row is left for the sweep", r.ok && r.action === "created" && fk.applied() && (row.status === "paid" || row.status === "applied") && fk.creditNotes.length === 0, { r, row });
+      L.update = upd;
+      const rr = await reconcileAddonCharges(fk.client, L);
+      check("0006 fix3: … and the sweep then marks it applied (add-on found), no credit note", rr.length === 1 && rr[0].status === "applied" && [...L.rows.values()][0].status === "applied" && fk.creditNotes.length === 0, { rr, row });
     }
 
     // Fix 4: trial_end carried through schedule phases

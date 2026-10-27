@@ -1,13 +1,13 @@
 import "server-only";
 import { and, asc, eq, inArray, lt } from "drizzle-orm";
-import { schema, type Db } from "@/lib/db";
+import { connectSession, isPoolTimeout, schema, type Db, type SessionClient } from "@/lib/db";
 import type { AddonChargeLedger, AddonChargeRecord } from "./addon-charge";
 import { reconcileAddonCharges, type AddonStripe } from "./addons";
 
 /**
  * The `addon_charge` table (migration 0011) as an `AddonChargeLedger` for one organization (docs/BILLING.md §11).
- * Writes go through `db` directly, NOT the caller's lock transaction, so a row survives that transaction being
- * rolled back (the money may already be collected). The caller holds the org row lock while it uses the ledger.
+ * Every write autocommits on `db` (0006: the add-on lock's own session connection, see `withAddonChangeLock`), so a
+ * row survives anything that fails later (the money may already be collected). The caller holds the org's add-on lock.
  */
 export function dbAddonChargeLedger(db: Db, orgId: string): AddonChargeLedger {
   const t = schema.addonCharge;
@@ -69,26 +69,109 @@ export function dbAddonChargeLedger(db: Db, orgId: string): AddonChargeLedger {
   };
 }
 
-type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
+/** Advisory-lock key space for add-on changes (two int4 keys: never overlaps the single-bigint org locks in pipeline.ts). */
+const LOCK_NS = "flowops:addon-change";
+export const ADDON_LOCK_WAIT_MS = 20_000;
+
+/** Another add-on change of the same org kept the lock longer than the wait (→ 409, try again). */
+export class AddonChangeBusy extends Error {
+  constructor() {
+    super("Another add-on change for this organization is still in progress");
+  }
+}
+/** No session connection / no direct database URL (→ 503). */
+export class AddonLockUnavailable extends Error {}
+
+export type AddonLockOptions = {
+  /** How long to wait for the org's lock (default ADDON_LOCK_WAIT_MS). 0 = try once (the sweep skips busy orgs). */
+  waitMs?: number;
+  /** Session connection source (tests); default `connectSession` (dedicated direct pool, see db/index.ts). */
+  connect?: () => Promise<SessionClient>;
+};
 
 /**
- * The per-org add-on lock, taken by the add-on route and the sweep inside their transaction. FOR NO KEY UPDATE (not
- * FOR UPDATE): it conflicts with itself and with the FOR UPDATE org locks elsewhere (text packs), so changes stay
- * serialised, but it lets the ledger's `addon_charge` insert, which runs on another connection outside the
- * transaction, take the foreign key's KEY SHARE lock on the org row. With FOR UPDATE that insert would wait for the
- * transaction that is waiting for it (self-deadlock; caught by the DB tests).
+ * One add-on change per org at a time, on ONE database connection (0006).
+ *
+ * Takes a session-level `pg_try_advisory_lock(ns, hashtext(orgId))` on a single connection from the dedicated session
+ * pool, runs `fn` with an `addon_charge` ledger on that SAME connection (every write autocommits, so a charge row
+ * survives anything that happens later), and always unlocks in `finally`, also when `fn` throws. If the unlock can't be
+ * confirmed the connection is destroyed, which drops the lock with the session. If the process dies, the connection
+ * closes and Postgres drops the lock; a frozen function is cut off by `idle_session_timeout`.
+ *
+ * Why not the 0005 shape (a transaction holding `SELECT … FOR NO KEY UPDATE` on the org row, with ledger writes on a
+ * second pooled connection): every request held TWO connections from a pool of 5, so five concurrent requests could
+ * each hold one and wait forever for a second (instance hang). Here a request never needs a second connection while
+ * it holds one, and a request waiting for the lock holds none, so there is no cycle: requests either get the lock,
+ * wait for it (bounded: 409), or fail to get a connection (bounded by connectionTimeoutMillis: 503).
+ *
+ * Why session-level and not `pg_advisory_xact_lock`: the charge rows must be committed while the lock is held (a
+ * transaction-scoped lock would force them into the lock's transaction, and a rollback or crash would erase the record
+ * of money already collected). Session locks need a real session, hence the direct (unpooled) connection.
  */
-export async function lockOrgForAddonChange(tx: Tx, orgId: string) {
-  await tx.select({ id: schema.organization.id }).from(schema.organization).where(eq(schema.organization.id, orgId)).for("no key update");
+export async function withAddonChangeLock<T>(orgId: string, fn: (ledger: AddonChargeLedger, session: SessionClient) => Promise<T>, opts: AddonLockOptions = {}): Promise<T> {
+  const connect = async () => {
+    try {
+      return await (opts.connect ?? connectSession)();
+    } catch (err) {
+      throw new AddonLockUnavailable(isPoolTimeout(err) ? "No database connection available for add-on changes (timed out)" : `Add-on lock connection failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+  const deadline = Date.now() + (opts.waitMs ?? ADDON_LOCK_WAIT_MS);
+  let session: SessionClient;
+  // Try the lock; if another request of this org holds it, give the connection BACK while waiting (a waiter never
+  // occupies a connection, so a burst on one org can't starve other orgs of connections), then retry.
+  for (let i = 0; ; i++) {
+    session = await connect();
+    let ok = false;
+    try {
+      ok = Boolean((await session.query<{ ok: boolean }>("select pg_try_advisory_lock(hashtext($1), hashtext($2)) as ok", [LOCK_NS, orgId])).rows[0]?.ok);
+    } catch (err) {
+      session.release(true);
+      throw err;
+    }
+    if (ok) break;
+    session.release();
+    if (Date.now() >= deadline) throw new AddonChangeBusy();
+    await new Promise((r) => setTimeout(r, Math.min(250, 25 * 2 ** Math.min(i, 4)) + Math.floor(Math.random() * 25)));
+  }
+  try {
+    return await fn(dbAddonChargeLedger(session.db, orgId), session);
+  } finally {
+    let destroy = false;
+    try {
+      const { rows } = await session.query<{ ok: boolean }>("select pg_advisory_unlock(hashtext($1), hashtext($2)) as ok", [LOCK_NS, orgId]);
+      destroy = !rows[0]?.ok;
+    } catch {
+      destroy = true;
+    }
+    if (destroy) console.error("[billing] add-on lock unlock not confirmed; dropping the connection (releases the lock)", orgId);
+    session.release(destroy);
+  }
 }
 
 /**
- * Sweep (0005): settle trial add-on charge attempts left `pending` / `paid` by a crash, for every org, under each
- * org's row lock (so it never races a live request). Only attempts older than `olderThanMs` (default 10 min) are
- * touched. Idempotent: safe to run as often as wanted. NOT scheduled yet (launch task, docs/BILLING.md §11); the
- * same reconciliation also runs inline at the start of the org's next add-on change.
+ * HTTP answer for a lock/connection failure, or null if `err` is something else (rethrow it).
+ * 503 = no connection (pool timeout / no direct URL), 409 = the org's lock stayed busy.
  */
-export async function sweepAddonCharges(db: Db, stripe: AddonStripe, opts: { olderThanMs?: number; now?: Date } = {}) {
+export function addonLockFailureResponse(err: unknown): Response | null {
+  if (err instanceof AddonLockUnavailable || isPoolTimeout(err)) {
+    console.error("[billing] add-on change: database unavailable", err instanceof Error ? err.message : err);
+    return Response.json({ error: "Billing is busy right now. Nothing was charged or changed; please try again in a moment.", code: "db_unavailable" }, { status: 503, headers: { "Retry-After": "5" } });
+  }
+  if (err instanceof AddonChangeBusy)
+    return Response.json({ error: "Another add-on change for this business is still being processed. Nothing was charged by this request; try again in a moment.", code: "change_in_progress" }, { status: 409, headers: { "Retry-After": "5" } });
+  return null;
+}
+
+/**
+ * Sweep (0005, scheduled by the daily cron in 0006: GET /api/cron/addon-charges): settle trial add-on charge attempts
+ * left `pending` / `paid` by a crash, for every org, under that org's add-on lock (`withAddonChangeLock`, so it never
+ * races a live request). An org whose lock is busy is skipped (status "busy": a live request is settling it anyway,
+ * and the next run retries). Only attempts older than `olderThanMs` (default 10 min) are touched. Orgs in
+ * `skipOrgIds` (demo / exempt) are skipped; past `deadline` (epoch ms) the remaining orgs are left for the next run. Idempotent: safe to run as often as wanted. Uses one session connection
+ * at a time.
+ */
+export async function sweepAddonCharges(db: Db, stripe: AddonStripe, opts: { olderThanMs?: number; now?: Date; skipOrgIds?: ReadonlySet<string>; deadline?: number; connect?: () => Promise<SessionClient>; waitMs?: number } = {}) {
   const cutoff = new Date((opts.now ?? new Date()).getTime() - (opts.olderThanMs ?? 10 * 60_000));
   const t = schema.addonCharge;
   const orgs = await db
@@ -97,13 +180,27 @@ export async function sweepAddonCharges(db: Db, stripe: AddonStripe, opts: { old
     .where(and(inArray(t.status, ["pending", "paid"]), lt(t.createdAt, cutoff)));
   const results: { orgId: string; id: string; status: string }[] = [];
   for (const { orgId } of orgs) {
+    if (opts.deadline && Date.now() > opts.deadline) {
+      results.push({ orgId, id: "*", status: "deferred" }); // out of time: next run
+      continue;
+    }
+    if (opts.skipOrgIds?.has(orgId)) {
+      results.push({ orgId, id: "*", status: "skipped_exempt" });
+      continue;
+    }
     try {
-      await db.transaction(async (tx) => {
-        await lockOrgForAddonChange(tx, orgId);
-        const ledger = dbAddonChargeLedger(db, orgId);
-        for (const r of await reconcileAddonCharges(stripe, ledger, await ledger.unresolved(cutoff))) results.push({ orgId, ...r });
-      });
+      await withAddonChangeLock(
+        orgId,
+        async (ledger) => {
+          for (const r of await reconcileAddonCharges(stripe, ledger, await ledger.unresolved(cutoff))) results.push({ orgId, ...r });
+        },
+        { waitMs: opts.waitMs ?? 0, connect: opts.connect },
+      );
     } catch (err) {
+      if (err instanceof AddonChangeBusy) {
+        results.push({ orgId, id: "*", status: "busy" });
+        continue;
+      }
       console.error("[billing] add-on charge sweep failed for an org (continuing)", orgId, err instanceof Error ? err.message : err);
       results.push({ orgId, id: "*", status: "error" });
     }

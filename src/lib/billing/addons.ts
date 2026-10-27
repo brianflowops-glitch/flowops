@@ -280,6 +280,8 @@ export async function setAddonQuantityUnderPolicy(policy: TrialAddonPolicy, { st
   if (cfg.key === "branding" && planLimits(classified.plan.planKey, env).brandingRemoved) return { ok: false, status: 409, error: "Branding removal is already included in this plan" };
 
   const c = cfg; // narrowed (used by applyChange below)
+  /** Set for a charged trial increase: marks its `addon_charge` row applied as soon as Stripe confirms the item write. */
+  let onItemWritten: (() => Promise<void>) | null = null;
   const existing = items.find((i) => i.price?.id === cfg.priceId);
   const currentQty = existing?.quantity ?? 0;
   const none = "none" as const;
@@ -311,17 +313,27 @@ export async function setAddonQuantityUnderPolicy(policy: TrialAddonPolicy, { st
     charge = paid.charge;
     if (!paid.record) return applyChange(); // nothing was charged (no trial time left)
     const rec = paid.record;
-    // From here on the money is taken. Applied → record `applied`. If applying fails or throws, settle the attempt from
-    // Stripe's state (applied after all → keep; not applied → refund once). A crash here is settled the same way later.
+    // From here on the money is taken. The row becomes `applied` the moment Stripe confirms the item write (0006,
+    // `onItemWritten`), BEFORE any later step (schedule re-read / phase rewrite / release): if one of those fails, or the
+    // process dies after it, the add-on was active, so the sweep must never refund it. If the item write itself fails
+    // or throws, settle the attempt from Stripe's state (applied after all → keep; not applied → refund once).
+    let itemConfirmed = false;
+    onItemWritten = async () => {
+      itemConfirmed = true;
+      // A failed DB write here leaves the row `paid`; the sweep then finds the item on the subscription → applied.
+      await ledger.update(rec.id, { status: "applied", note: "item confirmed by Stripe" }).catch((e) => console.error("[billing] could not mark add-on charge applied (sweep will)", rec.id, e instanceof Error ? e.message : e));
+    };
     let result: AddonChangeResult;
     try {
       result = await applyChange();
     } catch (err) {
-      await reconcileAddonCharges(stripe, ledger, [rec]).catch((e) => console.error("[billing] add-on charge left for the sweep", rec.id, e instanceof Error ? e.message : e));
+      if (!itemConfirmed) await reconcileAddonCharges(stripe, ledger, [rec]).catch((e) => console.error("[billing] add-on charge left for the sweep", rec.id, e instanceof Error ? e.message : e));
       throw err;
     }
-    if (result.ok) await ledger.update(rec.id, { status: "applied" });
-    else await reconcileAddonCharges(stripe, ledger, [rec]);
+    if (!itemConfirmed) {
+      if (result.ok) await ledger.update(rec.id, { status: "applied" });
+      else await reconcileAddonCharges(stripe, ledger, [rec]);
+    }
     return result;
   }
   return applyChange();
@@ -336,6 +348,7 @@ export async function setAddonQuantityUnderPolicy(policy: TrialAddonPolicy, { st
     const itemId = existing
       ? (await stripe.subscriptionItems.update(existing.id, { quantity, ...extra })).id
       : (await stripe.subscriptionItems.create({ subscription: sub.id, price: c.priceId, quantity, ...extra })).id;
+    if (onItemWritten) await onItemWritten();
     if (!prorate) return { ok: true, itemId };
     const out = await inspectProrationOutcome(stripe, sub.id, before);
     if (!out.ok && out.reason === "unidentified")

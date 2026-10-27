@@ -9,6 +9,7 @@ import * as packsLib from "@/lib/billing/text-packs";
 import * as stripeLib from "@/lib/billing/stripe";
 import * as scheduled from "@/lib/billing/scheduled";
 import * as addonsLib from "@/lib/billing/addons";
+import * as chargesDb from "@/lib/billing/addon-charges-db";
 
 // Route guards for /api/billing/addons. Nothing here reaches Stripe: every case is decided before the first Stripe call.
 describe("POST/GET /api/billing/addons guards", () => {
@@ -158,6 +159,36 @@ describe("POST/GET /api/billing/addons guards", () => {
       expect(set.mock.calls[0][0]).toMatchObject({ addon: "seat", quantity: 2, subscription: { id: "sub_x" } });
       // 0005: the trial-charge ledger for THIS org is passed (attempt rows + reconciliation under the org lock)
       expect(set.mock.calls[0][0].ledger?.orgId).toBeTruthy();
+    });
+
+    it("0006: the change runs inside the org's add-on lock (one session connection per request)", async () => {
+      live();
+      const lock = vi.spyOn(chargesDb, "withAddonChangeLock");
+      const set = vi.spyOn(addonsLib, "setAddonQuantity").mockResolvedValue({ ok: true, action: "created", addon: "seat", quantity: 2, currentQuantity: 2, effectiveAt: null, itemId: "si_1", proration: "always_invoice", charge: null });
+      spies.push(lock, set);
+      expect((await post(owner)).status).toBe(200);
+      expect(lock).toHaveBeenCalledTimes(1);
+      expect(lock.mock.calls[0][0]).toBe(set.mock.calls[0][0].ledger?.orgId);
+    });
+
+    it("0006: lock busy past the wait → 409 change_in_progress; pool exhausted / timeout → 503 db_unavailable with Retry-After; nothing charged", async () => {
+      live();
+      const set = vi.spyOn(addonsLib, "setAddonQuantity");
+      spies.push(set);
+      const lock = vi.spyOn(chargesDb, "withAddonChangeLock").mockRejectedValueOnce(new chargesDb.AddonChangeBusy());
+      spies.push(lock);
+      let res = await post(owner);
+      expect(res.status).toBe(409);
+      expect((await res.json()).code).toBe("change_in_progress");
+      spies.push(vi.spyOn(console, "error").mockImplementation(() => {}));
+      lock.mockRejectedValueOnce(new Error("timeout exceeded when trying to connect"));
+      res = await post(owner);
+      expect(res.status).toBe(503);
+      expect(res.headers.get("retry-after")).toBe("5");
+      expect((await res.json()).code).toBe("db_unavailable");
+      lock.mockRejectedValueOnce(new chargesDb.AddonLockUnavailable("no direct URL"));
+      expect((await post(owner)).status).toBe(503);
+      expect(set).not.toHaveBeenCalled();
     });
 
     it("200 in a trial: says it covers the rest of the free trial", async () => {

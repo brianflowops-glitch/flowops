@@ -2,6 +2,7 @@
 //   A. trial add with a declining card → 402; switch to a good card → retry → paid (per-attempt idempotency key)
 //   B. removing an add-on during a trial keeps trial_end (schedule phases carry trial_end); trial-end invoice = plan only
 //   C. crash after the trial charge (item write + refund fail) → addon_charge row stays paid → sweep refunds once
+//   D. (0006 fix 3) item write confirmed, then a later step (schedule re-read) fails → row already applied → never refunded
 //   STRIPE_SECRET_KEY_TEST_US=sk_test_… DATABASE_URL=<throwaway local postgres, migrated> \
 //     npx tsx --conditions=react-server scripts/billing-sandbox-0005.ts
 // Every clock and customer it creates is deleted at the end. The secret key is never printed.
@@ -183,6 +184,32 @@ async function world(label: string, cardToken = "pm_card_visa") {
     check("sweep again (even with the row reset to paid): still ONE credit note (never refunds twice)", cns2.length === 1 && (await c.rows())[0].status === "refunded", { n: cns2.length });
     const ok = await c.apply("seat", 1);
     check("the next add (no faults) charges and applies normally", ok.ok && ok.charge?.kind === "trial_proration" && (await c.qty(P.seat_month)) === 1, ok);
+
+    // ═══ D. 0006 fix 3: applied as soon as Stripe confirms the item, so a later failure never refunds ═══
+    console.log("\n── D. (0006) Item confirmed, then a later step fails ──");
+    const dec = await c.apply("seat", 0); // pending removal at the trial end → a schedule with a next phase
+    check("D setup: seat 1 → 0 in the trial is scheduled (schedule with a next phase)", dec.ok && dec.action === "scheduled", dec);
+    let schedReads = 0;
+    const lateFail = {
+      ...(crashy as unknown as Record<string, unknown>),
+      subscriptionItems: stripe.subscriptionItems,
+      creditNotes: stripe.creditNotes,
+      subscriptionSchedules: {
+        create: (p: Stripe.SubscriptionScheduleCreateParams) => stripe.subscriptionSchedules.create(p),
+        update: (id: string, p: Stripe.SubscriptionScheduleUpdateParams) => stripe.subscriptionSchedules.update(id, p),
+        release: (id: string) => stripe.subscriptionSchedules.release(id),
+        retrieve: async (id: string) => { if (++schedReads >= 2) throw new Error("simulated failure after the item write"); return stripe.subscriptionSchedules.retrieve(id); },
+      },
+    } as unknown as AddonStripe;
+    const before = (await c.rows()).length;
+    const thrownD = await c.apply("seat", 3, lateFail).then(() => "no error", (e: Error) => e.message);
+    const dRows = (await c.rows()).slice(before);
+    const dInv = dRows[0]?.stripeInvoiceId ? await stripe.invoices.retrieve(dRows[0].stripeInvoiceId) : null;
+    RECORD.lateFail = { thrown: thrownD, rows: dRows.map((x) => ({ id: x.id, status: x.status, note: x.note })), invoice: dInv && { id: dInv.id, status: dInv.status, amount_paid: dInv.amount_paid } };
+    check("0006 fix3: charged, seats 3 on Stripe, the later step's error surfaces, and the row is ALREADY applied", thrownD.startsWith("simulated failure after the item write") && dRows.length === 1 && dRows[0].status === "applied" && dInv?.status === "paid" && (await c.qty(P.seat_month)) === 3, RECORD.lateFail);
+    sw = await sweepAddonCharges(db, stripe as unknown as AddonStripe, { olderThanMs: 0 });
+    const dCns = (await stripe.creditNotes.list({ invoice: dInv!.id!, limit: 10 })).data;
+    check("0006 fix3: the sweep leaves it alone: no credit note, row still applied, seats still 3", dCns.length === 0 && (await c.rows())[before].status === "applied" && !sw.some((x) => x.id === dRows[0].id) && (await c.qty(P.seat_month)) === 3, { sweep: sw.filter((x) => x.orgId === c.ORG), cns: dCns.length });
   } catch (e) {
     failed++;
     console.log("ERROR", e instanceof Error ? e.message : e);
