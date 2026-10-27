@@ -6,7 +6,7 @@
  * What IS here is *what a unit of each add-on gives you* and the default plan limits. Both are
  * product definitions rather than prices, and the plan limits can be overridden per plan from env.
  */
-import { addonByPriceId, planByPriceId } from "./config";
+import { addonByPriceId, planByPriceId, textPackSize } from "./config";
 
 type Env = Record<string, string | undefined>;
 
@@ -19,10 +19,11 @@ export interface PlanLimits {
   brandingRemoved: boolean;
 }
 
-/** Defaults from the pricing proposal (Brian to confirm). Override per plan with PLAN_LIMITS_<PLAN>. */
+/** Brian's final pricing (2026-10-27). Override per plan with PLAN_LIMITS_<PLAN>. */
 export const DEFAULT_PLAN_LIMITS: Readonly<Record<string, PlanLimits>> = {
   starter: { seats: 3, locations: 1, monthlyTexts: 500, brandingRemoved: false },
   pro: { seats: 10, locations: 1, monthlyTexts: 2000, brandingRemoved: true },
+  business: { seats: 25, locations: 3, monthlyTexts: 5000, brandingRemoved: true },
 };
 
 /** What a plan item with no limits configured (new plan, unknown price) falls back to: the smallest known tier. */
@@ -109,7 +110,7 @@ export function planLimits(planKey: string | null | undefined, env: Env = proces
   return { ...parsePlanLimits(override, base ?? FALLBACK_PLAN_LIMITS), source: "configured" };
 }
 
-/** What one unit of an add-on adds. `texts_<n>` is generic (texts_1000, texts_5000 …). */
+/** What one unit of a RECURRING add-on adds. `texts_<n>` only matters for a legacy recurring text bundle still on a subscription (new text packs are one-time, see text-packs.ts). */
 export type AddonEffect = Partial<Record<"seats" | "locations" | "monthlyTexts", number>> & { brandingRemoved?: true };
 
 export function addonEffect(key: string): AddonEffect | null {
@@ -124,7 +125,7 @@ export function addonEffect(key: string): AddonEffect | null {
 
 /**
  * Maximum quantity of each add-on one subscription may hold (abuse guard: an Owner could otherwise set
- * `texts_1000` to 1,000, i.e. a million texts we pay Twilio for). Product limits, overridable per add-on with
+ * `texts_1000` to 1,000, i.e. a million texts we pay Twilio for; for text packs the cap is per billing month). Product limits, overridable per add-on with
  * `STRIPE_ADDON_MAX_<KEY>` (e.g. `STRIPE_ADDON_MAX_TEXTS_1000=20`).
  */
 export const DEFAULT_ADDON_MAX: Readonly<Record<string, number>> = { seat: 50, location: 10, texts_1000: 10, branding: 1 };
@@ -168,8 +169,10 @@ export interface Entitlements extends PlanLimits {
   planKey: string | null;
   /** "configured": plan limits known; "fallback": plan not recognised → smallest tier; "none": no subscription. */
   source: "configured" | "fallback" | "none";
-  /** Add-ons that were counted, as given (unknown keys dropped). */
+  /** Recurring add-ons that were counted (unknown keys dropped), quantity = what was counted after the cap. */
   addons: AddonQuantity[];
+  /** One-time text packs (`texts_<n>`) that were counted for the current period, quantity after the cap. */
+  packs: AddonQuantity[];
 }
 
 /**
@@ -178,13 +181,13 @@ export interface Entitlements extends PlanLimits {
  * or an add-on unlocks it). Each add-on's summed quantity is capped at `addonMaxQuantity` (so a quantity
  * set directly in Stripe never grants more than the cap); `addons` reports the quantity actually counted.
  */
-export function computeEntitlements(planKey: string | null | undefined, addonQuantities: readonly AddonQuantity[] = [], env: Env = process.env): Entitlements {
-  if (!planKey) return { ...NO_LIMITS, planKey: null, source: "none", addons: [] };
+export function computeEntitlements(planKey: string | null | undefined, addonQuantities: readonly AddonQuantity[] = [], env: Env = process.env, packQuantities: readonly AddonQuantity[] = []): Entitlements {
+  if (!planKey) return { ...NO_LIMITS, planKey: null, source: "none", addons: [], packs: [] };
   const { source, ...limits } = planLimits(planKey, env);
-  return applyAddons(limits, planKey.toLowerCase(), source, addonQuantities, env);
+  return applyAddons(limits, planKey.toLowerCase(), source, addonQuantities, env, packQuantities);
 }
 
-function applyAddons(limits: PlanLimits, planKey: string | null, source: Entitlements["source"], addonQuantities: readonly AddonQuantity[], env: Env): Entitlements {
+function applyAddons(limits: PlanLimits, planKey: string | null, source: Entitlements["source"], addonQuantities: readonly AddonQuantity[], env: Env, packQuantities: readonly AddonQuantity[] = []): Entitlements {
   const merged = new Map<string, number>();
   for (const a of addonQuantities) {
     const q = Number.isFinite(a.quantity) ? Math.max(0, Math.floor(a.quantity)) : 0;
@@ -202,7 +205,19 @@ function applyAddons(limits: PlanLimits, planKey: string | null, source: Entitle
     if (fx.brandingRemoved) total.brandingRemoved = true;
     counted.push({ key, quantity: q });
   }
-  return { ...total, planKey, source, addons: counted.sort((a, b) => a.key.localeCompare(b.key)) };
+  // One-time text packs bought (and paid) for the current period: n texts each, capped per key like any add-on.
+  const packSum = new Map<string, number>();
+  for (const p of packQuantities) {
+    const q = Number.isFinite(p.quantity) ? Math.max(0, Math.floor(p.quantity)) : 0;
+    if (q > 0 && textPackSize(p.key)) packSum.set(p.key.toLowerCase(), (packSum.get(p.key.toLowerCase()) ?? 0) + q);
+  }
+  const packs: AddonQuantity[] = [];
+  for (const [key, raw] of packSum) {
+    const q = Math.min(raw, addonMaxQuantity(key, env));
+    total.monthlyTexts += textPackSize(key)! * q;
+    packs.push({ key, quantity: q });
+  }
+  return { ...total, planKey, source, addons: counted.sort((a, b) => a.key.localeCompare(b.key)), packs: packs.sort((a, b) => a.key.localeCompare(b.key)) };
 }
 
 export interface MirroredItem {
@@ -239,10 +254,10 @@ export function classifyItems<T extends MirroredItem>(items: readonly T[], env: 
 }
 
 /** items (as mirrored) → entitlements. */
-export function entitlementsFromItems(items: readonly MirroredItem[], env: Env = process.env): Entitlements {
+export function entitlementsFromItems(items: readonly MirroredItem[], env: Env = process.env, packQuantities: readonly AddonQuantity[] = []): Entitlements {
   const c = classifyItems(items, env);
   if (!c.plan) return computeEntitlements(null, [], env);
   // A plan item whose price is not configured as a plan still has a (fallback) tier: it is a live subscription.
-  if (c.plan.planKey === null) return applyAddons(FALLBACK_PLAN_LIMITS, null, "fallback", c.addons, env);
-  return computeEntitlements(c.plan.planKey, c.addons, env);
+  if (c.plan.planKey === null) return applyAddons(FALLBACK_PLAN_LIMITS, null, "fallback", c.addons, env, packQuantities);
+  return computeEntitlements(c.plan.planKey, c.addons, env, packQuantities);
 }

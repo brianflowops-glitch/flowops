@@ -11,7 +11,7 @@
  *   - A later change replaces a pending one (see `setAddonQuantity`).
  */
 import type Stripe from "stripe";
-import { addonByKey, addons } from "./config";
+import { addonByKey, addonPrice, isTextPackKey, plans, recurringAddons, type BillingInterval } from "./config";
 import { addonEffect, addonMaxQuantity, classifyItems, entitlementsFromItems, planLimits, type Entitlements } from "./entitlements";
 
 type Env = Record<string, string | undefined>;
@@ -177,9 +177,11 @@ const hasUnsupportedPhaseSettings = (p: Stripe.SubscriptionSchedule.Phase) => Bo
  * Other add-ons' pending changes, and a portal-scheduled plan downgrade, are kept.
  */
 export async function setAddonQuantity({ stripe, subscription, addon, quantity, env = process.env }: ChangeAddonInput): Promise<AddonChangeResult> {
-  const cfg = addonByKey(addon, env);
-  if (!cfg) return { ok: false, status: 400, error: "Unknown add-on" };
-  const invalid = validateAddonQuantity(cfg.key, quantity, env);
+  // Text bundles are one-time packs now (text-packs.ts / POST /api/billing/text-packs), never a recurring add-on.
+  if (isTextPackKey(addon)) return { ok: false, status: 400, error: "Text bundles are one-time packs now. Buy them with POST /api/billing/text-packs; they are not a recurring add-on." };
+  const known = addonByKey(addon, env);
+  if (!known) return { ok: false, status: 400, error: "Unknown add-on" };
+  const invalid = validateAddonQuantity(known.key, quantity, env);
   if (invalid) return invalid;
   if (!(ADDON_CHANGE_STATUSES as readonly string[]).includes(subscription.status))
     return { ok: false, status: 409, error: "Add-ons can only be changed on an active subscription. Fix the payment in the billing portal first." };
@@ -188,6 +190,12 @@ export async function setAddonQuantity({ stripe, subscription, addon, quantity, 
   const items = sub.items.data;
   const classified = classifyItems(items.map((i) => ({ priceId: i.price?.id ?? null, quantity: i.quantity ?? 1 })), env);
   if (!classified.plan || !classified.plan.planKey) return { ok: false, status: 409, error: "This subscription is not on a configured plan, so add-ons can't be changed" };
+  // The add-on price must have the subscription's billing interval (Stripe: one interval per subscription).
+  const planItem = items.find((i) => i.price?.id === classified.plan!.priceId);
+  const interval = (planItem?.price?.recurring?.interval ?? plans(env).find((p) => p.priceId === classified.plan!.priceId)?.interval ?? "month") as string;
+  if (interval !== "month" && interval !== "year") return { ok: false, status: 409, error: "This subscription's billing interval doesn't support add-ons" };
+  const cfg = addonPrice(known.key, interval as BillingInterval, env);
+  if (!cfg) return { ok: false, status: 409, error: `The "${known.key}" add-on has no ${interval === "year" ? "annual" : "monthly"} price configured, so it can't be added to this ${interval === "year" ? "annual" : "monthly"} subscription` };
   if (cfg.key === "branding" && planLimits(classified.plan.planKey, env).brandingRemoved) return { ok: false, status: 409, error: "Branding removal is already included in this plan" };
 
   const existing = items.find((i) => i.price?.id === cfg.priceId);
@@ -255,8 +263,13 @@ export async function setAddonQuantity({ stripe, subscription, addon, quantity, 
   return cleared || quantity === currentQty ? done("schedule_cleared") : done("scheduled", ph!.current.end_date);
 }
 
-/** Add-ons currently configured, for UI/GET: key + price id + the most one subscription may hold (no amounts: those live in Stripe). */
+/** Recurring add-ons currently configured, for UI/GET: key + price ids per interval + the most one subscription may hold (no amounts: those live in Stripe). Text packs are listed separately. */
 export function configuredAddons(env: Env = process.env) {
-  return addons(env).map((a) => ({ key: a.key, priceId: a.priceId, known: addonEffect(a.key) !== null, max: addonMaxQuantity(a.key, env) }));
+  const keys = [...new Set(recurringAddons(env).map((a) => a.key))];
+  return keys.map((key) => {
+    const month = addonPrice(key, "month", env)?.priceId;
+    const year = addonPrice(key, "year", env)?.priceId;
+    return { key, priceId: month ?? year!, prices: { ...(month ? { month } : {}), ...(year ? { year } : {}) }, known: addonEffect(key) !== null, max: addonMaxQuantity(key, env) };
+  });
 }
 

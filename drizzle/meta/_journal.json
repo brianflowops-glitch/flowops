@@ -64,6 +64,13 @@
       "when": 1793110176126,
       "tag": "0008_billing_addons",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1793121148689,
+      "tag": "0009_text_pack",
+      "breakpoints": true
     }
   ]
 }

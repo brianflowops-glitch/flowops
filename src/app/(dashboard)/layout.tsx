@@ -26,8 +26,11 @@ async function Gate({ children }: { children: React.ReactNode }) {
   const access = await getBillingAccess(ctx.org.id, ctx.role);
   if (access.access === "locked") {
     // Plan keys only (never price ids) and only for people who can act on them.
-    const planKeys = access.canManageBilling ? plans().map((p) => p.key) : [];
-    return <BillingLocked copy={lockScreenCopy(access)} orgName={ctx.org.name} planKeys={planKeys} />;
+    const all = access.canManageBilling ? plans() : [];
+    const order = ["starter", "pro", "business"];
+    const planKeys = [...new Set(all.filter((p) => p.interval === "month").map((p) => p.key))].sort((a, b) => (order.indexOf(a) + 1 || 99) - (order.indexOf(b) + 1 || 99) || a.localeCompare(b));
+    const annualPlanKeys = planKeys.filter((k) => all.some((p) => p.key === k && p.interval === "year"));
+    return <BillingLocked copy={lockScreenCopy(access)} orgName={ctx.org.name} planKeys={planKeys} annualPlanKeys={annualPlanKeys} />;
   }
   return (
     <AppShell

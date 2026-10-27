@@ -1,6 +1,7 @@
 import Stripe from "stripe";
 import { z } from "zod";
-import { addonByKey, billingConfigured, billingEnabled } from "@/lib/billing/config";
+import { addonByKey, addons, billingConfigured, billingEnabled, isTextPackKey, textPackSize } from "@/lib/billing/config";
+import { addonMaxQuantity } from "@/lib/billing/entitlements";
 import { configuredAddons, setAddonQuantity, validateAddonQuantity } from "@/lib/billing/addons";
 import { findLiveStripeSubscription, getOrCreateCustomer } from "@/lib/billing/checkout";
 import { getEntitlements } from "@/lib/billing/org-entitlements";
@@ -23,6 +24,10 @@ export async function GET(req: Request) {
   const [entitlements, pending] = await Promise.all([getEntitlements(ctx.org.id), getScheduledChanges(ctx.org.id)]);
   return Response.json({
     addons: configuredAddons(),
+    // One-time packs (POST /api/billing/text-packs): `max` is per billing period. What is active now is in entitlements.packs.
+    textPacks: addons()
+      .filter((a) => a.interval === "one_time")
+      .map((a) => ({ key: a.key, priceId: a.priceId, texts: textPackSize(a.key), max: addonMaxQuantity(a.key) })),
     entitlements,
     scheduled: pending.changes && { ...pending.changes, effectiveAt: new Date(pending.changes.effectiveAt * 1000).toISOString() },
     ...(pending.unavailable ? { scheduledUnavailable: true } : {}),
@@ -30,7 +35,7 @@ export async function GET(req: Request) {
 }
 
 /**
- * Owner or Admin sets an add-on's quantity on the org's existing subscription (0 removes it).
+ * Owner or Admin sets a RECURRING add-on's quantity (seat, location, branding; text packs are one-time, see text-packs/route.ts) on the org's existing subscription (0 removes it).
  * The quantity may not exceed the add-on's maximum (400; see `addonMaxQuantity`).
  * Never a mid-cycle charge or credit (`proration_behavior: "none"`). An increase or new add-on applies now and is
  * first billed at the next renewal; a decrease or removal stays active until the period ends, then drops
@@ -46,6 +51,7 @@ export async function POST(req: Request) {
   const parsed = body.safeParse(await readJson(req));
   if (!parsed.success) return badRequest(parsed.error);
 
+  if (isTextPackKey(parsed.data.addon)) return Response.json({ error: "Text bundles are one-time packs now. Buy them with POST /api/billing/text-packs; they are not a recurring add-on." }, { status: 400 });
   // Per-add-on maximum (docs/BILLING.md §11): rejected here, before any Stripe call.
   if (addonByKey(parsed.data.addon)) {
     const invalid = validateAddonQuantity(parsed.data.addon, parsed.data.quantity);

@@ -4,6 +4,7 @@ import { getDb, schema, type Db } from "@/lib/db";
 import { billingEnabled } from "./config";
 import { billingExemptOrgIds, effectiveSubscription, FULL_ACCESS_STATUSES } from "./access-rules";
 import { entitlementsFromItems, type Entitlements } from "./entitlements";
+import { activePaidPacks } from "./text-packs";
 
 export type OrgEntitlements =
   /** No limits apply: billing is off, or the org is exempt (docs/BILLING.md §6). */
@@ -19,7 +20,7 @@ export type OrgEntitlements =
  *   branding   → public booking page (src/app/book/…)
  *   locations  → no multi-location model exists yet
  */
-export async function getEntitlements(organizationId: string, opts: { db?: Db; env?: Record<string, string | undefined> } = {}): Promise<OrgEntitlements> {
+export async function getEntitlements(organizationId: string, opts: { db?: Db; env?: Record<string, string | undefined>; now?: Date } = {}): Promise<OrgEntitlements> {
   const env = opts.env ?? process.env;
   const enabled = opts.env ? env.BILLING_ENABLED === "true" : billingEnabled();
   if (!enabled) return { enforced: false, reason: "billing_disabled" };
@@ -36,5 +37,7 @@ export async function getEntitlements(organizationId: string, opts: { db?: Db; e
     .select({ priceId: schema.subscriptionItem.priceId, quantity: schema.subscriptionItem.quantity })
     .from(schema.subscriptionItem)
     .where(eq(schema.subscriptionItem.subscriptionId, sub.id));
-  return { enforced: true, reason: "ok", entitlements: entitlementsFromItems(items, env) };
+  // Monthly texts = plan texts + paid one-time packs whose window contains now (a pending or failed pack grants nothing).
+  const packs = await activePaidPacks(db, organizationId, opts.now);
+  return { enforced: true, reason: "ok", entitlements: entitlementsFromItems(items, env, packs) };
 }

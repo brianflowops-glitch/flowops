@@ -1,6 +1,8 @@
 // Offline billing checks (no network, no database): `npm run test:billing`
 import Stripe from "stripe";
-import { addonByKey, addonByPriceId, addons, isLiveKey, planByKey, planByPriceId, plans } from "../src/lib/billing/config";
+import { addonByKey, addonByPriceId, addonPrice, addons, isLiveKey, isTextPackKey, planByKey, planByPriceId, plans, textPackByKey, textPackSize, trialDays } from "../src/lib/billing/config";
+import { addMonthsUTC, textPackWindow, validateTextPackRequest } from "../src/lib/billing/text-pack-rules";
+import { checkoutSessionParams } from "../src/lib/billing/checkout-params";
 import { addonEffect, addonMaxQuantity, resetAddonMaxWarnings, classifyItems, computeEntitlements, entitlementsFromItems, parsePlanLimits, planLimits, DEFAULT_PLAN_LIMITS } from "../src/lib/billing/entitlements";
 import { configuredAddons, phaseItems, retrieveSubscriptionComplete, scheduledChanges, setAddonQuantity, validateAddonQuantity, type AddonStripe } from "../src/lib/billing/addons";
 import { findLiveSubscription, hasPaidAccess, normalizeStatus } from "../src/lib/billing/status";
@@ -23,9 +25,9 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
 
 (async () => {
   const env = { STRIPE_PRICE_STARTER: "price_test_a", STRIPE_PRICE_PRO_ANNUAL: "price_test_b", STRIPE_PRICE_EMPTY: "", OTHER: "x" };
-  check("plans() reads only non-empty STRIPE_PRICE_* vars", JSON.stringify(plans(env).map((p) => p.key)) === '["pro_annual","starter"]');
+  check("plans() reads only non-empty STRIPE_PRICE_* vars; _ANNUAL is the plan's yearly price, not a plan key", JSON.stringify(plans(env).map((p) => [p.key, p.interval])) === '[["pro","year"],["starter","month"]]');
   check("planByKey is case-insensitive", planByKey("STARTER", env)?.priceId === "price_test_a");
-  check("planByPriceId maps back to plan key", planByPriceId("price_test_b", env)?.key === "pro_annual");
+  check("planByPriceId maps back to plan key (any interval)", planByPriceId("price_test_b", env)?.key === "pro" && planByPriceId("price_test_b", env)?.interval === "year");
   check("no plans configured → empty list", plans({}).length === 0);
   check("live keys detected", isLiveKey("sk_live_123") && isLiveKey("rk_live_123") && !isLiveKey("sk_test_123"));
   check("unknown status → incomplete", normalizeStatus("something_new") === "incomplete");
@@ -88,10 +90,10 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
   check("402 body is {error:billing_locked, reason, status, canManageBilling}", body.error === "billing_locked" && body.reason === "past_due" && body.status === "past_due" && body.canManageBilling === true);
 
   // ── add-ons: config, limits, entitlements (docs/BILLING.md §11) ──
-  const aenv = { STRIPE_PRICE_STARTER: "price_s", STRIPE_PRICE_PRO: "price_p", STRIPE_ADDON_PRICE_SEAT: "price_seat", STRIPE_ADDON_PRICE_LOCATION: "price_loc", STRIPE_ADDON_PRICE_TEXTS_1000: "price_t1k", STRIPE_ADDON_PRICE_BRANDING: "price_brand", STRIPE_ADDON_PRICE_EMPTY: "" };
-  check("addons() reads only non-empty STRIPE_ADDON_PRICE_* vars, lowercased keys", JSON.stringify(addons(aenv).map((a) => a.key)) === '["branding","location","seat","texts_1000"]');
+  const aenv = { STRIPE_PRICE_STARTER: "price_s", STRIPE_PRICE_PRO: "price_p", STRIPE_ADDON_PRICE_SEAT: "price_seat", STRIPE_ADDON_PRICE_LOCATION: "price_loc", STRIPE_ADDON_PRICE_TEXTS_1000: "price_pack", STRIPE_ADDON_LEGACY_PRICE_TEXTS_1000: "price_t1k", STRIPE_ADDON_PRICE_BRANDING: "price_brand", STRIPE_ADDON_PRICE_EMPTY: "" };
+  check("addons() reads only non-empty STRIPE_ADDON_PRICE_* vars, lowercased keys", JSON.stringify(addons(aenv).map((a) => a.key)) === '["branding","location","seat","texts_1000","texts_1000"]');
   check("add-on env vars are never mistaken for plans", JSON.stringify(plans(aenv).map((p) => p.key)) === '["pro","starter"]');
-  check("addonByKey is case-insensitive, addonByPriceId maps back", addonByKey("SEAT", aenv)?.priceId === "price_seat" && addonByPriceId("price_t1k", aenv)?.key === "texts_1000");
+  check("addonByKey is case-insensitive, addonByPriceId maps back", addonByKey("SEAT", aenv)?.priceId === "price_seat" && addonByPriceId("price_t1k", aenv)?.key === "texts_1000" && addonByPriceId("price_t1k", aenv)?.legacy === true && addonByPriceId("price_pack", aenv) === undefined);
   check("no add-ons configured → empty list", addons({}).length === 0 && addonByPriceId("price_x", {}) === undefined);
   check("default limits: starter 3/1/500, no branding removal", JSON.stringify(planLimits("starter", {})) === JSON.stringify({ seats: 3, locations: 1, monthlyTexts: 500, brandingRemoved: false, source: "configured" }));
   check("default limits: pro 10/1/2000, branding removed", JSON.stringify(planLimits("pro", {})) === JSON.stringify({ seats: 10, locations: 1, monthlyTexts: 2000, brandingRemoved: true, source: "configured" }));
@@ -101,8 +103,9 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
   const js = planLimits("pro", { PLAN_LIMITS_PRO: '{"seats":25,"texts":5000}' });
   check("PLAN_LIMITS_<PLAN> JSON form; unspecified fields keep defaults", js.seats === 25 && js.monthlyTexts === 5000 && js.locations === 1 && js.brandingRemoved === true);
   const biz = planLimits("business", { PLAN_LIMITS_BUSINESS: "seats=30,locations=5,texts=10000,branding=true" });
-  check("a plan with no built-in default can be fully defined from env", biz.source === "configured" && biz.seats === 30 && biz.locations === 5 && biz.monthlyTexts === 10000);
-  check("unknown plan without limits → smallest tier, flagged fallback", planLimits("business", {}).source === "fallback" && planLimits("business", {}).seats === 3);
+  check("a plan with no built-in default can be fully defined from env", planLimits("enterprise", { PLAN_LIMITS_ENTERPRISE: "seats=30,locations=5,texts=10000,branding=true" }).seats === 30 && biz.source === "configured" && biz.seats === 30 && biz.locations === 5 && biz.monthlyTexts === 10000);
+  check("unknown plan without limits → smallest tier, flagged fallback", planLimits("enterprise", {}).source === "fallback" && planLimits("enterprise", {}).seats === 3);
+  check("default limits: business 25/3/5000, branding removed; PLAN_LIMITS_BUSINESS overrides", JSON.stringify(planLimits("business", {})) === JSON.stringify({ seats: 25, locations: 3, monthlyTexts: 5000, brandingRemoved: true, source: "configured" }) && planLimits("business", { PLAN_LIMITS_BUSINESS: "seats=40" }).seats === 40);
   const bad = parsePlanLimits("seats=-1,locations=abc,texts=1.5,bogus=3,branding=maybe,seats", DEFAULT_PLAN_LIMITS.starter);
   check("malformed limit values are ignored, never widen a limit", JSON.stringify(bad) === JSON.stringify(DEFAULT_PLAN_LIMITS.starter));
   check("malformed JSON ignored", JSON.stringify(parsePlanLimits("{not json", DEFAULT_PLAN_LIMITS.pro)) === JSON.stringify(DEFAULT_PLAN_LIMITS.pro));
@@ -123,7 +126,7 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
   e = computeEntitlements("starter", [{ key: "voice_agent", quantity: 2 }], {});
   check("entitlements: add-on with no known effect changes nothing", e.seats === 3 && e.addons.length === 0, e);
   // ── per-add-on maximum quantities (abuse guard) ──
-  const aenvCaps = { STRIPE_PRICE_STARTER: "price_s", STRIPE_ADDON_PRICE_SEAT: "price_seat", STRIPE_ADDON_PRICE_TEXTS_1000: "price_t1k" };
+  const aenvCaps = { STRIPE_PRICE_STARTER: "price_s", STRIPE_ADDON_PRICE_SEAT: "price_seat", STRIPE_ADDON_LEGACY_PRICE_TEXTS_1000: "price_t1k" };
   const warns: string[] = [];
   const origWarn = console.warn;
   console.warn = (...a: unknown[]) => void warns.push(a.join(" "));
@@ -167,7 +170,7 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
   check("validateAddonQuantity: negative / fractional / NaN → 400", [-1, 1.5, Number.NaN, Infinity].every((q) => validateAddonQuantity("seat", q, {})?.status === 400));
   check("validateAddonQuantity: env override raises the cap", validateAddonQuantity("seat", 80, { STRIPE_ADDON_MAX_SEAT: "100" }) === null && validateAddonQuantity("seat", 101, { STRIPE_ADDON_MAX_SEAT: "100" })?.status === 400);
   const cfgAddons = configuredAddons({ ...aenvCaps, STRIPE_ADDON_PRICE_LOCATION: "price_loc", STRIPE_ADDON_MAX_SEAT: "7" });
-  check("configuredAddons includes each add-on's max", JSON.stringify(cfgAddons.map((a) => [a.key, a.max])) === JSON.stringify([["location", 10], ["seat", 7], ["texts_1000", 10]]), cfgAddons);
+  check("configuredAddons includes each add-on's max", JSON.stringify(cfgAddons.map((a) => [a.key, a.max])) === JSON.stringify([["location", 10], ["seat", 7]]), cfgAddons);
 
   e = computeEntitlements(null, [{ key: "seat", quantity: 2 }], {});
   check("entitlements: no plan → nothing (source none)", e.seats === 0 && e.monthlyTexts === 0 && !e.brandingRemoved && e.source === "none", e);
@@ -321,6 +324,78 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
   pagedStripe.subscriptionItems.list = () => ({ autoPagingToArray: async () => [...big.items.data, { id: "si_11", price: { id: "price_seat" }, quantity: 1 } as unknown as Stripe.SubscriptionItem] });
   const full = await retrieveSubscriptionComplete(pagedStripe, "sub_x");
   check("retrieveSubscriptionComplete pages through has_more items", full.items.data.length === 2 && full.items.has_more === false);
+
+  // ── final pricing: annual prices, Business, one-time text packs, trial (docs/BILLING.md §11–12) ──
+  const fenv = {
+    STRIPE_PRICE_STARTER: "p_s_m", STRIPE_PRICE_PRO: "p_p_m", STRIPE_PRICE_BUSINESS: "p_b_m",
+    STRIPE_PRICE_STARTER_ANNUAL: "p_s_y", STRIPE_PRICE_PRO_ANNUAL: "p_p_y", STRIPE_PRICE_BUSINESS_ANNUAL: "p_b_y",
+    STRIPE_ADDON_PRICE_SEAT: "a_seat_m", STRIPE_ADDON_PRICE_LOCATION: "a_loc_m", STRIPE_ADDON_PRICE_BRANDING: "a_brand_m",
+    STRIPE_ADDON_PRICE_SEAT_ANNUAL: "a_seat_y", STRIPE_ADDON_PRICE_LOCATION_ANNUAL: "a_loc_y", STRIPE_ADDON_PRICE_BRANDING_ANNUAL: "a_brand_y",
+    STRIPE_ADDON_PRICE_TEXTS_1000: "pack_1k",
+  };
+  check("plans: three plans × two intervals, keys never end in _annual", plans(fenv).length === 6 && plans(fenv).every((p) => !p.key.includes("annual")) && JSON.stringify([...new Set(plans(fenv).map((p) => p.key))]) === '["business","pro","starter"]');
+  check("planByKey: month by default, year on request; missing interval → undefined", planByKey("pro", fenv)?.priceId === "p_p_m" && planByKey("PRO", fenv, "year")?.priceId === "p_p_y" && planByKey("pro", { STRIPE_PRICE_PRO: "x" }, "year") === undefined);
+  check("planByPriceId recognises annual prices (the webhook mapping)", planByPriceId("p_b_y", fenv)?.key === "business" && planByPriceId("p_b_y", fenv)?.interval === "year" && planByPriceId("p_s_m", fenv)?.interval === "month");
+  check("classifyItems maps an annual plan price + annual add-ons", (() => { const c = classifyItems([{ priceId: "p_p_y", quantity: 1 }, { priceId: "a_seat_y", quantity: 2 }], fenv); return c.plan?.planKey === "pro" && c.addons[0]?.key === "seat" && c.addons[0].quantity === 2 && c.unknown.length === 0; })());
+  check("add-on prices per interval; text pack is its own one-time price (never a recurring add-on or a subscription item match)", addonPrice("seat", "year", fenv)?.priceId === "a_seat_y" && addonPrice("seat", "month", fenv)?.priceId === "a_seat_m" && addonPrice("texts_1000", "month", fenv) === undefined && addonByKey("texts_1000", fenv) === undefined && textPackByKey("texts_1000", fenv)?.priceId === "pack_1k" && addonByPriceId("pack_1k", fenv) === undefined);
+  check("text pack keys: texts_1000 → 1000 texts, others are not packs", isTextPackKey("texts_1000") && textPackSize("texts_1000") === 1000 && textPackSize("seat") === null && !isTextPackKey("texts_0"));
+  check("TRIAL_DAYS: default 14, 0 disables, junk falls back to 14", trialDays({}) === 14 && trialDays({ TRIAL_DAYS: "0" }) === 0 && trialDays({ TRIAL_DAYS: "7" }) === 7 && trialDays({ TRIAL_DAYS: "abc" }) === 14 && trialDays({ TRIAL_DAYS: "-3" }) === 14);
+
+  e = computeEntitlements("business", [], {});
+  check("entitlements: business alone = 25 seats / 3 locations / 5000 texts / branding removed", e.seats === 25 && e.locations === 3 && e.monthlyTexts === 5000 && e.brandingRemoved, e);
+  e = computeEntitlements("starter", [], {}, [{ key: "texts_1000", quantity: 3 }]);
+  check("entitlements: paid packs add 1000 texts each on top of the plan", e.monthlyTexts === 3500 && JSON.stringify(e.packs) === JSON.stringify([{ key: "texts_1000", quantity: 3 }]), e);
+  e = computeEntitlements("starter", [], {}, [{ key: "texts_1000", quantity: 99 }]);
+  check("entitlements: packs are clamped to the per-period cap (10)", e.monthlyTexts === 500 + 10 * 1000, e);
+  e = computeEntitlements("starter", [{ key: "texts_1000", quantity: 2 }], {}, [{ key: "texts_1000", quantity: 3 }]);
+  check("entitlements: a legacy recurring texts add-on is still counted, together with paid packs", e.monthlyTexts === 500 + 2000 + 3000, e);
+  e = computeEntitlements(null, [], {}, [{ key: "texts_1000", quantity: 3 }]);
+  check("entitlements: no plan → packs grant nothing", e.monthlyTexts === 0 && e.packs.length === 0, e);
+  e = entitlementsFromItems([{ priceId: "p_p_y", quantity: 1 }, { priceId: "a_seat_y", quantity: 2 }], fenv, [{ key: "texts_1000", quantity: 1 }]);
+  check("entitlementsFromItems: annual pro + 2 annual seats + 1 pack = 12 seats, 3000 texts", e.planKey === "pro" && e.seats === 12 && e.monthlyTexts === 3000, e);
+
+  // pack window / validation
+  const D = (x: string) => new Date(x);
+  check("addMonthsUTC clamps to the last day of a shorter month", addMonthsUTC(D("2027-01-31T10:00:00Z"), 1).toISOString() === "2027-02-28T10:00:00.000Z" && addMonthsUTC(D("2027-11-15T00:00:00Z"), 3).toISOString() === "2028-02-15T00:00:00.000Z");
+  let w = textPackWindow(D("2026-10-01T00:00:00Z"), D("2026-11-01T00:00:00Z"), D("2026-10-20T00:00:00Z"));
+  check("pack window (monthly plan): the whole current period", w.start.toISOString() === "2026-10-01T00:00:00.000Z" && w.end.toISOString() === "2026-11-01T00:00:00.000Z");
+  w = textPackWindow(D("2026-10-01T00:00:00Z"), D("2027-10-01T00:00:00Z"), D("2027-03-20T00:00:00Z"));
+  check("pack window (annual plan): the current month of the year, so the cap is per month, not per year", w.start.toISOString() === "2027-03-01T00:00:00.000Z" && w.end.toISOString() === "2027-04-01T00:00:00.000Z");
+  w = textPackWindow(D("2026-10-01T00:00:00Z"), D("2027-10-01T00:00:00Z"), D("2027-09-30T23:00:00Z"));
+  check("pack window (annual plan, last month): ends at the period end", w.end.toISOString() === "2027-10-01T00:00:00.000Z" && w.start.toISOString() === "2027-09-01T00:00:00.000Z");
+  w = textPackWindow(D("2026-11-10T00:00:00Z"), D("2026-11-24T00:00:00Z"), D("2026-11-12T00:00:00Z"));
+  check("pack window (trial): ends with the trial; the next period starts a fresh window", w.end.toISOString() === "2026-11-24T00:00:00.000Z");
+  check("validateTextPackRequest: ok / unknown pack / 0 / fractional / above the cap", (() => {
+    const ok = validateTextPackRequest("texts_1000", 10, {}), hi = validateTextPackRequest("texts_1000", 11, {}), lo = validateTextPackRequest("texts_1000", 3, { STRIPE_ADDON_MAX_TEXTS_1000: "2" });
+    return ok.ok && ok.texts === 1000 && !validateTextPackRequest("seat", 1, {}).ok && !validateTextPackRequest("texts_1000", 0, {}).ok && !validateTextPackRequest("texts_1000", 1.5, {}).ok && !hi.ok && hi.status === 400 && /maximum of 10/.test(hi.error) && !lo.ok;
+  })());
+
+  // checkout session parameters
+  const cp = checkoutSessionParams({ orgId: "org_1", customer: "cus_1", priceId: "p_p_y", origin: "https://x.test", trialDays: 14 });
+  check("checkout: trial → subscription_data.trial_period_days=14 and payment_method_collection=always, cancel if no card at trial end", cp.subscription_data?.trial_period_days === 14 && cp.payment_method_collection === "always" && cp.subscription_data?.trial_settings?.end_behavior?.missing_payment_method === "cancel" && cp.line_items?.[0].price === "p_p_y" && cp.subscription_data?.metadata?.organizationId === "org_1", cp);
+  const cn = checkoutSessionParams({ orgId: "org_1", customer: "cus_1", priceId: "p_p_m", origin: "https://x.test", trialDays: 0 });
+  check("checkout: no trial → no trial fields, card still collected", cn.subscription_data?.trial_period_days === undefined && cn.subscription_data?.trial_settings === undefined && cn.payment_method_collection === "always");
+
+  // add-ons on an annual subscription use the annual price; missing annual price → 409
+  const annualSub = fakeSub([{ id: "si_plan", price: "p_s_y" }]);
+  const nAnn = calls.length;
+  r = await setAddonQuantity({ stripe: mkStripe(annualSub), subscription: act, addon: "seat", quantity: 2, env: fenv });
+  check("add-on on an annual subscription → the ANNUAL seat price, proration none", r.ok && r.action === "created" && calls.at(-1) === "create a_seat_y x2 proration=none", { r, calls: calls.slice(nAnn) });
+  r = await setAddonQuantity({ stripe: mkStripe(fakeSub([{ id: "si_plan", price: "p_s_m" }])), subscription: act, addon: "location", quantity: 1, env: fenv });
+  check("add-on on a monthly subscription → the MONTHLY location price", r.ok && calls.at(-1) === "create a_loc_m x1 proration=none", { r });
+  const noAnnual = { ...fenv, STRIPE_ADDON_PRICE_SEAT_ANNUAL: "" };
+  const nNo = calls.length;
+  r = await setAddonQuantity({ stripe: mkStripe(annualSub), subscription: act, addon: "seat", quantity: 1, env: noAnnual });
+  check("add-on on an annual subscription with no annual price configured → 409, nothing sent to Stripe", !r.ok && r.status === 409 && /annual/.test(r.error) && calls.length === nNo, r);
+  const annualSeat = fakeSub([{ id: "si_plan", price: "p_s_y" }, { id: "si_seat", price: "a_seat_y", q: 3 }]);
+  const stA = mkStripe(annualSeat);
+  r = await setAddonQuantity({ stripe: stA, subscription: act, addon: "seat", quantity: 1, env: fenv });
+  check("annual seat removal/decrease → still scheduled for period end (next phase), nothing changes now, no refund", r.ok && r.action === "scheduled" && r.currentQuantity === 3 && phaseItemsStr(stA.schedule()!.phases[0]) === "p_s_y×1,a_seat_y×3" && phaseItemsStr(stA.schedule()!.phases[1]) === "p_s_y×1,a_seat_y×1" && !calls.at(-1)!.startsWith("update "), { r });
+  r = await setAddonQuantity({ stripe: mkStripe(baseSub), subscription: act, addon: "texts_1000", quantity: 1, env: { ...fenv, STRIPE_PRICE_STARTER: "price_s" } });
+  check("texts_1000 can no longer be set as a recurring add-on → 400 pointing at text packs", !r.ok && r.status === 400 && /one-time/.test(r.error), r);
+  check("configuredAddons lists seat/location/branding with both intervals, never a text pack", (() => { const c = configuredAddons(fenv); return JSON.stringify(c.map((a) => a.key)) === '["branding","location","seat"]' && c.every((a) => a.prices.month && a.prices.year); })());
+  const legacySc = scheduledChanges(mkSchedule([{ start_date: START, end_date: END, items: [{ price: "p_s_m", quantity: 1 }, { price: "legacy_t", quantity: 2 }] }, { start_date: END, end_date: END + 1, items: [{ price: "p_s_m", quantity: 1 }] }]), { ...fenv, STRIPE_ADDON_LEGACY_PRICE_TEXTS_1000: "legacy_t" });
+  check("legacy recurring texts item: still counted today and shown as going away at renewal", !!legacySc && JSON.stringify(legacySc.addons) === JSON.stringify([{ key: "texts_1000", from: 2, to: 0 }]), legacySc);
 
   // Signature verification, fully offline (dummy key, locally generated header).
   const stripe = new Stripe("sk_test_dummy_offline");

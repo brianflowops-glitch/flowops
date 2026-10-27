@@ -399,6 +399,39 @@ export const subscriptionItem = pgTable(
   (t) => [uniqueIndex("subscription_item_stripe_item_unique").on(t.stripeItemId), index("subscription_item_subscription_idx").on(t.subscriptionId)],
 );
 
+/**
+ * One-time text packs (additive 0009). A row is reserved `pending` before the invoice is charged and only
+ * `paid` rows grant texts (entitlements: plan texts + paid packs whose window contains now). `period_start` /
+ * `period_end` is the monthly text window the pack is valid for (the billing period; for annual subscriptions
+ * the current month inside the year), also the unit of the per-period cap. `stripe_invoice_id` is unique, which
+ * is the dedupe key for invoice.paid / invoice.payment_failed.
+ */
+export const TEXT_PACK_STATUSES = ["pending", "paid", "failed"] as const;
+export type TextPackStatus = (typeof TEXT_PACK_STATUSES)[number];
+export const textPack = pgTable(
+  "text_pack",
+  {
+    id: text("id").primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organization.id, { onDelete: "cascade" }),
+    /** Pack key, e.g. texts_1000. */
+    packKey: text("pack_key").notNull(),
+    textsPerPack: integer("texts_per_pack").notNull(),
+    quantity: integer("quantity").notNull(),
+    stripeInvoiceId: text("stripe_invoice_id"),
+    status: text("status", { enum: TEXT_PACK_STATUSES }).notNull().default("pending"),
+    periodStart: timestamp("period_start", { withTimezone: true }).notNull(),
+    periodEnd: timestamp("period_end", { withTimezone: true }).notNull(),
+    /** What Stripe collected, in the smallest currency unit (set when paid). */
+    amountPaid: integer("amount_paid"),
+    paidAt: timestamp("paid_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("text_pack_stripe_invoice_unique").on(t.stripeInvoiceId), index("text_pack_org_period_idx").on(t.organizationId, t.periodStart)],
+);
+
 /** Processed Stripe webhook events (idempotency: Stripe retries and may deliver an event more than once). */
 export const stripeEvent = pgTable("stripe_event", {
   id: text("id").primaryKey(), // evt_…

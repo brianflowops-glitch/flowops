@@ -7,6 +7,8 @@ import { getDb, getConn, schema } from "../src/lib/db";
 import { processStripeEvent, type SubscriptionFetcher } from "../src/lib/billing/webhook";
 import { getBillingAccess, requireBillingAccess } from "../src/lib/billing/access";
 import { getEntitlements } from "../src/lib/billing/org-entitlements";
+import { purchaseTextPack, type PackStripe } from "../src/lib/billing/text-packs";
+import { trialEligibility } from "../src/lib/billing/checkout";
 import { subscriptionFields } from "../src/lib/billing/webhook";
 import { DEMO_ORG_ID, defaultHours } from "../src/lib/tenancy/defaults";
 
@@ -48,6 +50,16 @@ const ev = (type: string, object: unknown, created = T0) =>
   ({ id: `evt_${n}_${++evtSeq}`, type, object: "event", created, data: { object } }) as unknown as Stripe.Event;
 const run = (e: Stripe.Event) => processStripeEvent(e, { fetchSubscription });
 const row = async (id: string) => (await getDb().select().from(schema.subscription).where(eq(schema.subscription.stripeSubscriptionId, id)))[0];
+
+const expectUnique = async (db: ReturnType<typeof getDb>, invoiceId: string) => {
+  let threw = false;
+  try {
+    await db.insert(schema.textPack).values({ id: `tp_dup_${invoiceId}`, organizationId: DEMO_ORG_ID, packKey: "texts_1000", textsPerPack: 1000, quantity: 1, status: "pending", stripeInvoiceId: invoiceId, periodStart: new Date(), periodEnd: new Date() });
+  } catch {
+    threw = true;
+  }
+  check("text_pack: stripe_invoice_id is unique (one pack per invoice)", threw);
+};
 
 (async () => {
   const db = getDb();
@@ -198,7 +210,7 @@ const row = async (id: string) => (await getDb().select().from(schema.subscripti
   const envPrev = { ...process.env };
   Object.assign(process.env, {
     STRIPE_PRICE_STARTER: "price_t_starter", STRIPE_PRICE_PRO: "price_t_pro",
-    STRIPE_ADDON_PRICE_SEAT: "price_t_seat", STRIPE_ADDON_PRICE_LOCATION: "price_t_loc", STRIPE_ADDON_PRICE_TEXTS_1000: "price_t_t1k", STRIPE_ADDON_PRICE_BRANDING: "price_t_brand",
+    STRIPE_ADDON_PRICE_SEAT: "price_t_seat", STRIPE_ADDON_PRICE_LOCATION: "price_t_loc", STRIPE_ADDON_LEGACY_PRICE_TEXTS_1000: "price_t_t1k", STRIPE_ADDON_PRICE_TEXTS_1000: "price_t_pack", STRIPE_ADDON_PRICE_BRANDING: "price_t_brand",
   });
   delete process.env.PLAN_LIMITS_STARTER;
   delete process.env.PLAN_LIMITS_PRO;
@@ -302,17 +314,195 @@ const row = async (id: string) => (await getDb().select().from(schema.subscripti
   r = await ent();
   check("add-on caps: lowering the mirrored quantity below the cap grants exactly that (12 seats)", r.enforced && r.entitlements.seats === 12 && r.entitlements.monthlyTexts === 2000, plain(r));
 
+  // ── one-time text packs (docs/BILLING.md §11): paid-only grants, cap per period, trial, webhook settlement ──
+  // State here: pro + 2 seats, active → 12 seats / 2000 texts. Stripe is a stateful fake.
+  {
+    const nowD = new Date();
+    const nowS = Math.floor(nowD.getTime() / 1000);
+    let packSeq = 0;
+    type FInv = { id: string; status: string; amount_paid: number; currency: string; params: Stripe.InvoiceCreateParams; items: Stripe.InvoiceItemCreateParams[] };
+    const mkPackStripe = (o: { decline?: boolean; pm?: string | null; customerPm?: string | null; trialing?: boolean; failAfterCharge?: boolean } = {}) => {
+      const invs = new Map<string, FInv>();
+      const log: string[] = [];
+      const subObj = { id: SA, status: o.trialing ? "trialing" : "active", default_payment_method: o.pm === undefined ? "pm_card" : o.pm, items: { data: [{ id: "si_plan2", current_period_start: nowS - 10 * 86400, current_period_end: nowS + 20 * 86400 }] } } as unknown as Stripe.Subscription;
+      const stripe: PackStripe = {
+        subscriptions: { retrieve: async () => subObj },
+        customers: { retrieve: async () => ({ id: "cus_x", invoice_settings: { default_payment_method: o.customerPm ?? null } }) as unknown as Stripe.Customer },
+        invoices: {
+          create: async (params) => { const id = `in_pack_${n}_${++packSeq}`; invs.set(id, { id, status: "draft", amount_paid: 0, currency: "usd", params, items: [] }); log.push("invoice.create"); return { id, status: "draft" } as Stripe.Invoice; },
+          finalizeInvoice: async (id) => { invs.get(id)!.status = "open"; log.push("finalize"); return { id, status: "open" } as Stripe.Invoice; },
+          pay: async (id, p) => {
+            log.push(`pay ${p?.payment_method}`);
+            const inv = invs.get(id)!;
+            if (o.decline) throw Object.assign(new Error("Your card was declined."), { type: "StripeCardError", rawType: "card_error", code: "card_declined" });
+            inv.status = "paid"; inv.amount_paid = 1500 * Number((inv.params.metadata as Record<string, string>).quantity);
+            if (o.failAfterCharge) throw new Error("socket hang up after the charge");
+            return { id, status: "paid", amount_paid: inv.amount_paid, currency: "usd" } as Stripe.Invoice;
+          },
+          retrieve: async (id) => ({ ...invs.get(id)! }) as unknown as Stripe.Invoice,
+          voidInvoice: async (id) => { invs.get(id)!.status = "void"; log.push("void"); return {} as Stripe.Invoice; },
+          del: async (id) => { invs.get(id)!.status = "deleted"; log.push("delete"); return {}; },
+        },
+        invoiceItems: { create: async (p) => { const inv = [...invs.values()].find((i) => i.id === p.invoice)!; inv.items.push(p); log.push("item"); return {} as Stripe.InvoiceItem; } },
+      };
+      return { stripe, invs, log };
+    };
+    const buy = (fake: ReturnType<typeof mkPackStripe>, quantity: number, subStatus = "active", pack = "texts_1000") =>
+      purchaseTextPack({ stripe: fake.stripe, db, orgId: AORG, customerId: "cus_x", subscription: { id: SA, status: subStatus as Stripe.Subscription.Status }, pack, quantity, now: nowD });
+    const packRows = async () => (await db.select().from(schema.textPack).where(eq(schema.textPack.organizationId, AORG))).map((x) => `${x.status}:${x.quantity}`).sort();
+    const texts = async () => { const x = await ent(); return x.enforced ? x.entitlements.monthlyTexts : -1; };
+
+    check("packs: before any purchase → plan texts only (2000)", (await texts()) === 2000);
+
+    // paid → granted
+    let f = mkPackStripe();
+    let pr = await buy(f, 2);
+    const inv1 = [...f.invs.values()][0];
+    check("pack paid: ok, texts 2000, charged in full as its own invoice (one item, price_t_pack × 2), paid with the card on file, auto_advance off", pr.ok && pr.texts === 2000 && pr.amountPaid === 3000 && inv1.items.length === 1 && inv1.items[0].quantity === 2 && JSON.stringify(inv1.items[0].pricing) === JSON.stringify({ price: "price_t_pack" }) && inv1.params.auto_advance === false && inv1.params.collection_method === "charge_automatically" && f.log.join(",") === "invoice.create,item,finalize,pay pm_card", { pr, log: f.log });
+    check("pack paid: row is paid, entitlements = plan 2000 + 2000", JSON.stringify(await packRows()) === '["paid:2"]' && (await texts()) === 4000, await packRows());
+    check("pack paid: the result says it expires at the end of the current period", pr.ok && pr.validUntil === new Date((nowS + 20 * 86400) * 1000).toISOString() && !pr.duringTrial, pr);
+
+    // declined card → nothing granted, invoice voided, no pending/active pack left
+    f = mkPackStripe({ decline: true });
+    pr = await buy(f, 3);
+    const invD = [...f.invs.values()][0];
+    check("pack declined: 402 payment_failed pointing at the portal, nothing charged", !pr.ok && pr.status === 402 && pr.code === "payment_failed" && pr.portal === true, pr);
+    check("pack declined: the unpaid invoice is VOIDED (cannot be paid later)", invD.status === "void" && f.log.includes("void"), { st: invD.status, log: f.log });
+    check("pack declined: row failed, no pending pack, entitlements unchanged (4000)", JSON.stringify(await packRows()) === '["failed:3","paid:2"]' && (await texts()) === 4000, await packRows());
+    // a declined attempt does not use up the cap
+    f = mkPackStripe();
+    pr = await buy(f, 8);
+    check("pack cap: a failed attempt doesn't count; 2 + 8 = 10 is allowed", pr.ok && (await texts()) === 2000 + 10000, { pr, t: await texts() });
+    f = mkPackStripe();
+    pr = await buy(f, 1);
+    check("pack cap: the 11th pack in the period → 400 with a clear message, nothing created in Stripe", !pr.ok && pr.status === 400 && pr.code === "cap" && /At most 10/.test(pr.error) && f.log.length === 0, { pr, log: f.log });
+    pr = await buy(mkPackStripe(), 11);
+    check("pack cap: quantity above the cap in one request → 400", !pr.ok && pr.status === 400, pr);
+    check("pack cap: rows after all that", JSON.stringify(await packRows()) === '["failed:3","paid:2","paid:8"]', await packRows());
+    await db.delete(schema.textPack).where(eq(schema.textPack.organizationId, AORG));
+    check("packs gone → back to 2000", (await texts()) === 2000);
+
+    // concurrent purchases can't both slip under the cap
+    const fa = mkPackStripe(), fb = mkPackStripe();
+    const [ra, rb] = await Promise.all([buy(fa, 6), buy(fb, 6)]);
+    check("pack cap: two simultaneous 6-pack purchases → exactly one succeeds", [ra, rb].filter((x) => x.ok).length === 1 && [ra, rb].filter((x) => !x.ok && x.code === "cap").length === 1, { ra, rb });
+    await db.delete(schema.textPack).where(eq(schema.textPack.organizationId, AORG));
+
+    // no payment method → 402, nothing created
+    f = mkPackStripe({ pm: null, customerPm: null });
+    pr = await buy(f, 1);
+    check("pack without a payment method → 402 no_payment_method (portal), no Stripe invoice, no row", !pr.ok && pr.status === 402 && pr.code === "no_payment_method" && f.log.length === 0 && (await packRows()).length === 0, { pr, log: f.log });
+    f = mkPackStripe({ pm: null, customerPm: "pm_cust" });
+    pr = await buy(f, 1);
+    check("pack: falls back to the customer's default payment method", pr.ok && f.log.includes("pay pm_cust"), { pr, log: f.log });
+    await db.delete(schema.textPack).where(eq(schema.textPack.organizationId, AORG));
+
+    // trial: charged in full immediately, never free or deferred
+    f = mkPackStripe({ trialing: true });
+    pr = await buy(f, 1, "trialing");
+    check("pack during a trial: charged in full NOW on its own invoice (paid before granting), duringTrial flagged", pr.ok && pr.amountPaid === 1500 && pr.duringTrial && [...f.invs.values()][0].status === "paid" && f.log.at(-1)!.startsWith("pay "), { pr, log: f.log });
+    f = mkPackStripe({ trialing: true, pm: null });
+    pr = await buy(f, 1, "trialing");
+    check("pack during a trial without a payment method → 402, nothing granted", !pr.ok && pr.status === 402 && pr.code === "no_payment_method", pr);
+    await db.delete(schema.textPack).where(eq(schema.textPack.organizationId, AORG));
+
+    // not an active subscription
+    for (const st of ["past_due", "canceled", "unpaid", "incomplete", "paused"]) {
+      pr = await buy(mkPackStripe(), 1, st);
+      check(`pack on a ${st} subscription → 409, nothing created`, !pr.ok && pr.status === 409 && (await packRows()).length === 0, pr);
+    }
+    pr = await buy(mkPackStripe(), 1, "active", "seat");
+    check("pack: an unknown pack key (seat) → 400", !pr.ok && pr.status === 400, pr);
+
+    // timeout after Stripe actually collected → we see it's paid and grant (no double charge, no missing texts)
+    f = mkPackStripe({ failAfterCharge: true });
+    pr = await buy(f, 1);
+    check("pack: network error after the charge went through → reconciled as paid and granted", pr.ok && (await packRows()).join() === "paid:1" && (await texts()) === 3000, { pr, rows: await packRows() });
+    await db.delete(schema.textPack).where(eq(schema.textPack.organizationId, AORG));
+
+    // grants only for paid rows inside their window
+    const win = (a: number, b: number) => ({ periodStart: new Date(nowD.getTime() + a * 86400000), periodEnd: new Date(nowD.getTime() + b * 86400000) });
+    const mkRow = (id: string, status: string, a: number, b: number, extra: Record<string, unknown> = {}) => db.insert(schema.textPack).values({ id, organizationId: AORG, packKey: "texts_1000", textsPerPack: 1000, quantity: 1, status, ...win(a, b), ...extra } as typeof schema.textPack.$inferInsert);
+    await mkRow(`tp_a_${n}`, "pending", -1, 20, { stripeInvoiceId: `in_pend_${n}` });
+    await mkRow(`tp_b_${n}`, "failed", -1, 20);
+    await mkRow(`tp_c_${n}`, "paid", -40, -10); // an earlier period
+    await mkRow(`tp_d_${n}`, "paid", 10, 40); // a later window
+    check("entitlements: pending, failed, expired and future-window packs grant nothing", (await texts()) === 2000, await texts());
+    await mkRow(`tp_e_${n}`, "paid", -1, 20);
+    check("entitlements: a paid pack inside its window grants 1000", (await texts()) === 3000, await texts());
+
+    // webhook settlement (the pending row above has invoice in_pend_<n>)
+    const pend = { id: `in_pend_${n}`, amount_paid: 1500, metadata: { flowops_text_pack: `tp_a_${n}` } };
+    const wf0 = fetches;
+    let wr = await run(ev("invoice.paid", pend, AT + 100));
+    check("webhook invoice.paid on a pack invoice → pack paid (no subscription fetch)", wr.status === "processed" && fetches === wf0 && (await texts()) === 4000, { wr, t: await texts() });
+    const evd = ev("invoice.paid", pend, AT + 101);
+    await run(evd);
+    wr = await run(evd);
+    check("webhook: duplicate pack event deduped; replays don't double-grant", wr.status === "duplicate" && (await texts()) === 4000, wr);
+    await run(ev("invoice.payment_failed", pend, AT + 102));
+    check("webhook: a late payment_failed never downgrades a paid pack", (await texts()) === 4000, await texts());
+    await mkRow(`tp_f_${n}`, "pending", -1, 20, { stripeInvoiceId: `in_fail_${n}` });
+    await run(ev("invoice.payment_failed", { id: `in_fail_${n}`, metadata: { flowops_text_pack: `tp_f_${n}` } }, AT + 103));
+    const [ff] = await db.select().from(schema.textPack).where(eq(schema.textPack.id, `tp_f_${n}`));
+    check("webhook invoice.payment_failed on a pack → pack failed, nothing granted", ff?.status === "failed" && (await texts()) === 4000, ff);
+    await mkRow(`tp_g_${n}`, "pending", -1, 20, { stripeInvoiceId: `in_unpaid_${n}` });
+    await run(ev("invoice.paid", { id: `in_unpaid_${n}`, amount_paid: 1500, metadata: { flowops_text_pack: `tp_g_${n}` } }, AT + 104));
+    await run(ev("invoice.payment_failed", { id: `in_unpaid_${n}`, metadata: { flowops_text_pack: `tp_g_${n}` } }, AT + 105));
+    check("webhook: a pack that was marked failed but Stripe later reports paid is recovered", (await texts()) === 5000, await texts());
+    await expectUnique(db, `in_pend_${n}`);
+    await db.delete(schema.textPack).where(eq(schema.textPack.organizationId, AORG));
+
+    // legacy recurring texts item is still counted
+    stripeState.set(SA, asub("active", [{ id: "si_plan2", price: "price_t_pro" }, { id: "si_seat", price: "price_t_seat", q: 2 }, { id: "si_t", price: "price_t_t1k", q: 2 }]));
+    await run(ev("customer.subscription.updated", asub("active", []), AT + 110));
+    check("legacy recurring texts add-on: still counted (+2000) alongside a paid pack", (await mkRow(`tp_h_${n}`, "paid", -1, 20), await texts()) === 5000, await texts());
+    await db.delete(schema.textPack).where(eq(schema.textPack.organizationId, AORG));
+    stripeState.set(SA, asub("active", [{ id: "si_plan2", price: "price_t_pro" }, { id: "si_seat", price: "price_t_seat", q: 2 }]));
+    await run(ev("customer.subscription.updated", asub("active", []), AT + 111));
+
+    // annual plan mapping (webhook + entitlements)
+    process.env.STRIPE_PRICE_PRO_ANNUAL = "price_t_pro_y";
+    process.env.STRIPE_ADDON_PRICE_SEAT_ANNUAL = "price_t_seat_y";
+    stripeState.set(SA, asub("active", [{ id: "si_plan_y", price: "price_t_pro_y" }, { id: "si_seat_y", price: "price_t_seat_y", q: 3 }]));
+    await run(ev("customer.subscription.updated", asub("active", []), AT + 120));
+    s = await row(SA);
+    r = await ent();
+    check("annual subscription: webhook mirrors the annual plan price; entitlements = pro + 3 annual seats = 13 / 1 / 2000 / branding", s?.priceId === "price_t_pro_y" && JSON.stringify(plain(r)) === JSON.stringify({ reason: "ok", seats: 13, locations: 1, texts: 2000, branding: true, plan: "pro" }), { s: s?.priceId, p: plain(r) });
+    stripeState.set(SA, asub("active", [{ id: "si_plan2", price: "price_t_pro" }, { id: "si_seat", price: "price_t_seat", q: 2 }]));
+    await run(ev("customer.subscription.updated", asub("active", []), AT + 121));
+    delete process.env.STRIPE_PRICE_PRO_ANNUAL;
+    delete process.env.STRIPE_ADDON_PRICE_SEAT_ANNUAL;
+  }
+
+  // ── one free trial per organization ──
+  {
+    const TORG = `org_trial_${n}`;
+    await db.insert(schema.organization).values({ id: TORG, slug: `trial-${n}`, name: "Trial test", hours: defaultHours() });
+    const subs: { status: string }[] = [];
+    const fs = { subscriptions: { list: async () => ({ data: subs }) } };
+    check("trial: a brand-new org (no subscription anywhere) is eligible", (await trialEligibility(TORG, "cus_t", { db, stripe: fs })).eligible === true);
+    subs.push({ status: "incomplete_expired" });
+    check("trial: an abandoned first payment (incomplete_expired) doesn't use the trial up", (await trialEligibility(TORG, "cus_t", { db, stripe: fs })).eligible === true);
+    subs.push({ status: "canceled" });
+    check("trial: a cancelled subscription in STRIPE (mirror empty / lagging) → no trial", (await trialEligibility(TORG, "cus_t", { db, stripe: fs })).eligible === false);
+    subs.length = 0;
+    await db.insert(schema.subscription).values({ id: `sr_${n}`, organizationId: TORG, stripeSubscriptionId: `sub_t_${n}`, status: "canceled", priceId: "price_t_starter" } as typeof schema.subscription.$inferInsert);
+    check("trial: a cancelled subscription in OUR mirror (Stripe list empty) → no trial", (await trialEligibility(TORG, "cus_t", { db, stripe: fs })).eligible === false);
+    await db.delete(schema.organization).where(eq(schema.organization.id, TORG));
+  }
+
   // Failed card: locked org → zero entitlements (the lock already blocks it).
   stripeState.set(SA, asub("past_due", [{ id: "si_plan2", price: "price_t_pro" }, { id: "si_seat", price: "price_t_seat", q: 5 }]));
-  await run(ev("invoice.payment_failed", { id: "in_pf2", parent: { subscription_details: { subscription: SA } } }, AT + 40));
+  await run(ev("invoice.payment_failed", { id: "in_pf2", parent: { subscription_details: { subscription: SA } } }, AT + 200));
   r = await ent();
   check("entitlements: past_due → enforced with zero limits (reason not_active)", r.enforced && r.reason === "not_active" && r.entitlements.seats === 0, r);
 
   // Canceled is terminal: later events do not touch items.
   stripeState.set(SA, asub("canceled", [{ id: "si_plan2", price: "price_t_pro" }]));
-  await run(ev("customer.subscription.deleted", asub("canceled", []), AT + 50));
+  await run(ev("customer.subscription.deleted", asub("canceled", []), AT + 210));
   stripeState.set(SA, asub("active", [{ id: "si_plan3", price: "price_t_starter" }]));
-  const zomb = await run(ev("customer.subscription.updated", asub("active", []), AT + 60));
+  const zomb = await run(ev("customer.subscription.updated", asub("active", []), AT + 220));
   check("webhook: canceled subscription's items are not rewritten by a later event", zomb.status === "stale" && !(await items()).some((x) => x.startsWith("si_plan3")), { zomb, items: await items() });
   const [subRow] = await db.select().from(schema.subscription).where(eq(schema.subscription.stripeSubscriptionId, SA));
   await db.delete(schema.organization).where(eq(schema.organization.id, AORG));

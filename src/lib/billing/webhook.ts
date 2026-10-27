@@ -4,6 +4,7 @@ import { and, eq, notInArray, sql } from "drizzle-orm";
 import { getDb, schema, type Db } from "@/lib/db";
 import { normalizeStatus } from "./status";
 import { classifyItems } from "./entitlements";
+import { markPackFailed, markPackPaid } from "./text-packs";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
@@ -91,6 +92,16 @@ export async function processStripeEvent(event: Stripe.Event, opts: ProcessOptio
     if (event.type === "checkout.session.completed") {
       await onCheckoutCompleted(tx, event.data.object);
       return result("processed");
+    }
+    // A one-time text-pack invoice (metadata set by purchaseTextPack): settle the pack row, nothing else.
+    // Idempotent on top of the event-id dedupe: paid only moves pending/failed → paid, failed only pending → failed.
+    if (event.type === "invoice.paid" || event.type === "invoice.payment_failed") {
+      const inv = event.data.object as Stripe.Invoice;
+      if (inv.metadata?.flowops_text_pack) {
+        if (event.type === "invoice.paid") await markPackPaid(tx, inv.id as string, inv.amount_paid ?? null);
+        else await markPackFailed(tx, { invoiceId: inv.id as string });
+        return result("processed");
+      }
     }
     // invoice.* : status (active / past_due) is written from the fetched subscription.
     // Owner emails / account locking on failure are a founder decision (docs/BILLING.md → Failed payments)
