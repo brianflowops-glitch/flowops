@@ -1,7 +1,7 @@
 import { connection } from "next/server";
 import { createHash } from "node:crypto";
 import { convertToModelMessages, safeValidateUIMessages, stepCountIs, streamText, type UIMessage } from "ai";
-import { requireApi } from "@/lib/server/context";
+import { getContext, requireApi } from "@/lib/server/context";
 import { assistantTools } from "@/lib/server/assistant-tools";
 import { listServices, orgToday } from "@/lib/server/pipeline";
 import { AI_MESSAGES, friendlyAiError } from "@/lib/server/ai-errors";
@@ -24,7 +24,9 @@ function config() {
 export async function GET() {
   await connection();
   const { configured, model } = config();
-  return Response.json(configured ? { configured: true, model } : { configured: false });
+  // Only signed-in users see which model is used; anonymous callers just learn whether FlowAI is on.
+  const ctx = await getContext().catch(() => null);
+  return Response.json(configured ? (ctx ? { configured: true, model } : { configured: true }) : { configured: false });
 }
 
 const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
