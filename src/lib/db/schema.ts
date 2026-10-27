@@ -377,6 +377,28 @@ export const subscription = pgTable(
   (t) => [uniqueIndex("subscription_stripe_subscription_unique").on(t.stripeSubscriptionId), index("subscription_org_idx").on(t.organizationId)],
 );
 
+/**
+ * Line items of a mirrored Stripe subscription (v2.5, additive 0008): the plan item and any add-ons.
+ * Rewritten wholesale from the fetched subscription by the same guarded write as `subscription`, so
+ * ordering/dedupe are inherited. Whether an item is the plan or an add-on is derived at read time
+ * from price id ↔ env config (STRIPE_PRICE_* / STRIPE_ADDON_PRICE_*), like subscription.price_id.
+ */
+export const subscriptionItem = pgTable(
+  "subscription_item",
+  {
+    id: text("id").primaryKey(),
+    subscriptionId: text("subscription_id")
+      .notNull()
+      .references(() => subscription.id, { onDelete: "cascade" }),
+    stripeItemId: text("stripe_item_id").notNull(),
+    priceId: text("price_id"),
+    quantity: integer("quantity").notNull().default(1),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("subscription_item_stripe_item_unique").on(t.stripeItemId), index("subscription_item_subscription_idx").on(t.subscriptionId)],
+);
+
 /** Processed Stripe webhook events (idempotency: Stripe retries and may deliver an event more than once). */
 export const stripeEvent = pgTable("stripe_event", {
   id: text("id").primaryKey(), // evt_…

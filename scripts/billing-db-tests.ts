@@ -2,10 +2,12 @@
 //   DATABASE_URL=postgres://…/scratch npm run test:billing:db
 // Requires migrations applied to that database (npm run db:migrate) — uses the demo org.
 import type Stripe from "stripe";
-import { eq } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import { getDb, getConn, schema } from "../src/lib/db";
 import { processStripeEvent, type SubscriptionFetcher } from "../src/lib/billing/webhook";
 import { getBillingAccess, requireBillingAccess } from "../src/lib/billing/access";
+import { getEntitlements } from "../src/lib/billing/org-entitlements";
+import { subscriptionFields } from "../src/lib/billing/webhook";
 import { DEMO_ORG_ID, defaultHours } from "../src/lib/tenancy/defaults";
 
 if (/neon\.tech|vercel|amazonaws/.test(process.env.DATABASE_URL ?? "")) throw new Error("Refusing to run against a hosted database");
@@ -27,7 +29,7 @@ const sub = (id: string, status: string, extra: Record<string, unknown> = {}) =>
     status,
     cancel_at_period_end: false,
     metadata: {},
-    items: { data: [{ price: { id: "price_test_x" }, current_period_end: 1800000000 }] },
+    items: { data: [{ id: `si_${id}`, price: { id: "price_test_x" }, current_period_end: 1800000000 }] },
     ...extra,
   }) as unknown as Stripe.Subscription;
 
@@ -191,6 +193,120 @@ const row = async (id: string) => (await getDb().select().from(schema.subscripti
   if (prevFlag === undefined) delete process.env.BILLING_ENABLED;
   else process.env.BILLING_ENABLED = prevFlag;
   await db.delete(schema.organization).where(eq(schema.organization.id, ORG)); // test org only (cascades its subscription rows)
+
+  // ── add-ons: plan item by price id, item mirroring, entitlements (docs/BILLING.md §11) ──
+  const envPrev = { ...process.env };
+  Object.assign(process.env, {
+    STRIPE_PRICE_STARTER: "price_t_starter", STRIPE_PRICE_PRO: "price_t_pro",
+    STRIPE_ADDON_PRICE_SEAT: "price_t_seat", STRIPE_ADDON_PRICE_LOCATION: "price_t_loc", STRIPE_ADDON_PRICE_TEXTS_1000: "price_t_t1k", STRIPE_ADDON_PRICE_BRANDING: "price_t_brand",
+  });
+  delete process.env.PLAN_LIMITS_STARTER;
+  delete process.env.PLAN_LIMITS_PRO;
+  const AORG = `org_addon_${n}`;
+  await db.insert(schema.organization).values({ id: AORG, slug: `addon-${n}`, name: "Add-on test", hours: defaultHours() });
+  const SA = `sub_addon_${n}`;
+  type It = { id: string; price: string; q?: number };
+  const asub = (status: string, items: It[], extra: Record<string, unknown> = {}) =>
+    ({
+      id: SA, object: "subscription", customer: `cus_addon_${n}`, status, cancel_at_period_end: false, metadata: { organizationId: AORG },
+      items: { data: items.map((i) => ({ id: i.id, price: { id: i.price }, quantity: i.q ?? 1, current_period_end: 1800000000 })), has_more: false }, ...extra,
+    }) as unknown as Stripe.Subscription;
+  const items = async () => {
+    const [sr] = await db.select().from(schema.subscription).where(eq(schema.subscription.stripeSubscriptionId, SA));
+    return sr ? (await db.select().from(schema.subscriptionItem).where(eq(schema.subscriptionItem.subscriptionId, sr.id)).orderBy(asc(schema.subscriptionItem.stripeItemId))).map((i) => `${i.stripeItemId}:${i.priceId}:${i.quantity}`) : [];
+  };
+  const ent = async (e: Record<string, string> = { BILLING_ENABLED: "true" }) => getEntitlements(AORG, { env: { ...process.env, ...e } });
+  const plain = (r: Awaited<ReturnType<typeof ent>>) => (r.enforced ? { reason: r.reason, seats: r.entitlements.seats, locations: r.entitlements.locations, texts: r.entitlements.monthlyTexts, branding: r.entitlements.brandingRemoved, plan: r.entitlements.planKey } : r);
+  const AT = T0 + 1000;
+  const ae = ev;
+
+  let r = await ent();
+  check("entitlements: no subscription → enforced, all zero", r.enforced && r.reason === "no_subscription" && r.entitlements.seats === 0 && r.entitlements.monthlyTexts === 0, r);
+
+  // Add-on item listed FIRST: the plan must still be identified by price id (not items[0]).
+  stripeState.set(SA, asub("active", [{ id: "si_seat", price: "price_t_seat", q: 2 }, { id: "si_plan", price: "price_t_starter" }]));
+  await run(ae("customer.subscription.created", asub("active", []), AT));
+  s = await row(SA);
+  check("webhook: subscription.price_id is the PLAN price even when an add-on is items[0]", s?.priceId === "price_t_starter", s);
+  check("webhook: all items mirrored with quantities", JSON.stringify(await items()) === JSON.stringify(["si_plan:price_t_starter:1", "si_seat:price_t_seat:2"]), await items());
+  check("subscriptionFields: plan item's price from env mapping", subscriptionFields(asub("active", [{ id: "a", price: "price_t_loc" }, { id: "b", price: "price_t_pro" }])).priceId === "price_t_pro");
+  r = await ent();
+  check("entitlements: starter + 2 seats = 5 seats / 1 location / 500 texts", JSON.stringify(plain(r)) === JSON.stringify({ reason: "ok", seats: 5, locations: 1, texts: 500, branding: false, plan: "starter" }), plain(r));
+  check("entitlements: billing off → not enforced", JSON.stringify(await ent({})) === JSON.stringify({ enforced: false, reason: "billing_disabled" }));
+  check("entitlements: exempt org → not enforced", JSON.stringify(await ent({ BILLING_ENABLED: "true", BILLING_EXEMPT_ORG_IDS: AORG })) === JSON.stringify({ enforced: false, reason: "exempt" }));
+  const ov = await ent({ BILLING_ENABLED: "true", PLAN_LIMITS_STARTER: "seats=4" });
+  check("entitlements: PLAN_LIMITS_STARTER override applies (4 + 2 seats)", ov.enforced && ov.entitlements.seats === 6, ov);
+
+  const dupAdd = ae("customer.subscription.updated", asub("active", []), AT + 10);
+  stripeState.set(SA, asub("active", [{ id: "si_plan", price: "price_t_starter" }, { id: "si_seat", price: "price_t_seat", q: 3 }, { id: "si_t", price: "price_t_t1k", q: 2 }, { id: "si_b", price: "price_t_brand" }]));
+  await run(dupAdd);
+  check("webhook: quantity change + new add-ons mirrored", JSON.stringify(await items()) === JSON.stringify(["si_b:price_t_brand:1", "si_plan:price_t_starter:1", "si_seat:price_t_seat:3", "si_t:price_t_t1k:2"]), await items());
+  r = await ent();
+  check("entitlements: starter + 3 seats + 2×1000 texts + branding = 6/1/2500/branding", JSON.stringify(plain(r)) === JSON.stringify({ reason: "ok", seats: 6, locations: 1, texts: 2500, branding: true, plan: "starter" }), plain(r));
+  const before2 = fetches;
+  const dd = await run(dupAdd);
+  check("webhook: duplicate add-on event skipped (no Stripe call, items unchanged)", dd.status === "duplicate" && fetches === before2 && (await items()).length === 4);
+
+  // Out of order: a late OLDER event must not rewrite items, even if Stripe's read were stale.
+  stripeState.set(SA, asub("active", [{ id: "si_plan", price: "price_t_starter" }]));
+  const lateOld = await run(ae("customer.subscription.updated", asub("active", []), AT + 5));
+  check("webhook: late older event is stale and leaves add-on items untouched", lateOld.status === "stale" && (await items()).length === 4, { lateOld, items: await items() });
+
+  // Removal prunes; newer event wins.
+  const rm = await run(ae("customer.subscription.updated", asub("active", []), AT + 20));
+  check("webhook: removed add-on items are pruned", rm.status === "processed" && JSON.stringify(await items()) === JSON.stringify(["si_plan:price_t_starter:1"]), await items());
+  r = await ent();
+  check("entitlements: back to plain starter after removal", JSON.stringify(plain(r)) === JSON.stringify({ reason: "ok", seats: 3, locations: 1, texts: 500, branding: false, plan: "starter" }), plain(r));
+
+  // Same-second tie: fetched state wins (existing rule) and items follow it.
+  stripeState.set(SA, asub("active", [{ id: "si_plan", price: "price_t_starter" }, { id: "si_loc", price: "price_t_loc", q: 1 }]));
+  const tie2 = await run(ev("invoice.paid", { id: "in_tie2", parent: { subscription_details: { subscription: SA } } }, AT + 20));
+  check("webhook: same-second tie → fetched items win", tie2.status === "processed" && JSON.stringify(await items()) === JSON.stringify(["si_loc:price_t_loc:1", "si_plan:price_t_starter:1"]), { tie2, items: await items() });
+
+  // has_more: never prune from a truncated list.
+  const trunc = asub("active", [{ id: "si_plan", price: "price_t_starter" }]);
+  (trunc.items as { has_more: boolean }).has_more = true;
+  stripeState.set(SA, trunc);
+  await run(ev("customer.subscription.updated", trunc, AT + 25));
+  check("webhook: truncated item list (has_more) does not prune existing items", (await items()).length === 2, await items());
+
+  // Plan change (Starter → Pro) keeps add-ons; entitlements follow.
+  stripeState.set(SA, asub("active", [{ id: "si_plan2", price: "price_t_pro" }, { id: "si_seat", price: "price_t_seat", q: 5 }]));
+  await run(ev("customer.subscription.updated", asub("active", []), AT + 30));
+  s = await row(SA);
+  r = await ent();
+  check("webhook: plan swap → price_id = pro, items replaced", s?.priceId === "price_t_pro" && JSON.stringify(await items()) === JSON.stringify(["si_plan2:price_t_pro:1", "si_seat:price_t_seat:5"]), { s, items: await items() });
+  check("entitlements: pro + 5 seats = 15 / 1 / 2000 / branding", JSON.stringify(plain(r)) === JSON.stringify({ reason: "ok", seats: 15, locations: 1, texts: 2000, branding: true, plan: "pro" }), plain(r));
+
+  // A decrease scheduled for the renewal (subscription schedule attached, next phase lower): the mirror and the
+  // entitlements keep the CURRENT quantity until the renewal event delivers the new items.
+  stripeState.set(SA, asub("active", [{ id: "si_plan2", price: "price_t_pro" }, { id: "si_seat", price: "price_t_seat", q: 5 }, { id: "si_t", price: "price_t_t1k", q: 2 }], { schedule: "sub_sched_test" }));
+  const schedEv = await run(ev("customer.subscription.updated", asub("active", []), AT + 32));
+  r = await ent();
+  check("scheduled decrease: schedule attached, items unchanged → entitlements still 15 seats / 4000 texts", schedEv.status === "processed" && JSON.stringify(plain(r)) === JSON.stringify({ reason: "ok", seats: 15, locations: 1, texts: 4000, branding: true, plan: "pro" }), plain(r));
+  stripeState.set(SA, asub("active", [{ id: "si_plan2", price: "price_t_pro" }, { id: "si_seat", price: "price_t_seat", q: 2 }]));
+  await run(ev("customer.subscription.updated", asub("active", []), AT + 34));
+  r = await ent();
+  check("renewal event applies the scheduled decrease: seat 5 → 2 and the texts bundle pruned → 12 seats / 2000 texts", JSON.stringify(await items()) === JSON.stringify(["si_plan2:price_t_pro:1", "si_seat:price_t_seat:2"]) && JSON.stringify(plain(r)) === JSON.stringify({ reason: "ok", seats: 12, locations: 1, texts: 2000, branding: true, plan: "pro" }), { items: await items(), r: plain(r) });
+
+  // Failed card: locked org → zero entitlements (the lock already blocks it).
+  stripeState.set(SA, asub("past_due", [{ id: "si_plan2", price: "price_t_pro" }, { id: "si_seat", price: "price_t_seat", q: 5 }]));
+  await run(ev("invoice.payment_failed", { id: "in_pf2", parent: { subscription_details: { subscription: SA } } }, AT + 40));
+  r = await ent();
+  check("entitlements: past_due → enforced with zero limits (reason not_active)", r.enforced && r.reason === "not_active" && r.entitlements.seats === 0, r);
+
+  // Canceled is terminal: later events do not touch items.
+  stripeState.set(SA, asub("canceled", [{ id: "si_plan2", price: "price_t_pro" }]));
+  await run(ev("customer.subscription.deleted", asub("canceled", []), AT + 50));
+  stripeState.set(SA, asub("active", [{ id: "si_plan3", price: "price_t_starter" }]));
+  const zomb = await run(ev("customer.subscription.updated", asub("active", []), AT + 60));
+  check("webhook: canceled subscription's items are not rewritten by a later event", zomb.status === "stale" && !(await items()).some((x) => x.startsWith("si_plan3")), { zomb, items: await items() });
+  const [subRow] = await db.select().from(schema.subscription).where(eq(schema.subscription.stripeSubscriptionId, SA));
+  await db.delete(schema.organization).where(eq(schema.organization.id, AORG));
+  const left = subRow ? await db.select().from(schema.subscriptionItem).where(eq(schema.subscriptionItem.subscriptionId, subRow.id)) : [];
+  check("org delete cascades subscription_item rows", left.length === 0);
+  for (const k of Object.keys(process.env)) if (!(k in envPrev)) delete process.env[k];
+  Object.assign(process.env, envPrev);
 
   console.log(`\n${failed ? `${failed} failed` : "all passed"} (billing, local database, Stripe mocked)`);
   await getConn().pool.end();

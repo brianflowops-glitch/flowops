@@ -1,5 +1,6 @@
 import type Stripe from "stripe";
 import { billingEnabled, webhookSecret } from "@/lib/billing/config";
+import { retrieveSubscriptionComplete } from "@/lib/billing/addons";
 import { getStripe } from "@/lib/billing/stripe";
 import { processStripeEvent } from "@/lib/billing/webhook";
 import { hasDatabase } from "@/lib/db";
@@ -22,7 +23,7 @@ export async function POST(req: Request) {
 
   try {
     const stripe = getStripe();
-    const result = await processStripeEvent(event, { fetchSubscription: (id) => stripe.subscriptions.retrieve(id) });
+    const result = await processStripeEvent(event, { fetchSubscription: (id) => retrieveSubscriptionComplete(stripe, id) });
     return Response.json({ received: true, ...result });
   } catch (err) {
     console.error("[billing] webhook processing failed", event.id, event.type, err);

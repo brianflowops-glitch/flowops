@@ -37,11 +37,17 @@ Owner/Admin ─────POST /api/billing/portal──▶ FlowOps ──creat
 | `src/lib/billing/stripe.ts` | Lazy Stripe client (build never needs a key) |
 | `src/lib/billing/status.ts` | Status normalization and `hasPaidAccess()` (per-feature check; no `past_due` grace by default) |
 | `src/lib/billing/access.ts`, `access-rules.ts` | `getBillingAccess()`, `requireBillingAccess()` (402 lock used by `requireApi`), pure access rules (§6) |
-| `src/lib/billing/webhook.ts` | `processStripeEvent()` — dedupe + state changes in one transaction |
+| `src/lib/billing/webhook.ts` | `processStripeEvent()` — dedupe + state changes in one transaction; mirrors the plan item and add-on items (§11) |
+| `src/lib/billing/entitlements.ts` | Pure: plan limits, add-on effects, `computeEntitlements()`, price-id → plan/add-on classification (§11) |
+| `src/lib/billing/org-entitlements.ts` | `getEntitlements(orgId)`: reads the mirror, applies billing flag / exemptions (§11) |
+| `src/lib/billing/addons.ts` | `setAddonQuantity()`: increases/new add-ons apply now; decreases/removals are scheduled for the renewal through a subscription schedule; always `proration_behavior: "none"` (§11) |
 | `src/lib/billing/checkout.ts` | `getOrCreateCustomer()`, `findLiveStripeSubscription()`, `expireOpenCheckoutSessions()` |
-| `src/app/api/billing/{webhook,checkout,portal}/route.ts` | Route handlers |
+| `src/app/api/billing/{webhook,checkout,portal,addons}/route.ts` | Route handlers |
 | `drizzle/0006_billing.sql` | Additive migration (3 new tables, no changes to existing tables) |
+| `drizzle/0008_billing_addons.sql` | Additive migration (1 new table `subscription_item`; §11) |
 | `scripts/billing-tests.ts`, `scripts/billing-db-tests.ts` | Offline tests and local-DB webhook tests |
+| `scripts/billing-sandbox-addons.ts` | Live Stripe **sandbox** end-to-end check for add-ons (test clock; §9) |
+| `tests/billing-addons-route.test.ts` | Vitest: add-on route guards (404 / 503 / 401 / 403 / 400) |
 
 `/api/*` is already excluded from the auth proxy matcher, so Stripe can reach the webhook without a session.
 
@@ -49,7 +55,7 @@ Owner/Admin ─────POST /api/billing/portal──▶ FlowOps ──creat
 
 Plans are **only** env vars: `STRIPE_PRICE_<PLAN>=price_…` (e.g. `STRIPE_PRICE_STARTER`, `STRIPE_PRICE_PRO_ANNUAL`). The plan key is `<PLAN>` lowercased. Amount, currency, interval and trial length live on the Price in Stripe, so the founder can change pricing in the Stripe dashboard without a deploy. With no `STRIPE_PRICE_*` set, there are no plans and checkout returns "Unknown plan".
 
-**Approved for now (Brian, 2026-10-26):** Starter **$49/mo** and Pro **$99/mo**, USD, monthly. In the US sandbox (`Flowops Inc sandbox`, test mode) these are `price_1UUvY25iQFiJ57ypFl4SOyNb` (Starter, lookup key `test_starter_monthly`) and `price_1UUvY35iQFiJ57ypBQeXz1q5` (Pro, `test_pro_monthly`) → `STRIPE_PRICE_STARTER` / `STRIPE_PRICE_PRO`. Live-mode Prices with the same amounts get created at launch. Add-ons (extra seats, locations, SMS bundles, FlowAI usage) are still open.
+**Approved for now (Brian, 2026-10-26):** Starter **$49/mo** and Pro **$99/mo**, USD, monthly. In the US sandbox (`Flowops Inc sandbox`, test mode) these are `price_1UUvY25iQFiJ57ypFl4SOyNb` (Starter, lookup key `test_starter_monthly`) and `price_1UUvY35iQFiJ57ypBQeXz1q5` (Pro, `test_pro_monthly`) → `STRIPE_PRICE_STARTER` / `STRIPE_PRICE_PRO`. Live-mode Prices with the same amounts get created at launch. Add-on support is built (§11) but **add-on prices are placeholders**; Brian has not approved them. FlowAI usage and the voice agent are not add-ons yet.
 
 ### Plan changes and cancellation (Brian, 2026-10-26)
 
@@ -69,7 +75,9 @@ Plans are **only** env vars: `STRIPE_PRICE_<PLAN>=price_…` (e.g. `STRIPE_PRICE
 
 Conventions followed: text ids, text status column without a DB enum (like `member.role`), `timestamp with time zone`, FKs cascade on org delete. The migration only `CREATE`s new tables/indexes and adds FKs **on the new tables**; nothing existing is altered or dropped. Verified against a throwaway local Postgres 17 (not Neon): 0000–0006 apply cleanly in order.
 
-Note: since Stripe API version 2025-03-31, `current_period_end` lives on subscription **items**; we read it from the first item.
+Migration `0008_billing_addons` (additive only: one `CREATE TABLE`, one FK on the new table, two indexes) adds `subscription_item` (§11).
+
+Note: since Stripe API version 2025-03-31, `current_period_end` lives on subscription **items**; we read it from the plan item (all items on a subscription share one period).
 
 ## 5. Subscription lifecycle
 
@@ -146,6 +154,8 @@ Other event types are acknowledged with 200 `{status:"ignored"}` and not stored.
 | `STRIPE_SECRET_KEY` | Vercel (sensitive) | `sk_test_…` only for now |
 | `STRIPE_WEBHOOK_SECRET` | Vercel (sensitive) | `whsec_…` of the endpoint (differs per environment) |
 | `STRIPE_PRICE_<PLAN>` | Vercel | one per plan, test-mode `price_…` ids |
+| `STRIPE_ADDON_PRICE_<KEY>` | Vercel | one per add-on, test-mode `price_…` ids: `SEAT`, `LOCATION`, `TEXTS_1000`, `BRANDING` (§11). Distinct prefix from `STRIPE_PRICE_*`, so never read as a plan |
+| `PLAN_LIMITS_<PLAN>` | Vercel (optional) | override a plan's limits, e.g. `seats=3,locations=1,texts=500,branding=false` or JSON; defaults exist for `starter` and `pro` (§11) |
 | `STRIPE_ALLOW_LIVE` | Production only, at launch | must be `true` before an `sk_live_` key is accepted |
 | `BILLING_EXEMPT_ORG_IDS` | Every environment with billing on | comma-separated org ids never locked (e.g. `org_flowops_demo`); set **before** `BILLING_ENABLED=true` (§6) |
 
@@ -156,6 +166,10 @@ No publishable key is needed (hosted Checkout/Portal via redirect).
 Automated, no network:
 - `npm run test:billing` — plan config parsing, live-key refusal, status/access rules, which existing subscription statuses block a second checkout, signature verification (valid accepted, tampered rejected) with a locally generated header; the access lock: every status → full/locked, no subscription, flag off, exempt list, Owner/Admin/Staff `canManageBilling`, exempt vs. guarded API paths, the 402 body.
 - `DATABASE_URL=<throwaway local postgres> npm run test:billing:db` — runs `processStripeEvent` against a scratch DB after `npm run db:migrate`, with a **mocked** Stripe client: checkout links customer; the fetched state (not the payload) is written; duplicates skip without a Stripe call; two updates delivered in reverse order → the newer status wins; same-second tie → fetched state wins; canceled stays canceled even for a newer event; unknown org or a failed Stripe retrieve rolls back (event not recorded); access lock on its own test org: no row → locked, exempt → full, flag off → full, active → full, `invoice.payment_failed` → `past_due` → locked (Owner/Admin can still manage billing, Staff can't), the guard returns 402 for `/api/state` but not for `/api/billing/*`, `/api/auth/*`, data still there, `invoice.paid` → `active` → full again, `unpaid`/`canceled` → locked. The script refuses hosted DB URLs.
+
+Add-on tests (§11): `test:billing` also covers add-on env parsing, plan-limit parsing (defaults, key=value, JSON, malformed values), `computeEntitlements`, price-id classification, and `setAddonQuantity` against a fake Stripe client with a stateful fake subscription schedule (create / increase use `proration_behavior: "none"`; decrease and removal only write a schedule whose next phase holds the lower quantity and never touch the item; a repeated decrease is a no-op; a different decrease replaces the pending one; an increase replaces a pending decrease and releases the schedule; asking for the current quantity cancels a pending decrease; a portal-made plan-downgrade schedule is edited, kept and never released; schedules with discounts or several future phases are refused; `scheduledChanges()` diff; rejects unknown add-on, bad quantity, non-active subscription, branding on a plan that includes it, unconfigured plan). `test:billing:db` also covers: plan identified by price id when an add-on is `items[0]`, item mirroring, quantity changes, pruning removed add-ons, entitlements unchanged while a decrease is scheduled and dropping when the renewal event arrives, duplicate events, stale (older) events not rewriting items, same-second ties, truncated item lists (`has_more`) not pruning, plan swap keeping add-ons, `past_due` → zero entitlements, canceled terminal, org-delete cascade, `getEntitlements` for billing off / exempt / no subscription. `npm test` includes `tests/billing-addons-route.test.ts` (404 when off, 503 unconfigured, 401, **403 for staff**, 400 on bad bodies, GET works for a locked Owner/Admin).
+
+Live sandbox check (test mode, **US sandbox `acct_1UUvH95iQFiJ57yp` only**): `STRIPE_SECRET_KEY_TEST_US=sk_test_… DATABASE_URL=<throwaway local postgres> npx tsx --conditions=react-server scripts/billing-sandbox-addons.ts`. It creates the placeholder add-on prices if missing (lookup keys `test_addon_<key>_monthly`, metadata `flowops_addon=<key>`, `placeholder=true`), subscribes a test-clock customer to Starter, adds add-ons and increases them, **schedules a decrease and a removal** and checks they stay active (mirror + entitlements unchanged, no invoice or credit), that a later increase replaces a pending decrease and that asking for the current quantity cancels a pending one, runs the **real** Stripe events + fetched subscriptions through `processStripeEvent`, then advances the clock past **two renewals** and checks that the removal/decrease took effect exactly at renewal and that each renewal invoice bills only what is active then (12,400 and 8,400 cents, no proration lines, no credits). A second test-clock customer on Pro with a plan downgrade already scheduled (the same schedule shape the portal creates) checks that add-on changes edit that schedule's phases and keep the downgrade. Both clocks and the test org are deleted at the end. Webhook *delivery* (signature, HTTP) is covered by the existing steps below, not by this script.
 
 Manual with the Stripe CLI (test mode, after the founder provides a test key; Preview deployment or local dev):
 1. `stripe login` (founder's account, test mode) → create test Products/Prices in the dashboard → set `STRIPE_PRICE_*`.
@@ -172,7 +186,7 @@ Manual with the Stripe CLI (test mode, after the founder provides a test key; Pr
 
 ## 10. Founder decisions needed (Brian)
 
-1. ~~Plans and prices~~ **decided for now: Starter $49/mo, Pro $99/mo, USD** (§3). Still open: add-ons, annual option/discount, a third tier.
+1. ~~Plans and prices~~ **decided for now: Starter $49/mo, Pro $99/mo, USD** (§3). Add-on mechanics are built (§11) with placeholder prices; still open: final add-on prices, annual option/discount, a third tier.
 2. **Free trial**: yes/no and length; card required up front?
 3. **Founding/pilot pricing**: keep a pilot price for early customers (Stripe coupon or separate Price)?
 4. **Self-serve vs. invite-only**: can any new org subscribe itself, or only orgs we approve?
@@ -182,3 +196,67 @@ Manual with the Stripe CLI (test mode, after the founder provides a test key; Pr
 8. **Taxes**: turn on Stripe Tax? (depends on where customers are).
 9. **Stripe account**: confirm it is in the name of FlowOps Inc., and provide a **test-mode** secret key (`sk_test_…`) privately — never in a group chat. Live keys only at launch.
 10. **Receipts/invoices**: Stripe's emails, or branded FlowOps emails via Resend.
+11. **Add-ons** (§11): final prices (placeholders today: seat $10, location $29, 1,000 texts $15, branding $15 per month), final plan limits, whether Business is launched, whether an add-on added mid-cycle may be free until the first renewal (§11), and annual-plan add-on prices.
+
+
+## 11. Add-ons and entitlements (Able)
+
+Status: built, **dormant**: nothing reads entitlements to block anything yet, and everything is behind `BILLING_ENABLED` (off by default → every billing route 404s, `getEntitlements` returns `enforced: false`). Prices are **not** in code.
+
+### Configuration (env only)
+
+- **Add-on prices:** `STRIPE_ADDON_PRICE_<KEY>=price_…` (key = `<KEY>` lowercased): `SEAT`, `LOCATION`, `TEXTS_1000`, `BRANDING`. The prefix differs from `STRIPE_PRICE_*`, so an add-on can never be taken for a plan. Amount/interval/currency live on the Stripe Price.
+- **What one unit gives** is product logic in `entitlements.ts` (`addonEffect`): `seat` +1 seat, `location` +1 location, `texts_<n>` +n texts per month (so `TEXTS_5000` works with no code change), `branding` removes branding (on/off, max quantity 1). Unknown keys are still billed and mirrored but add nothing.
+- **Plan limits:** defaults from the pricing proposal, **Brian to confirm**: Starter 3 seats / 1 location / 500 texts / branding not removed; Pro 10 / 1 / 2,000 / branding removed. Override or define any plan (e.g. Business) with `PLAN_LIMITS_<PLAN>`, either `seats=30,locations=5,texts=10000,branding=true` or JSON `{"seats":30,"locations":5,"texts":10000,"branding":true}`. Unspecified fields keep the default; malformed values are ignored (never widen a limit). A plan with neither a default nor an override gets the **smallest tier** (fallback, flagged `source: "fallback"`) rather than unlimited.
+- Add-ons share the plan's billing interval (Stripe requires one interval per subscription): monthly add-on prices work with monthly plans only. Annual plans would need annual add-on prices (open decision).
+
+### Data model (`0008_billing_addons`, additive)
+
+`subscription_item`: `id`, `subscription_id` → `subscription.id` (cascade), `stripe_item_id` (unique), `price_id`, `quantity`, `created_at`, `updated_at`. The migration touches only the new `subscription_item` table (no existing table, including `notification`, is altered). **Renumbering:** another open PR (email reminders) also uses `0008`. Whichever merges second renumbers to `0009`: after rebasing, delete `drizzle/0008_billing_addons.sql`, `drizzle/meta/0008_snapshot.json` and its `_journal.json` entry, then run `DATABASE_URL=postgres://x npx drizzle-kit generate --name billing_addons` (regenerates it as the next number on top of the other PR's snapshot). Nothing else in the code refers to the migration number. Plan vs. add-on is **derived at read time** from price id ↔ env (like `subscription.price_id` ↔ plan), so changing env needs no data migration.
+
+### Webhook behaviour
+
+- `subscription.price_id` is now the price of the item that matches a configured plan (`plans()`), **not** `items[0]`. If no item matches a configured plan it falls back to the first item that is not a known add-on (the old behaviour when no plans are configured).
+- Items are rewritten from the **fetched** subscription inside the same transaction and only when the subscription write itself passes its guards: stale (older) events, ties, canceled-is-terminal and duplicate event ids all behave exactly as for the subscription row, and items can never be updated by an event the subscription row rejected. Removed items are pruned; if Stripe's embedded item list is truncated (`has_more`) nothing is pruned, and the webhook route's fetcher (`retrieveSubscriptionComplete`) pages through all items first.
+
+### Entitlements
+
+`computeEntitlements(planKey, [{key, quantity}], env?)` (pure) → `{ planKey, seats, locations, monthlyTexts, brandingRemoved, source, addons }`. `getEntitlements(orgId)` (server) reads the mirror and returns:
+
+| Case | Result |
+| --- | --- |
+| `BILLING_ENABLED` off | `{ enforced: false, reason: "billing_disabled" }` (no DB query) |
+| org in `BILLING_EXEMPT_ORG_IDS` | `{ enforced: false, reason: "exempt" }` |
+| active / trialing | `{ enforced: true, reason: "ok", entitlements }` |
+| other status | `reason: "not_active"`, all limits zero (the org is locked by §6 anyway) |
+| no subscription row | `reason: "no_subscription"`, all zero |
+
+**Where enforcement would hook in (not wired yet):** seats → `src/app/api/admin/invites/route.ts` / `src/lib/tenancy/invites.ts` (members + pending invites vs. `seats`); texts → `src/lib/server/integrations/notify.ts` (this month's sent SMS vs. `monthlyTexts`; decide soft vs. hard cap); branding → the public booking page; locations → no multi-location model exists yet. Each should call `getEntitlements` and skip when `enforced` is false.
+
+### API
+
+`/api/billing/addons` (same guards as the other billing routes: 404 unless `BILLING_ENABLED=true`, 503 if Stripe is not configured, 401 without a session, **403 for staff**; open to a locked Owner/Admin because `/api/billing/*` is exempt from the lock).
+
+- `GET` → `{ addons: [{key, priceId, known}], entitlements, scheduled, scheduledUnavailable? }`. `entitlements` is what applies **now** (the mirrored items). `scheduled` is what Stripe already has queued for the next renewal, read live from the subscription's schedule: `{ effectiveAt (ISO), addons: [{key, from, to}], plan: {from, to} | null (a portal-scheduled downgrade), entitlementsAtRenewal }`, or `null` when nothing is pending. If Stripe can't be reached `scheduled` is `null` and `scheduledUnavailable: true` (the rest still answers).
+- `POST {"addon":"seat","quantity":3}` sets the **absolute** quantity (0 removes). It finds the customer's live subscription in Stripe and returns `{ action, addon, quantity, currentQuantity, effectiveAt, proration: "none", billing }` where `action` is `created` / `updated` (applied now), `scheduled` (a decrease or removal waiting for `effectiveAt`), `schedule_cleared` (a pending decrease was cancelled) or `unchanged`. Errors: 400 unknown/unconfigured add-on, bad or >1000 quantity, branding quantity >1, or Stripe rejecting the request; 409 no subscription, subscription not `active`/`trialing`, plan not configured, the plan already includes branding removal, or a schedule we can't safely rewrite (discounts, trial, extra invoice items, or several future phases: use the billing portal). Our tables are updated only by the resulting `customer.subscription.updated` webhook (single writer).
+
+**Billing policy (team decision 2026-10-27: no mid-cycle prorated charges):** every Stripe write uses `proration_behavior: "none"`, so there are no proration lines, mid-cycle invoices or credits.
+
+| Request | What happens | Entitlement | Billed |
+| --- | --- | --- | --- |
+| new add-on / higher quantity | item created / updated now | immediately (when the webhook mirrors it) | first at the **next renewal** (free until then) |
+| lower quantity / 0 | **nothing changes now.** A subscription schedule's next phase holds the lower quantity (or omits the item) | unchanged until the period ends | at the renewal the lower quantity (or nothing) is billed; no credit for the unused time |
+| increase while a decrease is pending | applied now **and** the next phase is raised to the same quantity, so the pending decrease for that add-on is replaced | immediately | next renewal |
+| quantity = current while a decrease is pending | pending decrease cancelled; our schedule is released when both phases end up identical | unchanged | unchanged |
+
+How it works, from the Stripe docs and verified in the sandbox: a decrease calls `subscriptionSchedules.create({from_subscription})` (phase 1 = the live items up to `current_period_end`) and then `update` with two phases: phase 1 unchanged, phase 2 = the same items with the lower quantity for one billing period (`duration` taken from the plan price), `end_behavior: "release"`, `proration_behavior: "none"`. At the phase change Stripe swaps the items, bills the renewal invoice for the new phase and emits `customer.subscription.updated`, which the webhook mirrors (pruning the dropped item), so entitlements drop exactly at renewal. The schedule stays attached through that phase and is released by Stripe afterwards; a later decrease while the schedule is on its last phase just appends a phase.
+
+**Interaction with the Customer Portal.** The portal's "schedule at period end" downgrades (`bpc_1UUvd05iQFiJ57yp2r2sV9Rv`) are also subscription schedules (Stripe: the portal "creates and attaches a subscription schedule"), and a subscription can have one. So `setAddonQuantity` never creates a second schedule: if one exists it edits the **next phase** (keeping the downgraded plan) and, because Stripe warns that direct subscription edits "might be overwritten" when the next phase starts, **every change while a next phase exists is written to both phases in one schedule update** (an increase is also applied to the current phase, immediately). A schedule with discounts, a trial or extra invoice items, or more than one future phase is refused (409) rather than rewritten. Not covered: what the portal does when it later wants to edit a schedule *we* created (portal downgrades are limited to prices of the same product, and add-ons are separate products, so the portal does not edit add-ons). Re-test that in the sandbox portal before launch.
+
+**Decision for Brian:** under this policy an add-on added mid-cycle is **free until the first renewal** (nothing is charged now and the first charge is at renewal), and anything removed before renewal is never billed. Adding is immediate and removal waits for the period end, so the only "free" window is the time between adding and the next renewal. If that is not acceptable the alternatives are a prorated charge at add time (rejected by the team for now) or granting new add-ons only from the next renewal.
+
+- Nothing in the app creates an add-on price: prices are made in Stripe and put in env.
+
+### Sandbox objects (test mode, US sandbox `acct_1UUvH95iQFiJ57yp`)
+
+Placeholder add-on prices, **not approved pricing** (lookup key `test_addon_<key>_monthly`, metadata `flowops_addon=<key>`, `placeholder=true`): seat $10/mo `price_1UVB9h5iQFiJ57ypTZbo5ZBn`, location $29/mo `price_1UVB9h5iQFiJ57ypGYTvNWjm`, texts_1000 $15/mo `price_1UVB9i5iQFiJ57yplkbyM4ky`, branding $15/mo `price_1UVB9i5iQFiJ57ypFfJkhTj1`. Set them as `STRIPE_ADDON_PRICE_SEAT` etc. Live-mode prices are created at launch once Brian approves amounts.

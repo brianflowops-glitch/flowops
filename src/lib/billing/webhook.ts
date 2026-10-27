@@ -1,8 +1,9 @@
 import "server-only";
 import type Stripe from "stripe";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, notInArray, sql } from "drizzle-orm";
 import { getDb, schema, type Db } from "@/lib/db";
 import { normalizeStatus } from "./status";
+import { classifyItems } from "./entitlements";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
@@ -134,13 +135,17 @@ async function orgForSubscription(tx: Tx, sub: Stripe.Subscription): Promise<str
   return c?.organizationId ?? null;
 }
 
-export function subscriptionFields(sub: Stripe.Subscription) {
-  const item = sub.items?.data?.[0];
-  // Since API version 2025-03-31 the billing period lives on subscription items.
-  const periodEnd = item?.current_period_end ?? null;
+export function subscriptionFields(sub: Stripe.Subscription, env: Record<string, string | undefined> = process.env) {
+  const items = sub.items?.data ?? [];
+  // The plan item is the one whose price id matches a configured plan (never "the first item": add-ons
+  // are extra items on the same subscription). Falls back to the first non-add-on item, then to none.
+  const { plan } = classifyItems(items.map((i) => ({ priceId: i.price?.id ?? null, quantity: i.quantity ?? 1 })), env);
+  const planItem = (plan && items.find((i) => (i.price?.id ?? null) === plan.priceId)) || items[0];
+  // Since API version 2025-03-31 the billing period lives on subscription items (all items share one period).
+  const periodEnd = planItem?.current_period_end ?? items[0]?.current_period_end ?? null;
   return {
     status: normalizeStatus(sub.status),
-    priceId: item?.price?.id ?? null,
+    priceId: plan?.priceId ?? null,
     currentPeriodEnd: periodEnd ? new Date(periodEnd * 1000) : null,
     cancelAtPeriodEnd: Boolean(sub.cancel_at_period_end),
   };
@@ -166,5 +171,26 @@ async function upsertSubscription(tx: Tx, sub: Stripe.Subscription, eventCreated
       setWhere: sql`${t.status} <> 'canceled' and (${t.lastEventCreated} is null or ${t.lastEventCreated} <= ${eventCreated.toISOString()}::timestamptz)`,
     })
     .returning({ id: t.id });
+  // Items follow the same guard: only written when the subscription row was written (so a stale
+  // event or a canceled subscription never rewrites add-ons either), in the same transaction.
+  if (rows.length > 0) await syncItems(tx, rows[0].id, sub);
   return rows.length > 0;
+}
+
+/** Make `subscription_item` equal the fetched subscription's items (upsert present, prune removed). */
+async function syncItems(tx: Tx, subscriptionRowId: string, sub: Stripe.Subscription) {
+  const items = sub.items?.data ?? [];
+  const i = schema.subscriptionItem;
+  for (const it of items) {
+    await tx
+      .insert(i)
+      .values({ id: rid("si"), subscriptionId: subscriptionRowId, stripeItemId: it.id, priceId: it.price?.id ?? null, quantity: it.quantity ?? 1 })
+      .onConflictDoUpdate({
+        target: i.stripeItemId,
+        set: { subscriptionId: subscriptionRowId, priceId: it.price?.id ?? null, quantity: it.quantity ?? 1, updatedAt: sql`now()` },
+      });
+  }
+  // Only prune when the list is complete: a paginated (has_more) payload would otherwise drop real items.
+  if (sub.items?.has_more) return;
+  await tx.delete(i).where(items.length ? and(eq(i.subscriptionId, subscriptionRowId), notInArray(i.stripeItemId, items.map((x) => x.id))) : eq(i.subscriptionId, subscriptionRowId));
 }

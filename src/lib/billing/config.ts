@@ -6,6 +6,8 @@
  *   STRIPE_SECRET_KEY=sk_test_…   test-mode key; sk_live_/rk_live_ keys are refused unless STRIPE_ALLOW_LIVE=true
  *   STRIPE_WEBHOOK_SECRET=whsec_… signing secret of the webhook endpoint (or of `stripe listen`)
  *   STRIPE_PRICE_<PLAN>=price_…   one per plan, e.g. STRIPE_PRICE_STARTER; <PLAN> lowercased is the plan key
+ *   STRIPE_ADDON_PRICE_<KEY>=price_…  one per add-on, e.g. STRIPE_ADDON_PRICE_SEAT / _LOCATION / _TEXTS_1000 / _BRANDING
+ *   PLAN_LIMITS_<PLAN>=…          per-plan limits override (see entitlements.ts); defaults exist for starter and pro
  */
 
 export function billingEnabled(): boolean {
@@ -59,4 +61,32 @@ export function planByKey(key: string, env?: Record<string, string | undefined>)
 export function planByPriceId(priceId: string | null | undefined, env?: Record<string, string | undefined>): PlanConfig | undefined {
   if (!priceId) return undefined;
   return plans(env).find((p) => p.priceId === priceId);
+}
+
+export interface AddonConfig {
+  /** Add-on key, e.g. "seat", "location", "texts_1000", "branding" (from STRIPE_ADDON_PRICE_SEAT, …). */
+  key: string;
+  /** Stripe price id (price_…). Amount and interval live in Stripe, not here. */
+  priceId: string;
+}
+
+const ADDON_PRICE_ENV = /^STRIPE_ADDON_PRICE_([A-Z0-9_]+)$/;
+
+/** Add-ons configured through STRIPE_ADDON_PRICE_* env vars (distinct prefix from STRIPE_PRICE_*, so never mistaken for a plan). */
+export function addons(env: Record<string, string | undefined> = process.env): AddonConfig[] {
+  const out: AddonConfig[] = [];
+  for (const [name, value] of Object.entries(env)) {
+    const m = ADDON_PRICE_ENV.exec(name);
+    if (m && value) out.push({ key: m[1].toLowerCase(), priceId: value });
+  }
+  return out.sort((a, b) => a.key.localeCompare(b.key));
+}
+
+export function addonByKey(key: string, env?: Record<string, string | undefined>): AddonConfig | undefined {
+  return addons(env).find((a) => a.key === key.toLowerCase());
+}
+
+export function addonByPriceId(priceId: string | null | undefined, env?: Record<string, string | undefined>): AddonConfig | undefined {
+  if (!priceId) return undefined;
+  return addons(env).find((a) => a.priceId === priceId);
 }
