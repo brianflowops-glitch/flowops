@@ -69,3 +69,19 @@ in the booking transaction and sends right after commit. If the function dies in
 - Body is rebuilt from the booking with the engine's template (duplicated in `emailBodyFor`; keep in sync).
 - Schedule needs a `vercel.json` cron entry (not committed; deployment-setting change needs approval):
   `{ "crons": [{ "path": "/api/cron/notifications", "schedule": "*/5 * * * *" }] }` (Hobby plans only allow daily crons).
+
+## Email-only appointment reminders — migration `0008_email_reminders` (additive)
+Off by default. Set `EMAIL_REMINDERS_ENABLED=true` (and have `RESEND_API_KEY` set) to send one reminder **email**
+~24 h before each upcoming confirmed booking that has a customer email. No SMS code path: no phone, consent or
+Twilio call is read or made. With the flag off, `/api/cron/notifications` behaves exactly as before.
+- Runs from `GET /api/cron/notifications` right after the sweeper (`src/lib/server/reminders/run.ts`), so it needs the
+  cron to be enabled (`CRON_SECRET` set + a `vercel.json` cron entry; Vercel Hobby allows daily crons only).
+- Window: start in (now + 30 min, now + 24 h] in the organization's time zone (`organization.time_zone`, DST-aware);
+  `EMAIL_REMINDER_LEAD_HOURS` / `EMAIL_REMINDER_MIN_LEAD_MINUTES` tune it. With a once-a-day cron set the lead to 30 h so
+  every booking is covered (reminders then go out 6–30 h ahead). Bookings made or rescheduled inside the window, demo
+  organizations, cancelled bookings and past bookings are skipped.
+- Exactly once: adds nullable `notification.dedupe_key` + unique partial index. Key `reminder-<bookingId>-<startsAtISO>`
+  (a reschedule changes the start, so it gets a new reminder; the old one is skipped at send time). Insert is
+  `ON CONFLICT DO NOTHING`; sending is claimed with `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED)` (10-min
+  lease, max 3 attempts) and uses the key as the Resend `Idempotency-Key`. Rows use status `sending` (never `queued`), so
+  the recovery sweeper ignores them.

@@ -9,7 +9,7 @@
  * - Reliability: notification_failure (final send failures after retries; redacted),
  *   provider_webhook_event (dedupe), message_delivery_event, sms_opt_out
  */
-import { relations } from "drizzle-orm";
+import { relations, sql } from "drizzle-orm";
 import { bigint, boolean, index, integer, jsonb, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
 import type { DayHours } from "@/lib/booking/types";
 import { phoneE164Sql } from "./phone-sql";
@@ -255,8 +255,17 @@ export const notification = pgTable(
     claimedAt: timestamp("claimed_at", { withTimezone: true }),
     /** v2.4: how many times the recovery cron has claimed this row (capped, so it can't loop). */
     sweepAttempts: integer("sweep_attempts").notNull().default(0),
+    /**
+     * Optional exactly-once key (migration 0008). Only appointment reminders set it
+     * (`reminder-<bookingId>-<startsAtISO>`); a unique partial index makes "insert if absent" atomic. Null for all other rows.
+     */
+    dedupeKey: text("dedupe_key"),
   },
-  (t) => [index("notification_org_at_idx").on(t.organizationId, t.at), index("notification_status_at_idx").on(t.deliveryStatus, t.at)],
+  (t) => [
+    index("notification_org_at_idx").on(t.organizationId, t.at),
+    index("notification_status_at_idx").on(t.deliveryStatus, t.at),
+    uniqueIndex("notification_dedupe_key_uniq").on(t.dedupeKey).where(sql`${t.dedupeKey} is not null`),
+  ],
 );
 
 /**

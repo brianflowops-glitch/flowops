@@ -1,5 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import { sweepQueuedNotifications } from "@/lib/server/notification-sweeper";
+import { runEmailReminders } from "@/lib/server/reminders/run";
 
 /**
  * Recovery cron for notification rows stuck in "queued". Vercel Cron calls this with
@@ -21,6 +22,15 @@ export async function GET(req: Request) {
   try {
     const report = await sweepQueuedNotifications();
     if (report.claimed || report.expired) console.log(`[sweeper] ${JSON.stringify(report)}`);
+    // Email-only appointment reminders: a no-op (and not even in the response) unless EMAIL_REMINDERS_ENABLED=true.
+    if (process.env.EMAIL_REMINDERS_ENABLED?.trim().toLowerCase() === "true") {
+      const reminders = await runEmailReminders().catch((e: unknown) => {
+        console.error(`[reminders] run failed: ${e instanceof Error ? e.message.slice(0, 200) : "unknown error"}`);
+        return { error: "reminders failed" };
+      });
+      if ("sent" in reminders && (reminders.enqueued || reminders.claimed || reminders.expired)) console.log(`[reminders] ${JSON.stringify(reminders)}`);
+      return Response.json({ ...report, reminders });
+    }
     return Response.json(report);
   } catch (e) {
     console.error(`[sweeper] run failed: ${e instanceof Error ? e.message.slice(0, 200) : "unknown error"}`);
