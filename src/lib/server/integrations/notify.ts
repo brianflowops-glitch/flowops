@@ -6,6 +6,7 @@ import { maskPhone, toE164 } from "@/lib/phone";
 import { isSmsOptedOut } from "@/lib/server/webhooks/store";
 import { recordNotificationFailure } from "./notification-failures";
 import { type AttemptOutcome, type FailureKind, maskEmail, parseRetryAfter, withRetry } from "./retry";
+import { smsBodyFor } from "@/lib/notify/sms-templates";
 
 /** Where a send came from, for the failure log / alert. Never put PII in `tag`. */
 export interface SendMeta {
@@ -186,9 +187,12 @@ export async function sendSms(to: string, body: string, ref?: string, meta?: Sen
   return { ok: false, detail: `${r.detail}${suffix}` };
 }
 
-/** SMS text: business name first (carrier requirement), short, with opt-out language. */
-export function smsBody(subject: string, ref: string, businessName?: string) {
-  return `${businessName ? `${businessName}: ` : ""}${subject}. Ref ${ref}. Reply STOP to opt out.`;
+/**
+ * SMS text for a booking notification: exactly the A2P campaign sample wording (see
+ * src/lib/notify/sms-templates.ts). null = not an approved message type, so don't send it.
+ */
+export function smsBody(subject: string, b: { date: string; time: string }, businessName?: string | null): string | null {
+  return smsBodyFor(subject, b, businessName);
 }
 
 /** Real Notification Agent backend. Returns undefined when neither Resend nor Twilio is configured. */
@@ -203,7 +207,9 @@ export function notifierAdapter(opts: { businessName?: string; organizationId?: 
     async send(b, subject, body, channel, sendOpts) {
       const meta: SendMeta = { tag: `booking:${b.id}`, organizationId: opts.organizationId, idempotencyKey: sendOpts?.idempotencyKey };
       if (channel === "email") return sendEmail(b.email, subject, body, process.env.RESEND_REPLY_TO || undefined, meta);
-      return sendSms(b.phone!, smsBody(subject, b.id, opts.businessName), b.id, meta);
+      const text = smsBody(subject, b, opts.businessName);
+      if (!text) return { ok: false, detail: "not sent: no approved SMS template for this message" };
+      return sendSms(b.phone!, text, b.id, meta);
     },
   };
 }

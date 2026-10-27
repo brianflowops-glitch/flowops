@@ -149,6 +149,8 @@ async function resend(row: Row): Promise<{ status: "sent" | "failed"; kind: "sen
   if (!twilioConfigured()) return skip("SMS not configured");
   if (!b.smsConsent || !b.phone) return skip("customer no longer opted in to texts");
   const [org] = await db.select({ name: schema.organization.name }).from(schema.organization).where(eq(schema.organization.id, row.organizationId)).limit(1);
-  const r = await sendSms(b.phone, smsBody(row.subject, b.id, org?.name), b.id, meta);
+  const text = smsBody(row.subject, b, org?.name);
+  if (!text) return skip("no approved SMS template for this message");
+  const r = await sendSms(b.phone, text, b.id, meta);
   return r.ok ? { status: "sent", kind: "sent", detail: `${r.detail ?? "sent"} (recovered)` } : { status: "failed", kind: "failed", detail: r.detail ?? "failed" };
 }
