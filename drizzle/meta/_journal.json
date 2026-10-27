@@ -57,6 +57,13 @@
       "when": 1793052870549,
       "tag": "0007_phone_e164_idx",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1793110185180,
+      "tag": "0008_email_reminders",
+      "breakpoints": true
     }
   ]
 }

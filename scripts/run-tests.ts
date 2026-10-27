@@ -1,10 +1,11 @@
-// Runs the FL-001…FL-008 simulation suite plus RT-001…RT-007 (notification retry) WH-001…WH-003 (webhook signatures) and RL-001 (rate-limit fallback) unit tests in Node: `npm test`
+// Runs the FL-001…FL-008 simulation suite plus RT-001…RT-007 (notification retry) WH-001…WH-003 (webhook signatures) RL-001 (rate-limit fallback) and RM-001…RM-008 (email reminders) unit tests in Node: `npm test`
 import { TEST_CASES, runTest } from "../src/lib/booking/tests";
 import { RETRY_TEST_CASES } from "../src/lib/server/integrations/retry.tests";
 import { WEBHOOK_TEST_CASES } from "../src/lib/server/webhooks/webhooks.tests";
 import { RATE_LIMIT_TEST_CASES } from "../src/lib/server/rate-limit-memory.tests";
+import { REMINDER_TEST_CASES } from "../src/lib/server/reminders/reminders.tests";
 
-const ALL = [...TEST_CASES, ...RETRY_TEST_CASES, ...WEBHOOK_TEST_CASES, ...RATE_LIMIT_TEST_CASES];
+const ALL = [...TEST_CASES, ...RETRY_TEST_CASES, ...WEBHOOK_TEST_CASES, ...RATE_LIMIT_TEST_CASES, ...REMINDER_TEST_CASES];
 
 (async () => {
   let failed = 0;
