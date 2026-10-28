@@ -377,9 +377,109 @@ export const subscription = pgTable(
   (t) => [uniqueIndex("subscription_stripe_subscription_unique").on(t.stripeSubscriptionId), index("subscription_org_idx").on(t.organizationId)],
 );
 
+/**
+ * Line items of a mirrored Stripe subscription (v2.5, additive 0008): the plan item and any add-ons.
+ * Rewritten wholesale from the fetched subscription by the same guarded write as `subscription`, so
+ * ordering/dedupe are inherited. Whether an item is the plan or an add-on is derived at read time
+ * from price id ↔ env config (STRIPE_PRICE_* / STRIPE_ADDON_PRICE_*), like subscription.price_id.
+ */
+export const subscriptionItem = pgTable(
+  "subscription_item",
+  {
+    id: text("id").primaryKey(),
+    subscriptionId: text("subscription_id")
+      .notNull()
+      .references(() => subscription.id, { onDelete: "cascade" }),
+    stripeItemId: text("stripe_item_id").notNull(),
+    priceId: text("price_id"),
+    quantity: integer("quantity").notNull().default(1),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("subscription_item_stripe_item_unique").on(t.stripeItemId), index("subscription_item_subscription_idx").on(t.subscriptionId)],
+);
+
+/**
+ * One-time text packs (additive 0009). A row is reserved `pending` before the invoice is charged and only
+ * `paid` rows grant texts (entitlements: plan texts + paid packs whose window contains now). `period_start` /
+ * `period_end` is the monthly text window the pack is valid for (the billing period; for annual subscriptions
+ * the current month inside the year), also the unit of the per-period cap. `stripe_invoice_id` is unique, which
+ * is the dedupe key for invoice.paid / invoice.payment_failed.
+ * Rollover (additive 0010): `expires_at` = end of the window AFTER the purchase window (a pack bought in window N is
+ * usable in N and N+1; null on older rows = `period_end`). `texts_used` counts texts drawn from the pack
+ * (plan allowance first, then packs soonest-expiring first; see consumeTexts in text-packs.ts).
+ */
+export const TEXT_PACK_STATUSES = ["pending", "paid", "failed"] as const;
+export type TextPackStatus = (typeof TEXT_PACK_STATUSES)[number];
+export const textPack = pgTable(
+  "text_pack",
+  {
+    id: text("id").primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organization.id, { onDelete: "cascade" }),
+    /** Pack key, e.g. texts_1000. */
+    packKey: text("pack_key").notNull(),
+    textsPerPack: integer("texts_per_pack").notNull(),
+    quantity: integer("quantity").notNull(),
+    stripeInvoiceId: text("stripe_invoice_id"),
+    status: text("status", { enum: TEXT_PACK_STATUSES }).notNull().default("pending"),
+    periodStart: timestamp("period_start", { withTimezone: true }).notNull(),
+    periodEnd: timestamp("period_end", { withTimezone: true }).notNull(),
+    /** What Stripe collected, in the smallest currency unit (set when paid). */
+    amountPaid: integer("amount_paid"),
+    paidAt: timestamp("paid_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    /** Last instant the pack's texts are usable: end of the next text window (rollover, 0010). Null = period_end. */
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
+    /** Texts already drawn from this pack (0..texts_per_pack × quantity). */
+    textsUsed: integer("texts_used").notNull().default(0),
+  },
+  (t) => [
+    uniqueIndex("text_pack_stripe_invoice_unique").on(t.stripeInvoiceId),
+    index("text_pack_org_period_idx").on(t.organizationId, t.periodStart),
+    index("text_pack_org_expires_idx").on(t.organizationId, t.expiresAt),
+  ],
+);
+
 /** Processed Stripe webhook events (idempotency: Stripe retries and may deliver an event more than once). */
 export const stripeEvent = pgTable("stripe_event", {
   id: text("id").primaryKey(), // evt_…
   type: text("type").notNull(),
   processedAt: timestamp("processed_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+/**
+ * One attempt to charge a trial add-on increase (docs/BILLING.md §11, patch 0005). Written `pending` before any
+ * Stripe call so a crash between the charge and the add-on being applied can be settled (refund or confirm) by
+ * `reconcileAddonCharges` / `sweepAddonCharges`. Statuses: pending → paid → applied | refunded; pending → failed.
+ */
+export const ADDON_CHARGE_STATUSES = ["pending", "paid", "applied", "failed", "refunded"] as const;
+export const addonCharge = pgTable(
+  "addon_charge",
+  {
+    /** Attempt id (adc_…); also in the invoice metadata (`flowops_addon_charge_id`) and the idempotency key. */
+    id: text("id").primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organization.id, { onDelete: "cascade" }),
+    stripeSubscriptionId: text("stripe_subscription_id").notNull(),
+    stripeCustomerId: text("stripe_customer_id").notNull(),
+    addonKey: text("addon_key").notNull(),
+    priceId: text("price_id").notNull(),
+    fromQuantity: integer("from_quantity").notNull(),
+    toQuantity: integer("to_quantity").notNull(),
+    /** What we asked Stripe to collect, smallest currency unit. */
+    amount: integer("amount").notNull(),
+    currency: text("currency").notNull(),
+    paymentMethod: text("payment_method").notNull(),
+    status: text("status", { enum: ADDON_CHARGE_STATUSES }).notNull().default("pending"),
+    stripeInvoiceId: text("stripe_invoice_id"),
+    stripeCreditNoteId: text("stripe_credit_note_id"),
+    note: text("note"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("addon_charge_stripe_invoice_unique").on(t.stripeInvoiceId), index("addon_charge_org_status_idx").on(t.organizationId, t.status)],
+);

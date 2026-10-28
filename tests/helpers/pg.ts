@@ -60,4 +60,13 @@ export function hasDatabase() {
   return true;
 }
 export type Db = ReturnType<typeof getDb>;
+export function isPoolTimeout(err: unknown) {
+  return err instanceof Error && /timeout exceeded when trying to connect/i.test(err.message);
+}
+/** A dedicated connection from the test pool (like @/lib/db's session pool). */
+export async function connectSession() {
+  const c = await pool!.connect();
+  return { db: drizzle(c, { schema }) as unknown as Db, query: (text: string, params?: unknown[]) => c.query(text, params) as never, release: (destroy?: boolean) => c.release(destroy ? true : undefined) };
+}
 export { schema };
+export { sessionDatabaseUrl, sessionDbProblem } from "../../src/lib/db/session-url";

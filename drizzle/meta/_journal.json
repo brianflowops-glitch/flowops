@@ -57,6 +57,34 @@
       "when": 1793052870549,
       "tag": "0007_phone_e164_idx",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1793110176126,
+      "tag": "0008_billing_addons",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1793121148689,
+      "tag": "0009_text_pack",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1793139698522,
+      "tag": "0010_text_pack_rollover",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1793141598157,
+      "tag": "0011_addon_charge",
+      "breakpoints": true
     }
   ]
 }

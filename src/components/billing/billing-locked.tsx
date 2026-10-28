@@ -6,10 +6,11 @@ import { authClient } from "@/lib/auth-client";
 import type { LockCopy } from "@/lib/billing/lock-copy";
 
 /** Full-screen billing lock. Shown by the dashboard layout instead of the app when billing is locked. */
-export function BillingLocked({ copy, orgName, planKeys }: { copy: LockCopy; orgName: string; planKeys: string[] }) {
+export function BillingLocked({ copy, orgName, planKeys, annualPlanKeys = [] }: { copy: LockCopy; orgName: string; planKeys: string[]; annualPlanKeys?: string[] }) {
   const router = useRouter();
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [billingInterval, setBillingInterval] = useState<"month" | "year">("month");
 
   async function go(url: string, body?: unknown, key = url) {
     setBusy(key);
@@ -39,10 +40,19 @@ export function BillingLocked({ copy, orgName, planKeys }: { copy: LockCopy; org
               {busy ? "Opening billing…" : "Manage billing"}
             </button>
           )}
+          {copy.action === "choose_plan" && annualPlanKeys.length > 0 && (
+            <div className="flex justify-center gap-2 text-xs">
+              {(["month", "year"] as const).map((i) => (
+                <button key={i} type="button" aria-pressed={billingInterval === i} onClick={() => setBillingInterval(i)} className={`rounded-full px-3 py-1 ${billingInterval === i ? "bg-white/15 text-white" : "text-slate-400 hover:text-white"}`}>
+                  {i === "month" ? "Monthly" : "Yearly (2 months free)"}
+                </button>
+              ))}
+            </div>
+          )}
           {copy.action === "choose_plan" &&
             (planKeys.length ? (
-              planKeys.map((k) => (
-                <button key={k} disabled={busy !== null} onClick={() => go("/api/billing/checkout", { plan: k }, k)} className="rounded-md bg-cyan-500 px-4 py-2 text-sm font-medium capitalize text-slate-950 hover:bg-cyan-400 disabled:opacity-50">
+              planKeys.filter((k) => billingInterval === "month" || annualPlanKeys.includes(k)).map((k) => (
+                <button key={k} disabled={busy !== null} onClick={() => go("/api/billing/checkout", { plan: k, interval: billingInterval }, k)} className="rounded-md bg-cyan-500 px-4 py-2 text-sm font-medium capitalize text-slate-950 hover:bg-cyan-400 disabled:opacity-50">
                   {busy === k ? "Opening checkout…" : `Choose ${k}`}
                 </button>
               ))

@@ -39,4 +39,24 @@ export function hasDatabase() {
   return true;
 }
 export type Db = ReturnType<typeof getDb>;
+/** Same as @/lib/db. */
+export function isPoolTimeout(err: unknown) {
+  return err instanceof Error && /timeout exceeded when trying to connect/i.test(err.message);
+}
+/** PGlite has one session: the "session connection" is that session (advisory locks work, release is a no-op). */
+export async function connectSession() {
+  if (!db) create();
+  await ready;
+  return {
+    db: getDb(),
+    query: async (text: string, params?: unknown[]) => ({ rows: (await client!.query(text, params as unknown[])).rows as never[] }),
+    release: () => undefined,
+  };
+}
 export { schema };
+import { sessionDbProblem as realSessionDbProblem } from "../../src/lib/db/session-url";
+export { sessionDatabaseUrl } from "../../src/lib/db/session-url";
+/** Same rules as @/lib/db, except that no DATABASE_URL at all is fine here (PGlite stands in for it). */
+export function sessionDbProblem(env: Record<string, string | undefined> = process.env) {
+  return env.DATABASE_URL?.trim() || env.DATABASE_URL_UNPOOLED?.trim() ? realSessionDbProblem(env) : null;
+}

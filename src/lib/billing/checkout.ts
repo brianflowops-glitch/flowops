@@ -1,6 +1,7 @@
 import "server-only";
 import { eq } from "drizzle-orm";
-import { getDb, schema } from "@/lib/db";
+import type Stripe from "stripe";
+import { getDb, schema, type Db } from "@/lib/db";
 import type { OrgContext } from "@/lib/server/context";
 import { getStripe } from "./stripe";
 import { findLiveSubscription } from "./status";
@@ -39,4 +40,25 @@ export async function expireOpenCheckoutSessions(customer: string) {
   for await (const session of stripe.checkout.sessions.list({ customer, status: "open", limit: 100 })) {
     await stripe.checkout.sessions.expire(session.id).catch(() => undefined); // already completed/expired: fine
   }
+}
+
+/** Subscriptions that never became live (abandoned first payment) don't use up the trial. */
+const NEVER_LIVE = ["incomplete", "incomplete_expired"];
+
+/**
+ * One free trial per business: an org that EVER had a subscription (a row in our mirror, or any subscription on
+ * its Stripe customer, including a cancelled one) gets no trial, whatever it does next (cancel and resubscribe, a
+ * second checkout, another plan). Both sources are checked because the mirror can lag the webhook.
+ */
+export async function trialEligibility(
+  orgId: string,
+  customer: string,
+  deps: { db?: Db; stripe?: { subscriptions: { list(p: Stripe.SubscriptionListParams): Promise<{ data: { status: string }[] }> } } } = {},
+): Promise<{ eligible: boolean; reason?: "had_subscription" }> {
+  const db = deps.db ?? getDb();
+  const rows = await db.select({ status: schema.subscription.status }).from(schema.subscription).where(eq(schema.subscription.organizationId, orgId));
+  if (rows.some((r) => !NEVER_LIVE.includes(r.status))) return { eligible: false, reason: "had_subscription" };
+  const subs = await (deps.stripe ?? getStripe()).subscriptions.list({ customer, status: "all", limit: 100 });
+  if (subs.data.some((s) => !NEVER_LIVE.includes(s.status))) return { eligible: false, reason: "had_subscription" };
+  return { eligible: true };
 }
