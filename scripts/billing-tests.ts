@@ -516,18 +516,19 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
     r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "active" }, addon: "seat", quantity: 6, env: aenv, now });
     check("0004 failed proration payment with a pending decrease: 402, the schedule is NOT touched (the pending decrease stays)", !r4.ok && r4.status === 402 && !f.log.some((l) => l.startsWith("schedule.")) && phaseItemsStr(f.sched()!.phases[1]) === "price_p×1,price_seat×1", { r4, log: f.log });
 
-    // trial add charging
+    // trial add charging under the charge_now BRANCH (0008: no longer the default; pinned explicitly so it stays tested)
+    const chargeNow = (i: Parameters<typeof setAddonQuantity>[0]) => setAddonQuantityUnderPolicy("charge_now", i);
     f = mk({ status: "trialing" });
-    r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now, ledger: memoryAddonChargeLedger("org_t") });
+    r4 = await chargeNow({ stripe: f.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now, ledger: memoryAddonChargeLedger("org_t") });
     const expectTrial = Math.round(1000 * 2 * (7 * 86400) / ((addMonthsUTC(now, 1).getTime() - now.getTime()) / 1000));
-    check("0004 trial add: the rest of the trial at the seat rate is charged NOW on a standalone invoice (pending items excluded), and only then the item is written with proration none", r4.ok && r4.action === "created" && r4.charge?.kind === "trial_proration" && r4.charge.amountPaid === expectTrial && f.log.join("|") === `invoice.create trial_proration pm=pm_card excl=exclude|invoiceItem ${expectTrial} usd period=${T0}-${T0 + 7 * 86400}|finalize in_trial|pay in_trial|create price_seat x2 none`, { r4, log: f.log, expectTrial });
-    check("0004 trial add: amount ≈ 7/30 of 2 × $10 (≈ $4.60)", expectTrial > 440 && expectTrial < 480, expectTrial);
+    check("0004 trial add (charge_now): the rest of the trial at the seat rate is charged NOW on a standalone invoice (pending items excluded), and only then the item is written with proration none", r4.ok && r4.action === "created" && r4.charge?.kind === "trial_proration" && r4.charge.amountPaid === expectTrial && f.log.join("|") === `invoice.create trial_proration pm=pm_card excl=exclude|invoiceItem ${expectTrial} usd period=${T0}-${T0 + 7 * 86400}|finalize in_trial|pay in_trial|create price_seat x2 none`, { r4, log: f.log, expectTrial });
+    check("0004 trial add (charge_now): amount ≈ 7/30 of 2 × $10 (≈ $4.60)", expectTrial > 440 && expectTrial < 480, expectTrial);
     f = mk({ status: "trialing", pm: null });
-    r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now, ledger: memoryAddonChargeLedger("org_t") });
-    check("0004 trial add with no card on file → 402 no_payment_method, no invoice, no item write", !r4.ok && r4.status === 402 && r4.code === "no_payment_method" && f.log.length === 0, { r4, log: f.log });
+    r4 = await chargeNow({ stripe: f.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now, ledger: memoryAddonChargeLedger("org_t") });
+    check("0004 trial add (charge_now) with no card on file → 402 no_payment_method, no invoice, no item write", !r4.ok && r4.status === 402 && r4.code === "no_payment_method" && f.log.length === 0, { r4, log: f.log });
     f = mk({ status: "trialing", payStatus: "decline" });
-    r4 = await setAddonQuantity({ stripe: f.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now, ledger: memoryAddonChargeLedger("org_t") });
-    check("0004 trial add with a declined card → invoice voided, 402 payment_failed, no item write", !r4.ok && r4.status === 402 && r4.code === "payment_failed" && f.log.includes("void in_trial") && !f.log.some((l) => l.startsWith("create ") || l.startsWith("update ")), { r4, log: f.log });
+    r4 = await chargeNow({ stripe: f.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now, ledger: memoryAddonChargeLedger("org_t") });
+    check("0004 trial add (charge_now) with a declined card → invoice voided, 402 payment_failed, no item write", !r4.ok && r4.status === 402 && r4.code === "payment_failed" && f.log.includes("void in_trial") && !f.log.some((l) => l.startsWith("create ") || l.startsWith("update ")), { r4, log: f.log });
     check("trialProrationAmount: full interval left → full price; nothing left → 0; annual uses a year", trialProrationAmount({ unitAmount: 1000, delta: 2, now: T0, periodEnd: T0 + 10 * 365 * 86400, interval: "month" }) === 2000 && trialProrationAmount({ unitAmount: 1000, delta: 2, now: T0, periodEnd: T0, interval: "month" }) === 0 && Math.abs(trialProrationAmount({ unitAmount: 10000, delta: 1, now: T0, periodEnd: T0 + 14 * 86400, interval: "year" }) - Math.round(10000 * 14 / 365)) <= 2);
 
     // removal unchanged
@@ -542,8 +543,9 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
     const trialIn = (o: Opt = {}) => mk({ status: "trialing", ...o });
     let n5 = 0;
     const ids = () => `adc_t${++n5}`;
+    // 0005/0006 trial-charge tests pin the charge_now branch (0008 made at_trial_end the default).
     const tr = (fk: ReturnType<typeof mk>, ledger: ReturnType<typeof memoryAddonChargeLedger>, quantity = 2) =>
-      setAddonQuantity({ stripe: fk.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity, env: aenv, now, ledger, newAttemptId: ids });
+      chargeNow({ stripe: fk.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity, env: aenv, now, ledger, newAttemptId: ids });
 
     // Fix 1: per-attempt idempotency key → decline, then retry with a good card → paid
     {
@@ -560,9 +562,9 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
       // same attempt id + same pm (what the OLD key effectively did on a retry): Stripe replays the voided invoice → never paid
       const fk2 = trialIn({ pm: "pm_fail" });
       const L2 = memoryAddonChargeLedger("org_t");
-      await setAddonQuantity({ stripe: fk2.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now, ledger: L2, newAttemptId: () => "adc_same" }).catch(() => null);
+      await chargeNow({ stripe: fk2.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now, ledger: L2, newAttemptId: () => "adc_same" }).catch(() => null);
       const L3 = memoryAddonChargeLedger("org_t2");
-      const c = await setAddonQuantity({ stripe: fk2.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now, ledger: L3, newAttemptId: () => "adc_same" });
+      const c = await chargeNow({ stripe: fk2.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now, ledger: L3, newAttemptId: () => "adc_same" });
       check("0005 fix1: a replayed key that returns a voided invoice is never paid → 502 stripe_error, nothing written (guard in chargeOneOff)", !c.ok && c.status === 502 && fk2.log.some((l) => l.startsWith("invoice.create(replay")) && fk2.log.filter((l) => l.startsWith("pay ")).length === 1 && !fk2.log.some((l) => l.startsWith("create ")), { c, log: fk2.log });
     }
 
@@ -650,8 +652,8 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
       check("0005 fix3: refundAddonCharge finds an existing credit note for the attempt and doesn't create another", again === "cn_prev" && fk.creditNotes.length === 1, { again, cns: fk.creditNotes });
       const ok = await tr(trialIn(), memoryAddonChargeLedger("org_t"));
       check("0005 fix3: happy path still one row → applied", ok.ok, ok);
-      const noLedger = await setAddonQuantity({ stripe: trialIn().client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now }).then(() => "no error", (e: Error) => e.message);
-      check("0005 fix3: a trial increase without a ledger is refused before any Stripe charge", /ledger/.test(noLedger), noLedger);
+      const noLedger = await chargeNow({ stripe: trialIn().client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now }).then(() => "no error", (e: Error) => e.message);
+      check("0005 fix3: (charge_now) a trial increase without a ledger is refused before any Stripe charge", /ledger/.test(noLedger), noLedger);
     }
 
     // 0006 fix 3: the attempt row is marked applied as soon as Stripe confirms the item write, before any later step
@@ -701,12 +703,45 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
 
     // Policy switch (one constant, not an env var)
     {
-      check("TRIAL_ADDON_POLICY is charge_now (flipping it is a reviewed code change: update this test + docs/BILLING.md §11)", TRIAL_ADDON_POLICY === "charge_now");
+      check("TRIAL_ADDON_POLICY is at_trial_end (Brian 2026-10-28, 0008; flipping it is a reviewed code change: update this test + docs/BILLING.md §11)", TRIAL_ADDON_POLICY === "at_trial_end");
       check("trialIncreaseHandling: charge_now → charge the rest of the trial now; at_trial_end → apply free until the trial ends", trialIncreaseHandling("charge_now") === "charge_rest_of_trial_now" && trialIncreaseHandling("at_trial_end") === "apply_free_until_trial_end");
       const fk = trialIn();
       const L = memoryAddonChargeLedger("org_t");
       const r5 = await setAddonQuantityUnderPolicy("at_trial_end", { stripe: fk.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now, ledger: L });
-      check("policy at_trial_end (other branch): trial add applied now with proration none, NO invoice, no attempt row, charge null", r5.ok && r5.action === "created" && r5.charge === null && fk.log.join("|") === "create price_seat x2 none" && L.rows.size === 0, { r5, log: fk.log });
+      check("policy at_trial_end (explicit): trial add applied now with proration none, NO invoice, no attempt row, charge null, free until the trial end", r5.ok && r5.action === "created" && r5.charge === null && r5.proration === "none" && r5.freeUntil === T0 + 7 * 86400 && fk.log.join("|") === "create price_seat x2 none" && L.rows.size === 0, { r5, log: fk.log });
+
+      // 0008: the DEFAULT path (setAddonQuantity, what the route calls) is at_trial_end
+      const te = T0 + 7 * 86400;
+      let fd = trialIn();
+      let Ld = memoryAddonChargeLedger("org_t");
+      let d = await setAddonQuantity({ stripe: fd.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now, ledger: Ld });
+      check("0008 default (at_trial_end): trial add of 2 seats → created now, proration none, NO invoice/payment call, no attempt row, charge null, freeUntil = trial_end", d.ok && d.action === "created" && d.quantity === 2 && d.proration === "none" && d.charge === null && d.freeUntil === te && fd.log.join("|") === "create price_seat x2 none" && !fd.log.some((l) => /^(invoice|finalize|pay|void)/.test(l)) && Ld.rows.size === 0 && fd.keys.length === 0, { d, log: fd.log });
+      fd = trialIn({ items: [{ id: "si_plan", price: "price_p" }, { id: "si_seat", price: "price_seat", q: 2 }] });
+      d = await setAddonQuantity({ stripe: fd.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 5, env: aenv, now });
+      check("0008 default: raising an existing trial add-on (2 → 5) → item updated with proration none, no invoice, works without a ledger", d.ok && d.action === "updated" && d.currentQuantity === 5 && d.proration === "none" && d.charge === null && d.freeUntil === te && fd.log.join("|") === "update si_seat x5 none", { d, log: fd.log });
+      fd = trialIn({ pm: null });
+      d = await setAddonQuantity({ stripe: fd.client, subscription: { id: "sub_x", status: "trialing" }, addon: "location", quantity: 1, env: aenv, now });
+      check("0008 default: no card on file in a trial is NOT a 402 any more (nothing is charged now; the trial-end invoice collects)", d.ok && d.action === "created" && d.charge === null && fd.log.join("|") === "create price_loc x1 none", { d, log: fd.log });
+      fd = trialIn({ payStatus: "decline" });
+      d = await setAddonQuantity({ stripe: fd.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 2, env: aenv, now });
+      check("0008 default: a card that would decline doesn't matter now (no payment attempted)", d.ok && d.charge === null && !fd.log.some((l) => l.startsWith("pay")), { d, log: fd.log });
+      fd = trialIn();
+      d = await setAddonQuantity({ stripe: fd.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 50, env: aenv, now });
+      check("0008 trade-off: a trial user can add up to the cap (50 seats) free for the rest of the trial", d.ok && d.quantity === 50 && d.charge === null && fd.log.join("|") === "create price_seat x50 none", { d, log: fd.log });
+      // pending decrease 4 → 1 at the trial end, then an increase to 6 during the trial: free now, next phase raised to 6
+      fd = trialIn({ items: [{ id: "si_plan", price: "price_p" }, { id: "si_seat", price: "price_seat", q: 4 }] });
+      const dec = await setAddonQuantity({ stripe: fd.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 1, env: aenv, now });
+      d = await setAddonQuantity({ stripe: fd.client, subscription: { id: "sub_x", status: "trialing" }, addon: "seat", quantity: 6, env: aenv, now });
+      console.log("  0008 increase-over-pending-decrease log:", fd.log.join(" | "));
+      check("0008 default: trial increase over a pending decrease → item 6 with proration none, no invoice; the pending decrease is replaced (schedule released: trial end bills 6)", dec.ok && dec.action === "scheduled" && d.ok && d.action === "updated" && d.charge === null && d.proration === "none" && fd.log.includes("update si_seat x6 none") && !fd.log.some((l) => /^(invoice|pay)/.test(l)) && (fd.sched() === null ? fd.log.some((l) => l.startsWith("schedule.release")) : phaseItemsStr(fd.sched()!.phases[1]) === "price_p×1,price_seat×6"), { dec, d, log: fd.log });
+      // a leftover charge_now attempt from before the flip is still settled first under the default policy
+      fd = trialIn();
+      Ld = memoryAddonChargeLedger("org_t");
+      await Ld.insert({ id: "adc_before_flip", subscriptionId: "sub_x", customerId: "cus_1", addon: "seat", priceId: "price_seat", fromQuantity: 0, toQuantity: 2, amount: 467, currency: "usd", paymentMethod: "pm_card" });
+      await Ld.update("adc_before_flip", { status: "paid", invoiceId: "in_before_flip" });
+      fd.invState["in_before_flip"] = { status: "paid", amount: 467 };
+      d = await setAddonQuantity({ stripe: fd.client, subscription: { id: "sub_x", status: "trialing" }, addon: "location", quantity: 1, env: aenv, now, ledger: Ld });
+      check("0008 default: an unresolved charge_now attempt left from before the flip is still settled (refunded, add-on not on the sub) before the free trial add", d.ok && d.charge === null && Ld.rows.get("adc_before_flip")!.status === "refunded" && fd.creditNotes.length === 1, { d, row: Ld.rows.get("adc_before_flip"), cns: fd.creditNotes });
       const fa = mk();
       const r6 = await setAddonQuantityUnderPolicy("at_trial_end", { stripe: fa.client, subscription: { id: "sub_x", status: "active" }, addon: "seat", quantity: 2, env: aenv, now });
       check("policy at_trial_end does not change ACTIVE subscriptions (still prorated + charged now)", r6.ok && r6.charge?.kind === "proration" && fa.log[0] === "create price_seat x2 always_invoice/pending_if_incomplete", { r6, log: fa.log });

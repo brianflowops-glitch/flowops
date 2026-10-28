@@ -3,6 +3,9 @@
 //   B. removing an add-on during a trial keeps trial_end (schedule phases carry trial_end); trial-end invoice = plan only
 //   C. crash after the trial charge (item write + refund fail) → addon_charge row stays paid → sweep refunds once
 //   D. (0006 fix 3) item write confirmed, then a later step (schedule re-read) fails → row already applied → never refunded
+//   A, C, D exercise the "charge_now" BRANCH explicitly (0008 made "at_trial_end" the default):
+//   E. (0008, DEFAULT at_trial_end) trial add → no invoice now, no attempt row; the first invoice at the trial end bills
+//      the plan + the add-ons in full
 //   STRIPE_SECRET_KEY_TEST_US=sk_test_… DATABASE_URL=<throwaway local postgres, migrated> \
 //     npx tsx --conditions=react-server scripts/billing-sandbox-0005.ts
 // Every clock and customer it creates is deleted at the end. The secret key is never printed.
@@ -11,7 +14,7 @@ import { asc, eq } from "drizzle-orm";
 import { getDb, getConn, schema } from "../src/lib/db";
 import { dbAddonChargeLedger, sweepAddonCharges } from "../src/lib/billing/addon-charges-db";
 import { processStripeEvent } from "../src/lib/billing/webhook";
-import { retrieveSubscriptionComplete, setAddonQuantity, TRIAL_ADDON_POLICY, type AddonStripe } from "../src/lib/billing/addons";
+import { retrieveSubscriptionComplete, setAddonQuantity, setAddonQuantityUnderPolicy, TRIAL_ADDON_POLICY, type AddonStripe, type TrialAddonPolicy } from "../src/lib/billing/addons";
 import { getEntitlements } from "../src/lib/billing/org-entitlements";
 import { findLiveSubscription } from "../src/lib/billing/status";
 import { defaultHours } from "../src/lib/tenancy/defaults";
@@ -90,22 +93,24 @@ async function world(label: string, cardToken = "pm_card_visa") {
   const invoices = async () => (await stripe.invoices.list({ customer: customer.id, limit: 30 })).data;
   const seats = async () => { const r = await getEntitlements(ORG, { now: await now(), env }); return r.enforced ? r.entitlements.seats : -1; };
   const ledger = dbAddonChargeLedger(db, ORG);
-  const apply = async (addon: string, quantity: number, client: AddonStripe = stripe as unknown as AddonStripe) => setAddonQuantity({ stripe: client, subscription: await live(), addon, quantity, env, now: await now(), ledger });
+  // A/C/D: the charge_now branch, pinned. applyDefault: exactly what the route calls (TRIAL_ADDON_POLICY).
+  const apply = async (addon: string, quantity: number, client: AddonStripe = stripe as unknown as AddonStripe, policy: TrialAddonPolicy = "charge_now") => setAddonQuantityUnderPolicy(policy, { stripe: client, subscription: await live(), addon, quantity, env, now: await now(), ledger });
+  const applyDefault = async (addon: string, quantity: number) => setAddonQuantity({ stripe: stripe as unknown as AddonStripe, subscription: await live(), addon, quantity, env, now: await now(), ledger });
   const rows = async () => db.select().from(schema.addonCharge).where(eq(schema.addonCharge.organizationId, ORG)).orderBy(asc(schema.addonCharge.createdAt));
   const qty = async (price: string) => (await stripe.subscriptions.retrieve((await live()).id)).items.data.find((i) => i.price.id === price)?.quantity ?? 0;
-  return { clock, ORG, customer, drain, now, live, invoices, seats, apply, qty, ledger, rows };
+  return { clock, ORG, customer, drain, now, live, invoices, seats, apply, applyDefault, qty, ledger, rows };
 }
 
 (async () => {
   const acct = await stripe.accounts.retrieveCurrent();
   check(`connected to the expected US sandbox account (${EXPECT_ACCOUNT}), test mode`, acct.id === EXPECT_ACCOUNT);
   if (acct.id !== EXPECT_ACCOUNT) process.exit(1);
-  check("TRIAL_ADDON_POLICY = charge_now (default)", TRIAL_ADDON_POLICY === "charge_now");
+  check("TRIAL_ADDON_POLICY = at_trial_end (default since 0008); A, C, D pin the charge_now branch", TRIAL_ADDON_POLICY === "at_trial_end");
   const customers: string[] = [];
   const trialSub = (w: Awaited<ReturnType<typeof world>>) => stripe.subscriptions.create({ customer: w.customer.id, items: [{ price: P.pro_month }], trial_period_days: 14, trial_settings: { end_behavior: { missing_payment_method: "cancel" } }, metadata: { organizationId: w.ORG, flowops_test: "0005" } });
   try {
     // ═══ A. decline → retry with a good card → paid ═══
-    console.log("\n── A. Trial add: declined, then retried with a good card ──");
+    console.log("\n── A. (charge_now branch) Trial add: declined, then retried with a good card ──");
     const a = await world("retry", "pm_card_chargeCustomerFail");
     customers.push(a.customer.id);
     const aSub = await trialSub(a);
@@ -145,7 +150,7 @@ async function world(label: string, cardToken = "pm_card_visa") {
     check("at the trial end: active, first invoice = Pro $99 only (seat dropped at trial end), seats 0", cS.status === "active" && first?.status === "paid" && first.amount_paid === 9900 && (await a.qty(P.seat_month)) === 0, { st: cS.status, inv: RECORD.trialEndInvoice });
 
     // ═══ C. crash after the trial charge → sweep refunds exactly once ═══
-    console.log("\n── C. Crash after the trial charge, settled by the sweep ──");
+    console.log("\n── C. (charge_now branch) Crash after the trial charge, settled by the sweep ──");
     const c = await world("crash");
     customers.push(c.customer.id);
     const cSub = await trialSub(c);
@@ -186,7 +191,7 @@ async function world(label: string, cardToken = "pm_card_visa") {
     check("the next add (no faults) charges and applies normally", ok.ok && ok.charge?.kind === "trial_proration" && (await c.qty(P.seat_month)) === 1, ok);
 
     // ═══ D. 0006 fix 3: applied as soon as Stripe confirms the item, so a later failure never refunds ═══
-    console.log("\n── D. (0006) Item confirmed, then a later step fails ──");
+    console.log("\n── D. (0006, charge_now branch) Item confirmed, then a later step fails ──");
     const dec = await c.apply("seat", 0); // pending removal at the trial end → a schedule with a next phase
     check("D setup: seat 1 → 0 in the trial is scheduled (schedule with a next phase)", dec.ok && dec.action === "scheduled", dec);
     let schedReads = 0;
@@ -210,6 +215,48 @@ async function world(label: string, cardToken = "pm_card_visa") {
     sw = await sweepAddonCharges(db, stripe as unknown as AddonStripe, { olderThanMs: 0 });
     const dCns = (await stripe.creditNotes.list({ invoice: dInv!.id!, limit: 10 })).data;
     check("0006 fix3: the sweep leaves it alone: no credit note, row still applied, seats still 3", dCns.length === 0 && (await c.rows())[before].status === "applied" && !sw.some((x) => x.id === dRows[0].id) && (await c.qty(P.seat_month)) === 3, { sweep: sw.filter((x) => x.orgId === c.ORG), cns: dCns.length });
+
+    // ═══ E. 0008 DEFAULT (at_trial_end): free now, billed in full on the first invoice at the trial end ═══
+    console.log("\n── E. (0008, default at_trial_end) Trial add: no invoice now; billed on the first invoice at the trial end ──");
+    const e = await world("trialend");
+    customers.push(e.customer.id);
+    const eSub = await trialSub(e);
+    await advance(e.clock.id, eSub.trial_start! + 5 * 86400);
+    await e.drain();
+    const invs0 = await e.invoices();
+    RECORD.e_invoicesBefore = invs0.map((i) => ({ id: i.id, reason: i.billing_reason, amount_paid: i.amount_paid, total: i.total }));
+    const r1 = await e.applyDefault("seat", 2);
+    const r2 = await e.applyDefault("location", 1);
+    const invs1 = await e.invoices();
+    const eS = await stripe.subscriptions.retrieve(eSub.id);
+    RECORD.e_adds = { r1: r1.ok ? { action: r1.action, proration: r1.proration, charge: r1.charge, freeUntil: r1.freeUntil } : r1, r2: r2.ok ? { action: r2.action, proration: r2.proration, charge: r2.charge, freeUntil: r2.freeUntil } : r2, invoicesAfter: invs1.map((i) => ({ id: i.id, reason: i.billing_reason, amount_paid: i.amount_paid })), pending: eS.pending_update ?? null };
+    check("default trial add (2 seats, 1 location) → ok, created, proration none, charge null, freeUntil = trial_end", r1.ok && r1.action === "created" && r1.proration === "none" && r1.charge === null && r1.freeUntil === eSub.trial_end && r2.ok && r2.action === "created" && r2.charge === null && r2.freeUntil === eSub.trial_end, RECORD.e_adds);
+    // Stripe itself issues a $0 "Free trial for N × …" invoice (billing_reason subscription_update) for an item change during
+    // a free trial (docs.stripe.com/billing/subscriptions/prorations: "updating a subscription during a free trial period …
+    // creates a non-proration debit"). Nothing is charged: every such invoice is $0 and there are no charges.
+    const newInvs = invs1.filter((i) => !invs0.some((x) => x.id === i.id));
+    const chargesNow = (await stripe.charges.list({ customer: e.customer.id, limit: 10 })).data;
+    RECORD.e_newInvoices = newInvs.map((i) => ({ id: i.id, reason: i.billing_reason, total: i.total, amount_paid: i.amount_paid, lines: i.lines.data.map((l) => [l.amount, l.description]) }));
+    check("NO immediate charge: no invoice above $0 (Stripe's own $0 'Free trial for …' subscription_update invoices only), no Stripe charge, no addon_charge rows", invs1.every((i) => i.total === 0 && i.amount_paid === 0) && newInvs.every((i) => i.billing_reason === "subscription_update" && i.lines.data.every((l) => l.amount === 0 && /^Free trial for/.test(l.description ?? ""))) && chargesNow.length === 0 && (await e.rows()).length === 0, { newInvoices: RECORD.e_newInvoices, charges: chargesNow.length });
+    check("items active now (seats 2, location 1), still trialing with trial_end unchanged, no pending update", (await e.qty(P.seat_month)) === 2 && (await e.qty(P.location_month)) === 1 && eS.status === "trialing" && eS.trial_end === eSub.trial_end && !eS.pending_update, { st: eS.status });
+    const [proP, seatP, locP] = await Promise.all([P.pro_month, P.seat_month, P.location_month].map((id) => stripe.prices.retrieve(id)));
+    const expectFirst = proP.unit_amount! + 2 * seatP.unit_amount! + locP.unit_amount!;
+    const preview = await stripe.invoices.createPreview({ customer: e.customer.id, subscription: eSub.id });
+    RECORD.e_preview = { total: preview.total, period_start: preview.period_start, lines: preview.lines.data.map((l) => ({ amount: l.amount, desc: l.description })) };
+    check(`upcoming invoice (preview) at the trial end = Pro + 2 seats + 1 location = ${expectFirst}¢, no proration lines`, preview.total === expectFirst && preview.lines.data.every((l) => !(l as unknown as { proration?: boolean }).proration && !(l as unknown as { parent?: { subscription_item_details?: { proration?: boolean } } }).parent?.subscription_item_details?.proration), RECORD.e_preview);
+    await advance(e.clock.id, eSub.trial_end! + 3600);
+    await e.drain();
+    const eInvs = await e.invoices();
+    const eFirst = eInvs.find((i) => i.billing_reason === "subscription_cycle");
+    const eA = await stripe.subscriptions.retrieve(eSub.id);
+    RECORD.e_firstInvoice = eFirst && { id: eFirst.id, status: eFirst.status, amount_paid: eFirst.amount_paid, created: eFirst.created, period_start: eFirst.period_start, lines: eFirst.lines.data.map((l) => ({ amount: l.amount, qty: l.quantity, desc: l.description })) };
+    RECORD.e_invoicesAll = eInvs.map((i) => ({ id: i.id, reason: i.billing_reason, amount_paid: i.amount_paid, status: i.status }));
+    check(`at the trial end: active; FIRST invoice PAID = ${expectFirst}¢ (Pro ${proP.unit_amount} + 2 × ${seatP.unit_amount} + ${locP.unit_amount}), created at the trial end`, eA.status === "active" && eFirst?.status === "paid" && eFirst.amount_paid === expectFirst && Math.abs(eFirst.created - eSub.trial_end!) < 2 * 3600, RECORD.e_firstInvoice);
+    const eCharges = (await stripe.charges.list({ customer: e.customer.id, limit: 10 })).data;
+    RECORD.e_charges = eCharges.map((c) => ({ id: c.id, amount: c.amount, status: c.status }));
+    check("the trial-end invoice is the ONLY non-zero invoice and the only charge: the add-ons were never charged separately", eInvs.filter((i) => i.amount_paid > 0).length === 1 && eInvs.filter((i) => i.amount_paid > 0)[0].id === eFirst?.id && eCharges.length === 1 && eCharges[0].amount === expectFirst, { invoices: RECORD.e_invoicesAll, charges: RECORD.e_charges });
+    const eSeats = await e.seats();
+    check("entitlements after the trial (webhook mirror): Pro 10 + 2 add-on seats = 12", eSeats === 12, eSeats);
   } catch (e) {
     failed++;
     console.log("ERROR", e instanceof Error ? e.message : e);

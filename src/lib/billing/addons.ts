@@ -7,9 +7,10 @@
  *     (monthly or annual). Active subscription: Stripe prorates (`proration_behavior: "always_invoice"`) and the
  *     write uses `payment_behavior: "pending_if_incomplete"`, so the new quantity only takes effect once that
  *     immediate invoice is paid. A failed payment voids the invoice, which discards the pending update: nothing is
- *     granted and the caller gets 402. During a free TRIAL Stripe's proration is $0, so the add-on's rate for the
- *     rest of the trial is charged now on a standalone invoice before the quantity is applied (addon-charge.ts);
- *     no card on file → 402. Full price from the next renewal either way.
+ *     granted and the caller gets 402. During a free TRIAL (0008, Brian 2026-10-28: `TRIAL_ADDON_POLICY = "at_trial_end"`)
+ *     the increase is applied now with no charge (`proration_behavior: "none"`, no invoice) and the FIRST invoice at
+ *     the trial end bills it in full with the plan. (The older "charge_now" branch, which charged the rest of the
+ *     trial on a standalone invoice before applying, is kept and tested but is not the default.)
  *   - Decrease / removal (unchanged): the add-on stays active until the current period ends, then drops at renewal.
  *     Done with a subscription schedule whose next phase holds the lower quantity. No refund, no proration credit.
  *   - A later change replaces a pending one (see `setAddonQuantity`).
@@ -27,8 +28,10 @@ type Env = Record<string, string | undefined>;
 /**
  * What an add-on INCREASE during a free trial costs:
  *   "charge_now"   → the add-on's rate for the rest of the trial is charged immediately on a standalone invoice, and
- *                    the quantity is applied only once that is paid (Brian, 2026-10-27; the default).
- *   "at_trial_end" → applied now with no charge; the first invoice at the end of the trial bills it in full.
+ *                    the quantity is applied only once that is paid (Brian, 2026-10-27; the default until 0008).
+ *   "at_trial_end" → applied now with no charge; the first invoice at the end of the trial bills it in full
+ *                    (Brian, 2026-10-28; THE DEFAULT since 0008). Trade-off: a trial user can add up to the caps
+ *                    (e.g. 50 seats, 10 locations) free for the rest of the trial and cancel before it ends.
  * Decreases/removals are the same under both (scheduled for the renewal, no credit).
  */
 export type TrialAddonPolicy = "charge_now" | "at_trial_end";
@@ -36,9 +39,12 @@ export type TrialAddonPolicy = "charge_now" | "at_trial_end";
 /**
  * THE ONE PLACE to flip the trial add-on rule. Deliberately a code constant reviewed in a PR, NOT an env var or a
  * runtime setting (billing rules must not be flippable at runtime). Changing it also requires updating the guard
- * test in scripts/billing-tests.ts ("TRIAL_ADDON_POLICY is charge_now") and docs/BILLING.md §11.
+ * test in scripts/billing-tests.ts ("TRIAL_ADDON_POLICY is at_trial_end") and docs/BILLING.md §11.
+ * Under "at_trial_end" the trial-charge code (chargeTrialIncrease, per-attempt keys, the addon_charge ledger and its
+ * sweep/cron) is not reached by new requests; it stays because it IS the "charge_now" branch and it still settles
+ * any attempt rows written before the flip.
  */
-export const TRIAL_ADDON_POLICY: TrialAddonPolicy = "charge_now";
+export const TRIAL_ADDON_POLICY: TrialAddonPolicy = "at_trial_end";
 
 /** How a trial increase is handled under a policy (pure; both branches are tested). */
 export function trialIncreaseHandling(policy: TrialAddonPolicy): "charge_rest_of_trial_now" | "apply_free_until_trial_end" {
@@ -188,9 +194,12 @@ export type AddonChangeResult =
       /** Unix seconds when a scheduled decrease takes effect (the renewal), else null. */
       effectiveAt: number | null;
       itemId: string | null;
-      /** "always_invoice" for an increase (charged now, prorated); "none" for decreases / no change. */
+      /** "always_invoice" for an increase that was charged now (prorated); "none" for decreases / no change and for a
+       *  trial increase applied free until the trial ends (at_trial_end). */
       proration: "none" | "always_invoice";
       charge: AddonCharge | null;
+      /** Trial increase applied free (at_trial_end): unix seconds of the trial end, when the first invoice bills it. Else null. */
+      freeUntil?: number | null;
     }
   | { ok: false; status: 400 | 402 | 404 | 409 | 502; error: string; code?: "payment_failed" | "no_payment_method" | "stripe_error"; portal?: boolean };
 
@@ -205,7 +214,7 @@ export interface ChangeAddonInput {
   /** "Now" for the trial proration (a test clock's frozen time in the sandbox). Default: the real clock. */
   now?: Date;
   /**
-   * Required for trial increases under "charge_now": the per-attempt `addon_charge` record (addon-charges-db.ts in
+   * Required for trial increases under "charge_now" (not the default since 0008): the per-attempt `addon_charge` record (addon-charges-db.ts in
    * the app). The CALLER MUST HOLD THE ORG ROW LOCK (the route does): unresolved attempts of this org are settled
    * first (`reconcileAddonCharges`), which is only safe when no other request of the org is in flight.
    */
@@ -286,10 +295,16 @@ export async function setAddonQuantityUnderPolicy(policy: TrialAddonPolicy, { st
   const currentQty = existing?.quantity ?? 0;
   const none = "none" as const;
   let charge: AddonCharge | null = null;
-  const done = (action: Extract<AddonChangeResult, { ok: true }>["action"], effectiveAt: number | null = null, itemId: string | null = existing?.id ?? null): AddonChangeResult => ({
-    ok: true, action, addon: cfg.key, quantity, currentQuantity: action === "created" || action === "updated" ? quantity : currentQty, effectiveAt, itemId,
-    proration: action === "created" || action === "updated" ? "always_invoice" : none, charge,
-  });
+  const done = (action: Extract<AddonChangeResult, { ok: true }>["action"], effectiveAt: number | null = null, itemId: string | null = existing?.id ?? null): AddonChangeResult => {
+    const written = action === "created" || action === "updated";
+    // A trial increase that was not charged now (at_trial_end, or no trial time left) is free until the trial end.
+    const freeTrialAdd = written && trialing && !charge;
+    return {
+      ok: true, action, addon: cfg.key, quantity, currentQuantity: written ? quantity : currentQty, effectiveAt, itemId,
+      proration: written && !freeTrialAdd ? "always_invoice" : none, charge,
+      freeUntil: freeTrialAdd ? (sub.trial_end ?? null) : null,
+    };
+  };
 
   // The subscription's schedule (ours, or one the portal made for a scheduled downgrade), if any.
   const scheduleId = sub.schedule ? priceIdOf(sub.schedule as string | { id: string }) : null;

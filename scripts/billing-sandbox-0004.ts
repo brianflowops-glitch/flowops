@@ -1,6 +1,6 @@
 // LIVE Stripe SANDBOX check of patch 0004 (docs/BILLING.md §11): mid-period add-on increases are charged NOW,
-// prorated (always_invoice + pending_if_incomplete); a declined proration grants nothing; trial adds are charged
-// for the rest of the trial; removals still wait for the renewal. TEST MODE ONLY, never production.
+// prorated (always_invoice + pending_if_incomplete); a declined proration grants nothing; trial adds (0008, default
+// at_trial_end) are applied free with NO invoice until the trial end; removals still wait for the renewal. TEST MODE ONLY, never production.
 //   STRIPE_SECRET_KEY_TEST_US=sk_test_… DATABASE_URL=<throwaway local postgres, migrated> \
 //     npx tsx --conditions=react-server scripts/billing-sandbox-0004.ts
 // Real FlowOps code (setAddonQuantity, processStripeEvent, getEntitlements) against real Stripe objects on TEST
@@ -169,28 +169,29 @@ async function world(label: string) {
     RECORD.renewal = ren && { id: ren.id, status: ren.status, amount_paid: ren.amount_paid };
     check("RENEWAL: $99 + 3 × $10 = $129, no double charge for the prorated seats", ren?.status === "paid" && ren.amount_paid === 12900, RECORD.renewal);
 
-    // ═══ D. Trial: add charged for the rest of the trial; no card → 402 ═══
-    console.log("\n── D. Trial add-on charge ──");
+    // ═══ D. Trial (0008 default at_trial_end): add applied free, no invoice now; no card is not a 402 any more ═══
+    console.log("\n── D. Trial add-on (at_trial_end): no immediate invoice ──");
     const t = await world("trial");
     customers.push(t.customer.id);
     const tSub = await stripe.subscriptions.create({ customer: t.customer.id, items: [{ price: P.pro_month }], trial_period_days: 14, trial_settings: { end_behavior: { missing_payment_method: "cancel" } }, metadata: { organizationId: t.ORG, flowops_test: "0004" } });
     await t.drain();
     await advance(t.clock.id, tSub.trial_start! + 7 * 86400);
-    const tNow = Math.floor((await t.now()).getTime() / 1000);
+    const tInvs0 = await t.invoices();
     r = await t.apply("seat", 1);
-    const tInv = r.ok && r.charge ? await stripe.invoices.retrieve(r.charge.invoiceId) : undefined;
-    const monthFromNow = Date.UTC(new Date(tNow * 1000).getUTCFullYear(), new Date(tNow * 1000).getUTCMonth() + 1, new Date(tNow * 1000).getUTCDate(), new Date(tNow * 1000).getUTCHours(), new Date(tNow * 1000).getUTCMinutes(), new Date(tNow * 1000).getUTCSeconds()) / 1000;
-    const tExpected = Math.round(1000 * (tSub.trial_end! - tNow) / (monthFromNow - tNow));
-    RECORD.trialInvoice = tInv && { id: tInv.id, status: tInv.status, amount_paid: tInv.amount_paid, expected: tExpected, metadata: tInv.metadata };
-    check(`trialing + 1 seat → charged NOW on our own invoice for the rest of the trial (≈ ${tExpected}¢), item added`, r.ok && r.charge?.kind === "trial_proration" && tInv?.status === "paid" && Math.abs(tInv.amount_paid - tExpected) <= 2 && (await t.qty(P.seat_month)) === 1, { r, inv: RECORD.trialInvoice });
+    const tInvs1 = await t.invoices();
+    RECORD.trialAdd = { result: r.ok ? { action: r.action, proration: r.proration, charge: r.charge, freeUntil: r.freeUntil } : r, invoicesBefore: tInvs0.map((i) => ({ id: i.id, amount_paid: i.amount_paid })), invoicesAfter: tInvs1.map((i) => ({ id: i.id, amount_paid: i.amount_paid })) };
+    check("trialing + 1 seat (default at_trial_end) → created, proration none, charge null, freeUntil = trial_end, item added", r.ok && r.action === "created" && r.proration === "none" && r.charge === null && r.freeUntil === tSub.trial_end && (await t.qty(P.seat_month)) === 1, RECORD.trialAdd);
+    // Stripe issues its own $0 "Free trial for 1 × …" invoice (subscription_update) for an item change in a free trial; nothing is charged.
+    const tCharges = (await stripe.charges.list({ customer: t.customer.id, limit: 10 })).data;
+    check("NO immediate charge: every invoice is $0 (only Stripe's $0 'Free trial for …' subscription_update one is new), no Stripe charge", tInvs1.every((i) => i.total === 0 && i.amount_paid === 0) && tInvs1.filter((i) => !tInvs0.some((x) => x.id === i.id)).every((i) => i.billing_reason === "subscription_update") && tCharges.length === 0, { ...RECORD.trialAdd as object, charges: tCharges.length });
     const tS = await stripe.subscriptions.retrieve(tSub.id);
     check("still trialing, trial end unchanged", tS.status === "trialing" && tS.trial_end === tSub.trial_end);
-    // no card at all
+    // no card at all: nothing is charged now, so the add still applies (the trial-end invoice needs a card; without one
+    // Stripe cancels the subscription at the trial end: trial_settings.end_behavior.missing_payment_method = cancel)
     await stripe.customers.update(t.customer.id, { invoice_settings: { default_payment_method: "" } });
     for (const pm of (await stripe.paymentMethods.list({ customer: t.customer.id, type: "card" })).data) await stripe.paymentMethods.detach(pm.id);
-    const tInvs = (await t.invoices()).length;
     r = await t.apply("seat", 2);
-    check("trialing, no card on file → 402 no_payment_method, nothing created, seats still 1", !r.ok && r.status === 402 && r.code === "no_payment_method" && (await t.invoices()).length === tInvs && (await t.qty(P.seat_month)) === 1, r);
+    check("trialing, no card on file → still applied free (seats 2), every invoice $0, no charge, not a 402", r.ok && r.action === "updated" && r.charge === null && (await t.invoices()).every((i) => i.amount_paid === 0) && (await stripe.charges.list({ customer: t.customer.id, limit: 10 })).data.length === 0 && (await t.qty(P.seat_month)) === 2, r);
   } catch (err) {
     failed++;
     console.log("FAIL  script error:", err instanceof Error ? err.stack ?? err.message : err);

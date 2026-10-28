@@ -15,7 +15,7 @@ import { DEMO_ORG_ID, defaultHours } from "../src/lib/tenancy/defaults";
 import { AddonChangeBusy, AddonLockUnavailable, addonLockFailureResponse, dbAddonChargeLedger, sweepAddonCharges, withAddonChangeLock } from "../src/lib/billing/addon-charges-db";
 import { Pool } from "pg";
 import { connectSession, getSessionPool, isPoolTimeout, type SessionClient } from "../src/lib/db";
-import { setAddonQuantity, type AddonStripe } from "../src/lib/billing/addons";
+import { setAddonQuantity, setAddonQuantityUnderPolicy, type AddonStripe } from "../src/lib/billing/addons";
 
 if (/neon\.tech|vercel|amazonaws/.test(process.env.DATABASE_URL ?? "")) throw new Error("Refusing to run against a hosted database");
 
@@ -603,7 +603,8 @@ const expectUnique = async (db: ReturnType<typeof getDb>, invoiceId: string) => 
     fx.throwItem = true; fx.cnDown = 1;
     let attemptId = "";
     const crashed = await withAddonChangeLock(CORG, (ledger) =>
-      setAddonQuantity({ stripe: fstripe, subscription: { id: base.subscriptionId, status: "trialing" }, addon: "seat", quantity: 2, env: { STRIPE_ADDON_PRICE_SEAT: "price_c_seat", STRIPE_PRICE_PRO: "price_c_plan" }, now: new Date(T0 * 1000), ledger, newAttemptId: () => (attemptId = `adc_crash_${n}`) }),
+      // 0008: the trial-charge path is the charge_now BRANCH now (default at_trial_end never charges a trial add); pinned here.
+      setAddonQuantityUnderPolicy("charge_now", { stripe: fstripe, subscription: { id: base.subscriptionId, status: "trialing" }, addon: "seat", quantity: 2, env: { STRIPE_ADDON_PRICE_SEAT: "price_c_seat", STRIPE_PRICE_PRO: "price_c_plan" }, now: new Date(T0 * 1000), ledger, newAttemptId: () => (attemptId = `adc_crash_${n}`) }),
     ).then(() => "no error", (e: Error) => e.message);
     r0 = await rowOf(attemptId);
     check("crash after the trial charge (item write fails, refund unreachable): error surfaces, lock released, addon_charge row survives as PAID", crashed === "crash" && r0?.status === "paid" && !!r0.stripeInvoiceId && fx.inv.get(r0.stripeInvoiceId!)?.status === "paid" && fx.qty === 0 && fx.cns.length === 0, { crashed, r0 });
@@ -722,14 +723,15 @@ const expectUnique = async (db: ReturnType<typeof getDb>, invoiceId: string) => 
     const sessionPool = getSessionPool();
     let maxCheckedOut = 0;
     const sampler = setInterval(() => (maxCheckedOut = Math.max(maxCheckedOut, sessionPool.totalCount - sessionPool.idleCount)), 5);
-    // Exactly what POST /api/billing/addons does after its guards: lock → setAddonQuantity with the ledger → unlock.
+    // What POST /api/billing/addons does after its guards: lock → setAddonQuantity with the ledger → unlock. Pinned to the
+    // charge_now branch (0008) so the double-charge guarantee for trial charges stays covered; the default is checked below.
     const request = (org: string, quantity: number) =>
       withAddonChangeLock(org, async (ledger) => {
         active.set(org, (active.get(org) ?? 0) + 1);
         maxActive.set(org, Math.max(maxActive.get(org) ?? 0, active.get(org)!));
         maxGlobal = Math.max(maxGlobal, ++global);
         try {
-          return await setAddonQuantity({ stripe: fakes.get(org)!.stripe, subscription: { id: `sub_${org}`, status: "trialing" }, addon: "seat", quantity, env: ENV, now: new Date(T0 * 1000), ledger });
+          return await setAddonQuantityUnderPolicy("charge_now", { stripe: fakes.get(org)!.stripe, subscription: { id: `sub_${org}`, status: "trialing" }, addon: "seat", quantity, env: ENV, now: new Date(T0 * 1000), ledger });
         } finally {
           active.set(org, active.get(org)! - 1);
           global--;
@@ -755,6 +757,19 @@ const expectUnique = async (db: ReturnType<typeof getDb>, invoiceId: string) => 
       othersOk &&= fakes.get(o)!.f.paid.length === 1 && rows.length === 1 && rows[0].status === "applied";
     }
     check("0006 concurrency: orgs B, C, D each charged once and applied; different orgs ran in parallel", othersOk && maxGlobal > 1, { maxGlobal });
+
+    // 0008 default (at_trial_end) through the real lock + DB ledger: 3 simultaneous trial adds for one org → applied
+    // once, NO invoice at all, NO addon_charge row.
+    {
+      const EORG = `org_conc_e_${n}`;
+      await db.insert(schema.organization).values({ id: EORG, slug: `conc-e-${n}`, name: "Concurrency E", hours: defaultHours() });
+      const fe = mkFake(EORG);
+      const viaRoute = () => withAddonChangeLock(EORG, (ledger) => setAddonQuantity({ stripe: fe.stripe, subscription: { id: `sub_${EORG}`, status: "trialing" }, addon: "seat", quantity: 2, env: ENV, now: new Date(T0 * 1000), ledger }));
+      const rs = await Promise.all([viaRoute(), viaRoute(), viaRoute()]);
+      const rowsE = await db.select().from(schema.addonCharge).where(eq(schema.addonCharge.organizationId, EORG));
+      check("0008 default at_trial_end (real lock + DB ledger): 3 simultaneous trial adds → created once + 2 unchanged, qty 2, no invoice created or paid, no addon_charge row", rs.filter((r) => r.ok && r.action === "created").length === 1 && rs.filter((r) => r.ok && r.action === "unchanged").length === 2 && rs.every((r) => r.ok && r.charge === null) && fe.f.qty === 2 && fe.f.nInv === 0 && fe.f.paid.length === 0 && rowsE.length === 0, { rs, f: { qty: fe.f.qty, nInv: fe.f.nInv }, rows: rowsE.length });
+      ORGS.push(EORG);
+    }
     check(`0006 concurrency: never more than ${sessionPool.options.max} session connections in use (one per request holding the lock; waiters hold none)`, maxCheckedOut >= 1 && maxCheckedOut <= (sessionPool.options.max ?? 0), { maxCheckedOut });
     console.log(`  0006 concurrency: 8 requests in ${took} ms, results ${JSON.stringify(res)}, max in-lock at once ${maxGlobal}, max session connections in use ${maxCheckedOut}/${sessionPool.options.max}`);
     await sleep(50);

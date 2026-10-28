@@ -41,9 +41,10 @@ export async function GET(req: Request) {
 /**
  * Owner or Admin sets a RECURRING add-on's quantity (seat, location, branding; text packs are one-time, see text-packs/route.ts) on the org's existing subscription (0 removes it).
  * The quantity may not exceed the add-on's maximum (400; see `addonMaxQuantity`).
- * An increase or new add-on is CHARGED NOW, prorated for the rest of the current period (Stripe `always_invoice`;
- * during a free trial the rest of the trial at the add-on's rate, on its own invoice) and applies only once that
- * charge is paid: a declined card (or no card on file in a trial) → 402 with a portal pointer, nothing added.
+ * On an active subscription an increase or new add-on is CHARGED NOW, prorated for the rest of the current period
+ * (Stripe `always_invoice`) and applies only once that charge is paid: a declined card → 402 with a portal pointer,
+ * nothing added. During a free trial (TRIAL_ADDON_POLICY "at_trial_end", 0008) it is applied now with no charge and
+ * billed in full on the first invoice at the trial end (`freeUntil` in the response).
  * A decrease or removal stays active until the period ends, then drops (a subscription schedule's next phase;
  * see addons.ts). No refund, no credit. Changes for one org are serialised (per-org advisory lock on ONE dedicated
  * connection, `withAddonChangeLock`) so a double click can't double-charge; 409 `change_in_progress` if another change
@@ -84,6 +85,7 @@ export async function POST(req: Request) {
   }
   if (!result.ok) return Response.json({ error: result.error, ...(result.code ? { code: result.code } : {}), ...(result.portal ? { portal: "/api/billing/portal" } : {}) }, { status: result.status });
   const effectiveAt = result.effectiveAt ? new Date(result.effectiveAt * 1000).toISOString() : null;
+  const freeUntil = result.freeUntil ? new Date(result.freeUntil * 1000).toISOString() : null;
   const note =
     result.action === "scheduled"
       ? `Stays active until ${effectiveAt}, then ${result.quantity === 0 ? "is removed" : `drops to ${result.quantity}`} at renewal. No credit for the unused time.`
@@ -93,6 +95,8 @@ export async function POST(req: Request) {
           ? effectiveAt ? `Already scheduled for ${effectiveAt}.` : "No change."
           : result.charge
             ? `Active now. Charged ${(result.charge.amountPaid / 100).toFixed(2)} ${result.charge.currency.toUpperCase()} now, prorated ${result.charge.kind === "trial_proration" ? "for the rest of the free trial" : "for the rest of this billing period"}; full price from the next renewal.`
-            : "Active now; full price from the next renewal.";
-  return Response.json({ ...result, effectiveAt, billing: note });
+            : freeUntil
+              ? `Active now, free for the rest of the trial. Billed in full from the first invoice when the trial ends (${freeUntil}); nothing is charged now.`
+              : "Active now; full price from the next renewal.";
+  return Response.json({ ...result, effectiveAt, freeUntil, billing: note });
 }

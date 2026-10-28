@@ -191,7 +191,19 @@ describe("POST/GET /api/billing/addons guards", () => {
       expect(set).not.toHaveBeenCalled();
     });
 
-    it("200 in a trial: says it covers the rest of the free trial", async () => {
+    it("200 in a trial (default at_trial_end, 0008): free now, billed in full on the first invoice at the trial end", async () => {
+      live("trialing");
+      spies.push(vi.spyOn(addonsLib, "setAddonQuantity").mockResolvedValue({ ok: true, action: "updated", addon: "seat", quantity: 3, currentQuantity: 3, effectiveAt: null, itemId: "si_1", proration: "none", charge: null, freeUntil: 1800000000 }));
+      const res = await post(admin, { addon: "seat", quantity: 3 });
+      expect(res.status).toBe(200);
+      const j = await res.json();
+      expect(j).toMatchObject({ proration: "none", charge: null, freeUntil: new Date(1800000000 * 1000).toISOString() });
+      expect(j.billing).toContain("free for the rest of the trial");
+      expect(j.billing).toContain("first invoice when the trial ends (2027-01-15T08:00:00.000Z)");
+      expect(j.billing).toContain("nothing is charged now");
+    });
+
+    it("200 in a trial under the charge_now branch: says it covers the rest of the free trial", async () => {
       live("trialing");
       spies.push(vi.spyOn(addonsLib, "setAddonQuantity").mockResolvedValue({ ok: true, action: "updated", addon: "seat", quantity: 3, currentQuantity: 3, effectiveAt: null, itemId: "si_1", proration: "always_invoice", charge: { kind: "trial_proration", invoiceId: "in_2", amountPaid: 460, currency: "usd" } }));
       const res = await post(admin, { addon: "seat", quantity: 3 });
