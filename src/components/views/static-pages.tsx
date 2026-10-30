@@ -228,29 +228,11 @@ export function IntegrationsPage() {
   );
 }
 
-const TIERS = [
-  { name: "Starter", for: "Small teams", features: ["Booking Engine", "Core dashboards", "Community support"] },
-  { name: "Pro", for: "Growing ops teams", features: ["All modules", "Automation Center", "Standard integrations"] },
-  { name: "Enterprise", for: "Large organisations", features: ["SSO & advanced policies", "Custom agents", "Hybrid / on-prem LLMs"] },
-  { name: "MSP Edition", for: "Managed service providers", features: ["Multi-tenant console", "Per-tenant billing", "White-label"] },
-];
-
-/** Plans + roadmap (sample / planning content) shown under the real Administration settings. */
+/** Roadmap (planning content) shown under the real Administration settings. The stale "Plans" placeholder card was removed; real plans live in the Billing card. */
 export function AdminPlans() {
   return (
     <div className="mt-5">
       <div className="grid gap-5 xl:grid-cols-3">
-        <Card className="xl:col-span-3" title="Plans" subtitle="Usage + seat hybrid pricing (from the business plan; prices not set)">
-          <div className="grid gap-3 md:grid-cols-4">
-            {TIERS.map((t) => (
-              <div key={t.name} className="rounded-xl border border-white/[0.07] bg-white/[0.015] p-4">
-                <p className="font-semibold text-white">{t.name}</p>
-                <p className="mb-2 text-[11px] text-slate-500">{t.for}</p>
-                <Planned items={t.features} />
-              </div>
-            ))}
-          </div>
-        </Card>
         <Card className="xl:col-span-3" title="Roadmap" subtitle="Next steps after v1">
           <div className="grid gap-2 md:grid-cols-3">
             {ROADMAP.map((r) => (
