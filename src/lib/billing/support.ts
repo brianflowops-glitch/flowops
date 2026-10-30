@@ -1,2 +1,6 @@
-/** Billing support contact: the app's existing contact address (marketing pages, terms). Client-safe. */
-export { CONTACT_EMAIL as BILLING_SUPPORT_EMAIL } from "@/components/marketing/site-chrome";
+/**
+ * Billing support contact: the one address every billing message points at (billing card, plan-change / cancel
+ * stopgap answers from /api/billing/plan and /api/billing/cancel, docs/BILLING.md). Client-safe (no server imports).
+ * Deliberately separate from the general site contact (CONTACT_EMAIL in components/marketing/site-chrome.tsx).
+ */
+export const BILLING_SUPPORT_EMAIL = "billing@flowopsagent.ai";

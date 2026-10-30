@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Card, Pill } from "../ui";
+import { BILLING_SUPPORT_EMAIL } from "@/lib/billing/support";
 
 type Interval = "month" | "year";
 interface PlanState {
@@ -76,7 +77,7 @@ export function BillingCard() {
   if (state === "off") return null;
   if (!state) return <Card title="Billing"><p className="animate-pulse font-mono text-xs text-slate-500">loading…</p></Card>;
   const sub = state.subscription;
-  const support = `mailto:${state.supportEmail}?subject=${encodeURIComponent("FlowOps billing")}`;
+  const support = `mailto:${BILLING_SUPPORT_EMAIL}?subject=${encodeURIComponent("FlowOps billing")}`;
   const keys = [...new Set(state.plans.map((p) => p.key))].sort((a, b) => (TIERS.indexOf(a) + 99) % 99 - (TIERS.indexOf(b) + 99) % 99);
   const hasAnnual = state.plans.some((p) => p.interval === "year");
   const isCurrent = (k: string) => sub?.plan === k && sub?.interval === interval;
@@ -158,7 +159,7 @@ export function BillingCard() {
         )}
         <p className="text-xs text-slate-500">
           The billing portal is for your card and invoices. Anything else (custom plans, discounts):{" "}
-          <a className="text-cyan-300 hover:underline" href={support}>{state.supportEmail}</a>.
+          <a className="text-cyan-300 hover:underline" href={support}>{BILLING_SUPPORT_EMAIL}</a>.
         </p>
       </div>
     </Card>

@@ -12,6 +12,9 @@ import { getDb, schema } from "@/lib/db";
 import { eq } from "drizzle-orm";
 import { changePlanUnderPolicy, classifyPlanChange, itemsForPlan, setCancelAtPeriodEnd, UPGRADE_POLICY, type PlanStripe } from "@/lib/billing/plan-change";
 import { packDisputeState, packRevocation } from "@/lib/billing/text-pack-rules";
+import { BILLING_SUPPORT_EMAIL } from "@/lib/billing/support";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
 import StripeSdk from "stripe";
 import { isStripeResourceMissing, stripeChargeContextFetcher, type ClawbackStripe } from "@/lib/billing/clawback";
 
@@ -491,7 +494,20 @@ describe("POST/GET /api/billing/plan and POST /api/billing/cancel", () => {
       ch.mockResolvedValueOnce({ ok: false, status: 409, code: "unsupported", support: true, error: "x" });
       const res = await post(owner);
       expect(res.status).toBe(409);
-      expect((await res.json()).support).toMatch(/@/);
+      expect((await res.json()).support).toBe(BILLING_SUPPORT_EMAIL);
+    });
+    it("support contact: GET, plan-change and cancel stopgap answers all use BILLING_SUPPORT_EMAIL", async () => {
+      live();
+      spies.push(vi.spyOn(planLib, "changePlan").mockResolvedValue({ ok: false, status: 409, code: "unsupported", support: true, error: "x" }));
+      spies.push(vi.spyOn(planLib, "setCancelAtPeriodEnd").mockResolvedValue({ ok: false, status: 409, code: "unsupported", support: true, error: "x" } as never));
+      const g = await (await planRoute.GET(req("/api/billing/plan", { cookie: demoUser.cookie }))).json();
+      expect(g.supportEmail).toBe(BILLING_SUPPORT_EMAIL);
+      const p = await post(owner);
+      expect(p.status).toBe(409);
+      expect((await p.json()).support).toBe(BILLING_SUPPORT_EMAIL);
+      const c = await cancel(owner);
+      expect(c.status).toBe(409);
+      expect((await c.json()).support).toBe(BILLING_SUPPORT_EMAIL);
     });
     it("cancel: explained with the end date", async () => {
       live();
@@ -499,5 +515,28 @@ describe("POST/GET /api/billing/plan and POST /api/billing/cancel", () => {
       const j = await (await cancel(owner)).json();
       expect(j.billing).toContain("Your subscription ends on");
     });
+  });
+});
+
+describe("billing support contact", () => {
+  it("is billing@flowopsagent.ai, defined once", () => {
+    expect(BILLING_SUPPORT_EMAIL).toBe("billing@flowopsagent.ai");
+  });
+  it("billing code (card, routes, lib) imports the constant and hard-codes no email address", () => {
+    const files: string[] = [];
+    const walk = (d: string) => {
+      for (const f of readdirSync(d)) {
+        const p = join(d, f);
+        if (statSync(p).isDirectory()) walk(p);
+        else if (/\.(ts|tsx)$/.test(f)) files.push(p);
+      }
+    };
+    for (const d of ["src/lib/billing", "src/app/api/billing", "src/components/billing"]) walk(d);
+    const offenders = files.filter((f) => !f.endsWith("support.ts") && /[\w.+-]+@[\w-]+\.[\w.]+/.test(readFileSync(f, "utf8").replace(/@\/[\w/-]+/g, "")));
+    expect(offenders).toEqual([]);
+    const card = readFileSync("src/components/billing/billing-card.tsx", "utf8");
+    expect(card).toContain('import { BILLING_SUPPORT_EMAIL } from "@/lib/billing/support"');
+    expect(card).toContain("mailto:${BILLING_SUPPORT_EMAIL}");
+    for (const r of ["src/app/api/billing/plan/route.ts", "src/app/api/billing/cancel/route.ts"]) expect(readFileSync(r, "utf8")).toContain('import { BILLING_SUPPORT_EMAIL } from "@/lib/billing/support"');
   });
 });
