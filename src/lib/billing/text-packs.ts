@@ -81,7 +81,9 @@ export interface UsablePackRow {
   quantity: number;
   textsPerPack: number;
   textsUsed: number;
-  /** Texts still in the pack. */
+  /** Texts taken back after a refund or dispute (0012). */
+  textsRevoked: number;
+  /** Texts still in the pack (excluding revoked ones). */
   remaining: number;
   /** Start of the window the pack was bought in (the cap's unit). */
   window: string;
@@ -98,13 +100,15 @@ const expiresSql = () => sql`coalesce(${schema.textPack.expiresAt}, ${schema.tex
 export async function activePaidPacks(db: Pick<Db, "select">, orgId: string, now: Date = new Date()): Promise<UsablePackRow[]> {
   const t = schema.textPack;
   const rows = await db
-    .select({ id: t.id, key: t.packKey, quantity: t.quantity, textsPerPack: t.textsPerPack, textsUsed: t.textsUsed, periodStart: t.periodStart, periodEnd: t.periodEnd, expiresAt: t.expiresAt, createdAt: t.createdAt })
+    .select({ id: t.id, key: t.packKey, quantity: t.quantity, textsPerPack: t.textsPerPack, textsUsed: t.textsUsed, textsRevoked: t.textsRevoked, periodStart: t.periodStart, periodEnd: t.periodEnd, expiresAt: t.expiresAt, createdAt: t.createdAt })
     .from(t)
     .where(and(eq(t.organizationId, orgId), eq(t.status, "paid"), sql`${t.periodStart} <= ${now.toISOString()}::timestamptz`, sql`${expiresSql()} > ${now.toISOString()}::timestamptz`))
     .orderBy(expiresSql(), t.createdAt, t.id);
   return rows.map((r) => ({
     id: r.id, key: r.key, quantity: r.quantity, textsPerPack: r.textsPerPack, textsUsed: r.textsUsed,
-    remaining: Math.max(0, r.textsPerPack * r.quantity - r.textsUsed),
+    textsRevoked: r.textsRevoked,
+    // Revoked texts (refund / dispute, 0012) are not usable: consumeTexts allocates from `remaining` only.
+    remaining: Math.max(0, r.textsPerPack * r.quantity - r.textsUsed - r.textsRevoked),
     window: r.periodStart.toISOString(), expiresAt: r.expiresAt ?? r.periodEnd, createdAt: r.createdAt,
   }));
 }

@@ -6,6 +6,15 @@ import type { OrgContext } from "@/lib/server/context";
 import { getStripe } from "./stripe";
 import { findLiveSubscription } from "./status";
 
+/**
+ * The org's existing Stripe customer id, or null. Read-only: never calls Stripe and never writes a row, so read paths
+ * (e.g. the billing card's GET) can't create customers for the demo org or orgs that never subscribed.
+ */
+export async function findCustomerId(orgId: string): Promise<string | null> {
+  const [row] = await getDb().select({ id: schema.billingCustomer.stripeCustomerId }).from(schema.billingCustomer).where(eq(schema.billingCustomer.organizationId, orgId)).limit(1);
+  return row?.id ?? null;
+}
+
 /** Existing Stripe customer for the org, or a new one (one customer per organization). */
 export async function getOrCreateCustomer(ctx: OrgContext): Promise<string> {
   const db = getDb();

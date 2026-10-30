@@ -5,6 +5,7 @@ import { getDb, schema, type Db } from "@/lib/db";
 import { normalizeStatus } from "./status";
 import { classifyItems } from "./entitlements";
 import { markPackFailed, markPackPaid } from "./text-packs";
+import { applyChargeClawback, chargeIdForEvent, CLAWBACK_EVENTS, isStripeResourceMissing, type ChargeContext, type ChargeContextFetcher, type ClawbackOutcome } from "./clawback";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
@@ -15,6 +16,8 @@ export const HANDLED_EVENTS = [
   "customer.subscription.deleted",
   "invoice.paid",
   "invoice.payment_failed",
+  // Text-pack clawback (0012). Must also be added to the LIVE webhook endpoint at go-live (docs/BILLING.md §11).
+  ...CLAWBACK_EVENTS,
 ] as const;
 
 const rid = (p: string) => `${p}_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
@@ -27,6 +30,10 @@ export interface ProcessOptions {
   db?: Db;
   /** Required for subscription.* / invoice.* events that reference a subscription. */
   fetchSubscription?: SubscriptionFetcher;
+  /** Required for charge.refunded / charge.dispute.* (clawback.ts): the charge's current state and the invoices it paid. */
+  fetchChargeContext?: ChargeContextFetcher;
+  /** Clock for the clawback's "pack expired" check (tests). */
+  now?: Date;
 }
 
 export type WebhookResult = {
@@ -34,6 +41,8 @@ export type WebhookResult = {
   status: "processed" | "duplicate" | "ignored" | "stale";
   eventId: string;
   type: string;
+  /** Set for charge.refunded / charge.dispute.* events that concerned a text pack. */
+  clawback?: Extract<ClawbackOutcome, { status: "processed" }>;
 };
 
 /** Subscription id an event refers to (subscription.* object id, or the invoice's subscription). */
@@ -80,6 +89,21 @@ export async function processStripeEvent(event: Stripe.Event, opts: ProcessOptio
     if (!opts.fetchSubscription) throw new Error("fetchSubscription is required for subscription/invoice events");
     current = await opts.fetchSubscription(subId);
   }
+  const chargeId = chargeIdForEvent(event);
+  if (!chargeId && (CLAWBACK_EVENTS as readonly string[]).includes(event.type)) return result("ignored"); // malformed payload
+  let charge: ChargeContext | null = null;
+  if (chargeId) {
+    if (!opts.fetchChargeContext) throw new Error("fetchChargeContext is required for charge.refunded / charge.dispute.* events");
+    try {
+      charge = await opts.fetchChargeContext(chargeId);
+    } catch (err) {
+      // The charge / invoice no longer exists for this key (404 resource_missing): nothing to claw back, and a retry
+      // would 404 again. Log and acknowledge (200) instead of making Stripe retry for days. Other errors still throw.
+      if (!isStripeResourceMissing(err)) throw err;
+      console.warn(`[billing] text pack clawback: ${event.type} ${event.id}: charge ${chargeId} not found in Stripe (resource_missing); ignored`);
+      return result("ignored");
+    }
+  }
 
   return db.transaction(async (tx) => {
     const inserted = await tx
@@ -89,6 +113,11 @@ export async function processStripeEvent(event: Stripe.Event, opts: ProcessOptio
       .returning({ id: schema.stripeEvent.id });
     if (!inserted.length) return result("duplicate");
 
+    // Refund / dispute of a charge: only text packs are clawed back; any other charge (subscription invoices) is ignored.
+    if (charge) {
+      const out = await applyChargeClawback(tx, event, charge, opts.now);
+      return out.status === "processed" ? { ...result("processed"), clawback: out } : result("ignored");
+    }
     if (event.type === "checkout.session.completed") {
       await onCheckoutCompleted(tx, event.data.object);
       return result("processed");

@@ -74,6 +74,8 @@ Sandbox price ids for the final pricing are in §11 ("Sandbox objects").
 
 ### Plan changes and cancellation (Brian, 2026-10-26)
 
+> **Superseded (2026-10-30):** plan changes are now in-app (§13): upgrades are charged now with proration (`UPGRADE_POLICY = "prorate_now"`), downgrades and annual → monthly wait for the renewal. The Customer Portal keeps plan switching **off**. The text below is the 2026-10-26 history.
+
 - **Plan changes take effect at the next renewal, never mid-cycle, with no proration.** The app has no API-side plan-change code: plan changes only happen in the Stripe Customer Portal (checkout refuses a second subscription with 409). If one is added later it must use `proration_behavior: "none"` and a subscription schedule that starts the new price at `current_period_end`.
 - Portal configuration `bpc_1UUvd05iQFiJ57yp2r2sV9Rv` (sandbox, default) was set on 2026-10-26 to `features.subscription_update.proration_behavior = "none"` and `schedule_at_period_end.conditions = [decreasing_item_amount, shortening_interval]`, so **downgrades** (Pro → Starter) are scheduled for the end of the period.
 - **Limitation:** Stripe's portal can only schedule changes that *decrease* the amount or shorten the interval. An **upgrade** (Starter → Pro) in the portal applies the new plan right away. Because proration is off, nothing is charged mid-cycle and the customer pays the Pro price from the next renewal, so billing matches the "next renewal" rule but the Pro features start immediately. To defer upgrades too, we would need our own upgrade endpoint using a subscription schedule (or turn off upgrades in the portal). Founder call if that matters.
@@ -366,3 +368,47 @@ Each add-on POST uses **one** database connection. 0005 held two (the lock trans
 The old recurring placeholder `price_1UVB9i5iQFiJ57yplkbyM4ky` (texts_1000 $15/mo) was archived (no subscription used it). Live-mode prices with the same amounts must be created at launch.
 
 Earlier placeholder add-on prices (now superseded for texts; the seat/location/branding monthly ones are reused above) (lookup key `test_addon_<key>_monthly`, metadata `flowops_addon=<key>`, `placeholder=true`): seat $10/mo `price_1UVB9h5iQFiJ57ypTZbo5ZBn`, location $29/mo `price_1UVB9h5iQFiJ57ypGYTvNWjm`, texts_1000 $15/mo `price_1UVB9i5iQFiJ57yplkbyM4ky`, branding $15/mo `price_1UVB9i5iQFiJ57ypFfJkhTj1`. Set them as `STRIPE_ADDON_PRICE_SEAT` etc. Live-mode prices are created at launch once Brian approves amounts.
+
+## 12. Text-pack clawback on refund / dispute (migration `0012_text_pack_clawback`)
+
+The webhook also handles `charge.refunded`, `charge.dispute.created` and `charge.dispute.closed`. For each one it fetches the charge **before** the transaction (`stripeChargeContextFetcher`: `charges.retrieve`, `invoicePayments.list` by the charge's payment intent → paid invoice ids, `disputes.list({charge})`), then inside the transaction (event-id dedupe as for every event) finds the paid `text_pack` whose `stripe_invoice_id` is one of those invoices. A charge that isn't for a pack (subscription invoices, anything else) → `ignored`.
+
+The pack's revocation is computed **absolutely** from Stripe's current state of the charge (`packRevocation` in `text-pack-rules.ts`), so repeated and out-of-order deliveries give the same answer:
+
+| Charge state | Texts revoked |
+| --- | --- |
+| fully refunded | everything not yet used |
+| partially refunded | `floor(total × amount_refunded / amount)`, cumulative across refunds |
+| dispute open (`needs_response`, `under_review`) | everything not yet used |
+| dispute **lost** | stays revoked |
+| dispute **won** | restored (back to the refund-only figure), **unless the pack has expired** (then nothing changes) |
+| inquiry (`warning_*`) / `prevented` | nothing (no funds withdrawn) — decision for Brian |
+
+- Texts already used are never taken back and never charged; a revocation is capped at `total − used`. When the refunded/disputed share exceeds what was left, the excess (`texts_used_over_revocation`) is logged (`console.warn "[billing] text pack clawback: texts already used"` + a row in `text_pack_revocation`).
+- The plan's monthly allowance is never touched; nothing is auto-charged. `consumeTexts` / `activePaidPacks` treat `remaining = total − used − revoked`.
+- Locking: the org row, then the pack row (`FOR UPDATE`), same order as `consumeTexts`, so a send and a refund can't race.
+- A revoked pack still counts toward the per-window pack cap (decision for Brian).
+- A Stripe 404 (`resource_missing`) while looking up the charge or its invoice payments is logged (`console.warn`) and the event is acknowledged as `ignored` (200), so Stripe doesn't retry a lookup that can never succeed. Any other Stripe/network error still returns 500 (Stripe retries).
+
+**Migration `0012_text_pack_clawback` (add-only):** `text_pack` gains `texts_revoked int not null default 0`, `revoked_at`, `revoked_reason`, `stripe_charge_id`, `amount_refunded int not null default 0`, `dispute_status`. New table `text_pack_revocation` (one row per Stripe event that changed a pack; unique on `stripe_event_id`). Nothing is altered or dropped; existing packs read as "nothing revoked".
+
+**Go-live (Ryan, after Brian's sign-off):** add `charge.refunded`, `charge.dispute.created`, `charge.dispute.closed` to the **live** webhook endpoint. Until then live refunds/disputes simply aren't delivered (no harm; nothing is revoked).
+
+## 13. In-app plan changes and cancel (`/api/billing/plan`, `/api/billing/cancel`)
+
+Owner/Admin only (staff 403), demo orgs (`is_demo`) 403 `demo_org`, 404 unless `BILLING_ENABLED=true`. Plans: Starter / Pro / Business, monthly and annual. UI: the billing card on the Administration page (`src/components/billing/billing-card.tsx`).
+
+- **`UPGRADE_POLICY = "prorate_now"` (Brian, 2026-10-30):** an upgrade (higher tier, or same tier monthly → annual) is applied now with `proration_behavior: "always_invoice"` + `payment_behavior: "pending_if_incomplete"`, same as seats/locations. A failed charge → 402, the proration invoice is voided and **nothing changes**. `"at_renewal"` is kept and tested (schedules upgrades like downgrades) but is not the default.
+- **Downgrades** (lower tier) and **annual → monthly** are written as the next phase of a subscription schedule starting at the renewal; no charge, no credit.
+- **Add-ons switch interval with the plan** (seat/location/branding monthly ↔ annual price). If an add-on has no price for the target interval, the change is refused (409, contact support).
+- **Trials:** never charged; the trial continues (`trial_end` kept, proration none). Upgrades apply immediately (free); downgrades take effect at the trial end.
+- Pending add-on decreases already in the schedule are carried over (mapped to the new plan/interval). Choosing the current plan again cancels a pending plan change and keeps pending add-on changes.
+- **Read paths never create customers:** `GET /api/billing/plan` (loaded by the billing card on every Administration page view) returns `subscription: null` for `is_demo` orgs without any Stripe call or DB write, and otherwise only *looks up* an existing `billing_customer` row (`findCustomerId`); no row → `subscription: null`, no Stripe call. `POST /api/billing/plan` and `/api/billing/cancel` look up the same way (no row → 409). The card shows the portal button ("Card & invoices") only when there is a subscription and the org is not a demo org.
+- **Locking:** the same per-org advisory lock as add-ons (`withAddonChangeLock`); a concurrent billing change → **409 `change_in_progress`**.
+- **Refused → support** (`BILLING_SUPPORT_EMAIL` = `billing@flowopsagent.ai`, defined once in `src/lib/billing/support.ts` and imported by the billing card and the plan / cancel routes; separate from the general site contact address): schedules with more than one future phase, discounts / extra invoice items in a phase, unmappable items. A pending cancellation → 409 `cancel_pending` (resume first).
+- **Cancel (`POST /api/billing/cancel {cancel}`)** is schedule-safe: without a schedule it sets `cancel_at_period_end`; with one it trims the schedule to the current phase with `end_behavior: "cancel"` and saves the next phase in schedule metadata, so **resume** restores the pending change.
+
+**Customer Portal:** stays as is with **plan switching OFF** (payment method, invoices). It can be re-enabled only for plan-only subscriptions (no add-on items, no schedule) — the portal can't switch add-on intervals or keep a schedule.
+
+**Support stopgap:** whatever the endpoint refuses (above) is handled by support by email.
+
