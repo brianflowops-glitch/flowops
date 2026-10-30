@@ -1,6 +1,6 @@
 import Link from "next/link";
 
-export const CONTACT_EMAIL = "brian.flowops@gmail.com";
+export const CONTACT_EMAIL = "support@flowopsagent.ai";
 export const COMPANY_NAME = "FlowOps Inc.";
 export const COMPANY_ADDRESS = "235 Nothstein Road, Lehighton, PA 18235, USA";
 export const PILOT_MAILTO = `mailto:${CONTACT_EMAIL}?subject=${encodeURIComponent("FlowOps founding pilot")}&body=${encodeURIComponent(

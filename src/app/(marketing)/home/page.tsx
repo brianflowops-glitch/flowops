@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { ArrowRight, Bot, CalendarCheck, CalendarDays, Check, Link2, Mail, ShieldCheck, Users } from "lucide-react";
-import { MarketingShell, PILOT_MAILTO } from "@/components/marketing/site-chrome";
+import { CONTACT_EMAIL, MarketingShell, PILOT_MAILTO } from "@/components/marketing/site-chrome";
 
 export const metadata: Metadata = {
   title: { absolute: "FlowOps — Online booking and an AI assistant for small service businesses" },
@@ -159,7 +159,7 @@ export default function HomePage() {
                 Or create an account now
               </Link>
               <p className="text-center text-xs text-slate-500">
-                Questions? Email <a href="mailto:brian.flowops@gmail.com" className="text-slate-300 hover:underline">brian.flowops@gmail.com</a>
+                Questions? Email <a href={`mailto:${CONTACT_EMAIL}`} className="text-slate-300 hover:underline">{CONTACT_EMAIL}</a>
               </p>
             </div>
           </div>
