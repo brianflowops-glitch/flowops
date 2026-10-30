@@ -15,7 +15,8 @@ const MODULE_STATUS: Record<ModuleKey, { status: string; label: string }> = {
   core: { status: "active", label: "prototype" },
   biz: { status: "active", label: "booking live" },
   connect: { status: "simulated", label: "simulated" },
-  ai: { status: "planned", label: "needs API key" },
+  // FlowAI runs through Vercel AI Gateway (OIDC on Vercel); downgraded below if GET /api/assistant says it isn't configured.
+  ai: { status: "active", label: "live" },
   net: { status: "planned", label: "planned" },
   sec: { status: "planned", label: "planned" },
   pulse: { status: "planned", label: "planned" },
@@ -32,6 +33,21 @@ export function CommandCenter() {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- depends on client clock
     setToday(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`);
   }, []);
+  const [aiConfigured, setAiConfigured] = useState<boolean | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/assistant")
+      .then((r) => r.json())
+      .then((s: { configured?: boolean }) => {
+        if (!cancelled) setAiConfigured(s.configured !== false);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const moduleStatus: Record<ModuleKey, { status: string; label: string }> =
+    aiConfigured === false ? { ...MODULE_STATUS, ai: { status: "planned", label: "needs API key" } } : MODULE_STATUS;
   const currentPhase = today ? PHASE_END.findIndex((end) => today <= end) : -1;
 
   const active = state.bookings.filter((b) => b.status === "confirmed").length;
@@ -135,7 +151,7 @@ export function CommandCenter() {
                 <span className={clsx("h-2 w-2 rounded-full", m.color)} />
                 <p className={clsx("font-semibold", m.text)}>{m.name}</p>
                 <span className="ml-auto">
-                  <Pill status={MODULE_STATUS[k].status}>{MODULE_STATUS[k].label}</Pill>
+                  <Pill status={moduleStatus[k].status}>{moduleStatus[k].label}</Pill>
                 </span>
               </div>
               <p className="mt-1 text-xs text-slate-400">{m.tagline}</p>
