@@ -22,8 +22,9 @@ async function Gate({ children }: { children: React.ReactNode }) {
   }
   const ctx = await getContext();
   if (!ctx) redirect("/sign-in");
-  // Failed card / no active plan → lock screen instead of the app (no-op while BILLING_ENABLED is off).
-  const access = await getBillingAccess(ctx.org.id, ctx.role);
+  // Failed card / no active plan → lock screen instead of the app (no-op while BILLING_ENABLED is off;
+  // exempt and is_demo orgs always pass, see getBillingAccess).
+  const access = await getBillingAccess(ctx.org, ctx.role);
   if (access.access === "locked") {
     // Plan keys only (never price ids) and only for people who can act on them.
     const all = access.canManageBilling ? plans() : [];

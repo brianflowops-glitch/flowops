@@ -7,7 +7,7 @@
 import { SUBSCRIPTION_STATUSES, type SubscriptionStatus } from "@/lib/db/schema";
 
 export type BillingAccessLevel = "full" | "locked";
-export type BillingAccessReason = "ok" | "billing_disabled" | "exempt" | "no_subscription" | Exclude<SubscriptionStatus, "active" | "trialing">;
+export type BillingAccessReason = "ok" | "billing_disabled" | "exempt" | "demo" | "no_subscription" | Exclude<SubscriptionStatus, "active" | "trialing">;
 
 export interface BillingAccess {
   access: BillingAccessLevel;
@@ -49,15 +49,22 @@ export function effectiveSubscription<T extends { status: string; updatedAt?: Da
 export interface AccessInput {
   enabled: boolean;
   exempt: boolean;
+  /**
+   * organization.is_demo. Demo orgs (org_flowops_demo, seeded by scripts/db-migrate.ts) always have
+   * access, like BILLING_EXEMPT_ORG_IDS, and the add-on cron skips them too. Nothing here sends them
+   * to Checkout; access is decided without Stripe.
+   */
+  demo?: boolean;
   status: SubscriptionStatus | null;
   canManageBilling: boolean;
 }
 
-/** Map billing flag + exemption + subscription status onto full/locked. */
-export function resolveBillingAccess({ enabled, exempt, status, canManageBilling }: AccessInput): BillingAccess {
+/** Map billing flag + exemption / demo flag + subscription status onto full/locked. */
+export function resolveBillingAccess({ enabled, exempt, demo = false, status, canManageBilling }: AccessInput): BillingAccess {
   if (!enabled) return { access: "full", reason: "billing_disabled", status, canManageBilling };
   if (status && (FULL_ACCESS_STATUSES as readonly string[]).includes(status)) return { access: "full", reason: "ok", status, canManageBilling };
   if (exempt) return { access: "full", reason: "exempt", status, canManageBilling };
+  if (demo) return { access: "full", reason: "demo", status, canManageBilling };
   if (!status) return { access: "locked", reason: "no_subscription", status, canManageBilling };
   return { access: "locked", reason: status as BillingAccessReason, status, canManageBilling };
 }
