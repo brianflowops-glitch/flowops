@@ -3,7 +3,7 @@ import { getOrCreateCustomer } from "@/lib/billing/checkout";
 import { getStripe } from "@/lib/billing/stripe";
 import { requireApi } from "@/lib/server/context";
 
-/** Owner or Admin opens the Stripe Customer Portal (payment method, invoices, cancel). 404 unless BILLING_ENABLED=true. */
+/** Owner or Admin opens the Stripe Customer Portal (payment method, invoices; plan switching stays off there, see docs/BILLING.md §13). 404 unless BILLING_ENABLED=true. */
 export async function POST(req: Request) {
   if (!billingEnabled()) return new Response("Not found", { status: 404 });
   if (!billingConfigured()) return Response.json({ error: "Billing not configured" }, { status: 503 });

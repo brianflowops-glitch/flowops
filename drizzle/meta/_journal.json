@@ -85,6 +85,13 @@
       "when": 1793141598157,
       "tag": "0011_addon_charge",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1793378316346,
+      "tag": "0012_text_pack_clawback",
+      "breakpoints": true
     }
   ]
 }

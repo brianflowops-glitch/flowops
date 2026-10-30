@@ -18,7 +18,8 @@
     "test:billing": "tsx scripts/billing-tests.ts",
     "test:billing:ui": "tsx scripts/billing-lock-ui-tests.ts",
     "test:billing:db": "tsx --conditions=react-server scripts/billing-db-tests.ts",
-    "test:billing:sandbox": "tsx --conditions=react-server scripts/billing-sandbox-final.ts"
+    "test:billing:sandbox": "tsx --conditions=react-server scripts/billing-sandbox-final.ts",
+    "test:billing:sandbox:clawback": "tsx --conditions=react-server scripts/billing-sandbox-clawback.ts"
   },
   "dependencies": {
     "@ai-sdk/react": "^3.0.318",

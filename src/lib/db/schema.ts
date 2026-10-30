@@ -435,12 +435,60 @@ export const textPack = pgTable(
     expiresAt: timestamp("expires_at", { withTimezone: true }),
     /** Texts already drawn from this pack (0..texts_per_pack × quantity). */
     textsUsed: integer("texts_used").notNull().default(0),
+    /**
+     * Clawback (additive 0012): texts taken back after a refund or dispute of the pack's charge. Set ABSOLUTELY from
+     * Stripe's current state on every charge.refunded / charge.dispute.* event (never incremented), capped so the
+     * texts already used are never "revoked". Usable texts = texts_per_pack × quantity − texts_used − texts_revoked.
+     */
+    textsRevoked: integer("texts_revoked").notNull().default(0),
+    /** When texts were first revoked (null when nothing is revoked, e.g. after a won dispute restored them). */
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    /** refund | partial_refund | dispute | dispute_lost | restored_dispute_won. */
+    revokedReason: text("revoked_reason"),
+    /** The charge that paid the pack invoice (learnt from the first refund/dispute event). */
+    stripeChargeId: text("stripe_charge_id"),
+    /** charge.amount_refunded at the last processed event (cumulative, smallest currency unit). */
+    amountRefunded: integer("amount_refunded").notNull().default(0),
+    /** Status of the charge's latest dispute at the last processed event (null = never disputed). */
+    disputeStatus: text("dispute_status"),
   },
   (t) => [
     uniqueIndex("text_pack_stripe_invoice_unique").on(t.stripeInvoiceId),
     index("text_pack_org_period_idx").on(t.organizationId, t.periodStart),
     index("text_pack_org_expires_idx").on(t.organizationId, t.expiresAt),
   ],
+);
+
+/**
+ * One processed refund/dispute event of a text pack's charge (additive 0012): the audit trail of a clawback, and
+ * where texts that were ALREADY USED when the pack was revoked are recorded for Brian (`texts_used_over_revocation`:
+ * texts that would have been revoked but had already been sent; they are not taken back and nothing is charged).
+ * `stripe_event_id` is unique, so a repeated delivery never adds a second row.
+ */
+export const textPackRevocation = pgTable(
+  "text_pack_revocation",
+  {
+    id: text("id").primaryKey(),
+    textPackId: text("text_pack_id")
+      .notNull()
+      .references(() => textPack.id, { onDelete: "cascade" }),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organization.id, { onDelete: "cascade" }),
+    stripeEventId: text("stripe_event_id").notNull(),
+    eventType: text("event_type").notNull(),
+    stripeChargeId: text("stripe_charge_id").notNull(),
+    reason: text("reason"),
+    textsTotal: integer("texts_total").notNull(),
+    textsUsed: integer("texts_used").notNull(),
+    textsRevokedBefore: integer("texts_revoked_before").notNull(),
+    textsRevokedAfter: integer("texts_revoked_after").notNull(),
+    textsUsedOverRevocation: integer("texts_used_over_revocation").notNull().default(0),
+    amountRefunded: integer("amount_refunded").notNull().default(0),
+    disputeStatus: text("dispute_status"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("text_pack_revocation_event_unique").on(t.stripeEventId), index("text_pack_revocation_pack_idx").on(t.textPackId)],
 );
 
 /** Processed Stripe webhook events (idempotency: Stripe retries and may deliver an event more than once). */

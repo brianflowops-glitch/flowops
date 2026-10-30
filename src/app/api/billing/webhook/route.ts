@@ -3,6 +3,7 @@ import { billingEnabled, webhookSecret } from "@/lib/billing/config";
 import { retrieveSubscriptionComplete } from "@/lib/billing/addons";
 import { getStripe } from "@/lib/billing/stripe";
 import { processStripeEvent } from "@/lib/billing/webhook";
+import { stripeChargeContextFetcher } from "@/lib/billing/clawback";
 import { hasDatabase } from "@/lib/db";
 
 /** Stripe webhook endpoint (docs/BILLING.md). 404 unless BILLING_ENABLED=true. */
@@ -23,7 +24,7 @@ export async function POST(req: Request) {
 
   try {
     const stripe = getStripe();
-    const result = await processStripeEvent(event, { fetchSubscription: (id) => retrieveSubscriptionComplete(stripe, id) });
+    const result = await processStripeEvent(event, { fetchSubscription: (id) => retrieveSubscriptionComplete(stripe, id), fetchChargeContext: stripeChargeContextFetcher(stripe) });
     return Response.json({ received: true, ...result });
   } catch (err) {
     console.error("[billing] webhook processing failed", event.id, event.type, err);

@@ -9,6 +9,7 @@ import { getBillingAccess, requireBillingAccess } from "../src/lib/billing/acces
 import { getEntitlements } from "../src/lib/billing/org-entitlements";
 import { activePaidPacks, consumeTexts, purchaseTextPack, type PackStripe } from "../src/lib/billing/text-packs";
 import { textPackExpiry } from "../src/lib/billing/text-pack-rules";
+import type { ChargeContext } from "../src/lib/billing/clawback";
 import { trialEligibility } from "../src/lib/billing/checkout";
 import { subscriptionFields } from "../src/lib/billing/webhook";
 import { DEMO_ORG_ID, defaultHours } from "../src/lib/tenancy/defaults";
@@ -148,7 +149,7 @@ const expectUnique = async (db: ReturnType<typeof getDb>, invoiceId: string) => 
   [e] = await db.select().from(schema.stripeEvent).where(eq(schema.stripeEvent.id, failEv.id));
   check("Stripe retrieve fails → error, event NOT recorded", threw && !e);
 
-  const ign = await run(ev("charge.refunded", {}));
+  const ign = await run(ev("charge.succeeded", {}));
   check("unhandled type ignored", ign.status === "ignored", ign);
 
   // ── billing access lock: failed card → locked, paid → full (docs/BILLING.md §6) ──
@@ -529,6 +530,118 @@ const expectUnique = async (db: ReturnType<typeof getDb>, invoiceId: string) => 
       check("rollover cap: 10 rolled-over packs + 10 new ones in this window are both allowed and both usable (2000 + 20000)", pc.ok && (await texts()) === 2000 + 20000, { pc, t: await texts() });
       const pc2 = await buy(mkPackStripe(), 1);
       check("rollover cap: the 11th pack bought in THIS window is still refused", !pc2.ok && pc2.code === "cap", pc2);
+      await db.delete(schema.textPack).where(eq(schema.textPack.organizationId, AORG));
+    }
+
+    // ── 0012 clawback: charge.refunded / charge.dispute.* on a pack's charge revoke (or restore) its texts ──
+    {
+      const charges = new Map<string, ChargeContext>();
+      const setCharge = (id: string, c: Partial<ChargeContext>) => charges.set(id, { chargeId: id, amount: 1500, amountRefunded: 0, refunded: false, invoiceIds: [], disputeStatuses: [], ...charges.get(id), ...c });
+      let chargeFetches = 0;
+      const fetchChargeContext = async (id: string) => { chargeFetches++; const c = charges.get(id); if (!c) throw new Error(`mock: no charge ${id}`); return c; };
+      const runC = (e: Stripe.Event, now?: Date) => processStripeEvent(e, { fetchSubscription, fetchChargeContext, now });
+      const refundEv = (ch: string, t: number) => ev("charge.refunded", { id: ch, object: "charge" }, t);
+      const disputeEv = (type: "charge.dispute.created" | "charge.dispute.closed", ch: string, t: number) => ev(type, { id: `dp_${ch}_${t}`, object: "dispute", charge: ch }, t);
+      const pack = async (id: string) => (await db.select().from(schema.textPack).where(eq(schema.textPack.id, id)))[0];
+      const remaining = async (id: string) => (await activePaidPacks(db, AORG, nowD)).find((p) => p.id === id)?.remaining;
+      const logRows = async (id: string) => db.select().from(schema.textPackRevocation).where(eq(schema.textPackRevocation.textPackId, id));
+      const warn = console.warn;
+      const warned: string[] = [];
+      console.warn = (...a: unknown[]) => { warned.push(a.map(String).join(" ")); };
+      const info = console.info;
+      console.info = () => {};
+      try {
+        // Partial refunds (cumulative), used texts never revoked, idempotent on replays.
+        await mkRow(`tp_cb1_${n}`, "paid", -1, 20, { stripeInvoiceId: `in_cb1_${n}`, amountPaid: 1500 });
+        await consumeTexts(db, { orgId: AORG, allowance: 0, sentBefore: 0, count: 300, now: nowD });
+        setCharge(`ch_cb1_${n}`, { invoiceIds: [`in_cb1_${n}`], amountRefunded: 750 });
+        const e1 = refundEv(`ch_cb1_${n}`, AT + 300);
+        let r = await runC(e1);
+        let p = await pack(`tp_cb1_${n}`);
+        check("clawback: 50% refund → floor(1000 × 0.5) = 500 revoked; 200 left (300 already used)", r.status === "processed" && p.textsRevoked === 500 && p.revokedReason === "partial_refund" && !!p.revokedAt && p.amountRefunded === 750 && p.stripeChargeId === `ch_cb1_${n}` && (await remaining(`tp_cb1_${n}`)) === 200, { r, p });
+        check("clawback: plan allowance untouched; entitlements count only the 200 unrevoked pack texts", (await texts()) === 2000 + 200, await texts());
+        const f0 = chargeFetches;
+        r = await runC(e1);
+        check("clawback: the same event delivered again → duplicate, no Stripe call, nothing changes", r.status === "duplicate" && chargeFetches === f0 && (await pack(`tp_cb1_${n}`)).textsRevoked === 500 && (await logRows(`tp_cb1_${n}`)).length === 1);
+        r = await runC(refundEv(`ch_cb1_${n}`, AT + 301));
+        check("clawback: a new event with the same Stripe state → still 500 (absolute, not incremented)", r.status === "processed" && (await pack(`tp_cb1_${n}`)).textsRevoked === 500, await pack(`tp_cb1_${n}`));
+        setCharge(`ch_cb1_${n}`, { amountRefunded: 1200 });
+        r = await runC(refundEv(`ch_cb1_${n}`, AT + 302));
+        p = await pack(`tp_cb1_${n}`);
+        const lr = (await logRows(`tp_cb1_${n}`)).find((x) => x.stripeEventId === r.eventId);
+        check("clawback: cumulative refund 80% → 800 wanted, capped at 700 (300 used are not revoked); remaining 0", p.textsRevoked === 700 && (await remaining(`tp_cb1_${n}`)) === 0, p);
+        check("clawback: the 100 already-used texts are logged for Brian (row + structured warn)", lr?.textsUsedOverRevocation === 100 && lr.textsUsed === 300 && lr.textsRevokedBefore === 500 && lr.textsRevokedAfter === 700 && warned.some((w) => w.includes(`tp_cb1_${n}`) && w.includes('"usedOverRevocation":100')), { lr, warned });
+        const c = await consumeTexts(db, { orgId: AORG, allowance: 0, sentBefore: 0, count: 1, now: nowD });
+        check("clawback: consumeTexts never draws revoked texts", c.denied === 1 && c.fromPacks.length === 0, c);
+
+        // Charges that didn't pay a pack invoice are ignored (subscription invoices, unknown invoices, no invoice).
+        setCharge(`ch_sub_${n}`, { invoiceIds: [`in_subscription_${n}`], amountRefunded: 1500, refunded: true });
+        setCharge(`ch_none_${n}`, { invoiceIds: [], amountRefunded: 1500, refunded: true });
+        const ig1 = await runC(refundEv(`ch_sub_${n}`, AT + 303));
+        const ig2 = await runC(disputeEv("charge.dispute.created", `ch_none_${n}`, AT + 304));
+        check("clawback: non-pack charges → ignored, no pack touched", ig1.status === "ignored" && ig2.status === "ignored" && (await db.select().from(schema.textPackRevocation).where(eq(schema.textPackRevocation.stripeChargeId, `ch_sub_${n}`))).length === 0, { ig1, ig2 });
+
+        // Full refund: every remaining text revoked immediately.
+        await mkRow(`tp_cb2_${n}`, "paid", -1, 20, { stripeInvoiceId: `in_cb2_${n}` });
+        setCharge(`ch_cb2_${n}`, { invoiceIds: [`in_cb2_${n}`], amountRefunded: 1500, refunded: true });
+        await runC(refundEv(`ch_cb2_${n}`, AT + 305));
+        p = await pack(`tp_cb2_${n}`);
+        check("clawback: full refund → all 1000 revoked (reason refund)", p.textsRevoked === 1000 && p.revokedReason === "refund" && (await remaining(`tp_cb2_${n}`)) === 0, p);
+
+        // Dispute opened → revoked; won → restored; delivered out of order still converges.
+        await mkRow(`tp_cb3_${n}`, "paid", -1, 20, { stripeInvoiceId: `in_cb3_${n}`, textsUsed: 100 });
+        setCharge(`ch_cb3_${n}`, { invoiceIds: [`in_cb3_${n}`], disputeStatuses: ["needs_response"] });
+        await runC(disputeEv("charge.dispute.created", `ch_cb3_${n}`, AT + 306));
+        p = await pack(`tp_cb3_${n}`);
+        check("clawback: dispute opened → the 900 remaining revoked at once", p.textsRevoked === 900 && p.revokedReason === "dispute" && p.disputeStatus === "needs_response" && (await remaining(`tp_cb3_${n}`)) === 0, p);
+        setCharge(`ch_cb3_${n}`, { disputeStatuses: ["won"] });
+        await runC(disputeEv("charge.dispute.closed", `ch_cb3_${n}`, AT + 307));
+        p = await pack(`tp_cb3_${n}`);
+        check("clawback: dispute won (pack not expired, not refunded) → restored (900 usable again)", p.textsRevoked === 0 && p.revokedAt === null && p.revokedReason === "restored_dispute_won" && (await remaining(`tp_cb3_${n}`)) === 900, p);
+        await runC(disputeEv("charge.dispute.created", `ch_cb3_${n}`, AT + 299)); // a late, older 'created' delivery: Stripe's current state is still "won"
+        check("clawback: a late dispute.created after the win does not revoke again (current state wins)", (await pack(`tp_cb3_${n}`)).textsRevoked === 0);
+
+        // Dispute lost → stays revoked.
+        await mkRow(`tp_cb4_${n}`, "paid", -1, 20, { stripeInvoiceId: `in_cb4_${n}` });
+        setCharge(`ch_cb4_${n}`, { invoiceIds: [`in_cb4_${n}`], disputeStatuses: ["under_review"] });
+        await runC(disputeEv("charge.dispute.created", `ch_cb4_${n}`, AT + 308));
+        setCharge(`ch_cb4_${n}`, { disputeStatuses: ["lost"] });
+        await runC(disputeEv("charge.dispute.closed", `ch_cb4_${n}`, AT + 309));
+        p = await pack(`tp_cb4_${n}`);
+        check("clawback: dispute lost → stays revoked (reason dispute_lost)", p.textsRevoked === 1000 && p.revokedReason === "dispute_lost", p);
+
+        // Won after the pack expired → not restored. Won after a partial refund → restored only down to the refund's share.
+        await mkRow(`tp_cb5_${n}`, "paid", -1, 20, { stripeInvoiceId: `in_cb5_${n}` });
+        setCharge(`ch_cb5_${n}`, { invoiceIds: [`in_cb5_${n}`], disputeStatuses: ["needs_response"] });
+        await runC(disputeEv("charge.dispute.created", `ch_cb5_${n}`, AT + 310));
+        setCharge(`ch_cb5_${n}`, { disputeStatuses: ["won"] });
+        await runC(disputeEv("charge.dispute.closed", `ch_cb5_${n}`, AT + 311), new Date(nowD.getTime() + 30 * 86400000));
+        check("clawback: dispute won after the pack expired → stays revoked", (await pack(`tp_cb5_${n}`)).textsRevoked === 1000, await pack(`tp_cb5_${n}`));
+        await mkRow(`tp_cb6_${n}`, "paid", -1, 20, { stripeInvoiceId: `in_cb6_${n}` });
+        setCharge(`ch_cb6_${n}`, { invoiceIds: [`in_cb6_${n}`], amountRefunded: 375, disputeStatuses: ["needs_response"] });
+        await runC(disputeEv("charge.dispute.created", `ch_cb6_${n}`, AT + 312));
+        setCharge(`ch_cb6_${n}`, { disputeStatuses: ["won"] });
+        await runC(disputeEv("charge.dispute.closed", `ch_cb6_${n}`, AT + 313));
+        p = await pack(`tp_cb6_${n}`);
+        check("clawback: dispute won on a 25%-refunded charge → restored down to the refund's 250 revoked", p.textsRevoked === 250 && p.revokedReason === "partial_refund" && (await remaining(`tp_cb6_${n}`)) === 750, p);
+
+        // Inquiries (warning_*) withdraw no funds → nothing revoked.
+        await mkRow(`tp_cb7_${n}`, "paid", -1, 20, { stripeInvoiceId: `in_cb7_${n}` });
+        setCharge(`ch_cb7_${n}`, { invoiceIds: [`in_cb7_${n}`], disputeStatuses: ["warning_needs_response"] });
+        await runC(disputeEv("charge.dispute.created", `ch_cb7_${n}`, AT + 314));
+        check("clawback: an inquiry (warning_needs_response) revokes nothing", (await pack(`tp_cb7_${n}`)).textsRevoked === 0);
+
+        // Concurrency: a revocation and a send at the same moment never overdraw (both lock the org row).
+        await db.delete(schema.textPack).where(eq(schema.textPack.organizationId, AORG));
+        await mkRow(`tp_cb8_${n}`, "paid", -1, 20, { stripeInvoiceId: `in_cb8_${n}` });
+        setCharge(`ch_cb8_${n}`, { invoiceIds: [`in_cb8_${n}`], amountRefunded: 1500, refunded: true });
+        const [sent] = await Promise.all([consumeTexts(db, { orgId: AORG, allowance: 0, sentBefore: 0, count: 400, now: nowD }), runC(refundEv(`ch_cb8_${n}`, AT + 315))]);
+        p = await pack(`tp_cb8_${n}`);
+        check("clawback: concurrent send + full refund → used + revoked = 1000 exactly", p.textsUsed + p.textsRevoked === 1000 && p.textsUsed === (sent.denied ? 0 : 400), { p, sent });
+      } finally {
+        console.warn = warn;
+        console.info = info;
+      }
       await db.delete(schema.textPack).where(eq(schema.textPack.organizationId, AORG));
     }
 
