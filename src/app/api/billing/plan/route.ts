@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { billingConfigured, billingEnabled, plans, planByPriceId } from "@/lib/billing/config";
-import { findLiveStripeSubscription, getOrCreateCustomer } from "@/lib/billing/checkout";
+import { findCustomerId, findLiveStripeSubscription } from "@/lib/billing/checkout";
 import { changePlan, pendingCancelAt, UPGRADE_POLICY } from "@/lib/billing/plan-change";
 import { scheduledChanges } from "@/lib/billing/addons";
 import { getStripe } from "@/lib/billing/stripe";
@@ -20,6 +20,8 @@ const iso = (s: number | null | undefined) => (s ? new Date(s * 1000).toISOStrin
  * Owner/Admin: the subscription's plan, interval, status, trial end, pending cancellation and scheduled changes (read
  * live from Stripe), the plans the in-app switcher offers, and the support contact. 404 unless BILLING_ENABLED=true.
  * The Stripe portal is for the card and invoices only (plan switching and quantity changes are OFF there).
+ * Read-only: the demo org gets `subscription: null` with no Stripe call and no DB write; an org without a
+ * billing_customer row gets `subscription: null` too (no customer is ever created here).
  */
 export async function GET(req: Request) {
   if (!billingEnabled()) return new Response("Not found", { status: 404 });
@@ -27,7 +29,9 @@ export async function GET(req: Request) {
   const ctx = await requireApi(req, { manager: true });
   if (ctx instanceof Response) return ctx;
   const base = { plans: plans().map((p) => ({ key: p.key, interval: p.interval })), upgradePolicy: UPGRADE_POLICY, supportEmail: BILLING_SUPPORT_EMAIL, demo: ctx.org.isDemo };
-  const customer = await getOrCreateCustomer(ctx);
+  if (ctx.org.isDemo) return Response.json({ ...base, subscription: null });
+  const customer = await findCustomerId(ctx.org.id);
+  if (!customer) return Response.json({ ...base, subscription: null });
   const live = await findLiveStripeSubscription(customer);
   if (!live) return Response.json({ ...base, subscription: null });
   const stripe = getStripe();
@@ -68,8 +72,9 @@ export async function POST(req: Request) {
   if (!parsed.success) return badRequest(parsed.error);
   let result: Awaited<ReturnType<typeof changePlan>>;
   try {
-    const customer = await getOrCreateCustomer(ctx);
-    const live = await findLiveStripeSubscription(customer);
+    // Look up only: a plan change needs an existing subscription, so never create a customer here.
+    const customer = await findCustomerId(ctx.org.id);
+    const live = customer ? await findLiveStripeSubscription(customer) : null;
     if (!live) return Response.json({ error: "No subscription yet. Subscribe to a plan first." }, { status: 409 });
     result = await withAddonChangeLock(ctx.org.id, () => changePlan({ stripe: getStripe(), subscription: live, plan: parsed.data.plan, interval: parsed.data.interval }));
   } catch (err) {

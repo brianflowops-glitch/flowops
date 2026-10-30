@@ -631,6 +631,22 @@ const expectUnique = async (db: ReturnType<typeof getDb>, invoiceId: string) => 
         await runC(disputeEv("charge.dispute.created", `ch_cb7_${n}`, AT + 314));
         check("clawback: an inquiry (warning_needs_response) revokes nothing", (await pack(`tp_cb7_${n}`)).textsRevoked === 0);
 
+        // Stripe 404 (resource_missing) on the charge / invoice lookup → logged and ignored (200), not a 500 retry loop.
+        {
+          const missing = Object.assign(new Error("No such charge: 'ch_gone'"), { type: "StripeInvalidRequestError", code: "resource_missing", statusCode: 404 });
+          const w0 = warned.length;
+          const e404 = refundEv(`ch_gone_${n}`, AT + 316);
+          const r404 = await processStripeEvent(e404, { fetchSubscription, fetchChargeContext: async () => { throw missing; }, now: nowD });
+          check("clawback: Stripe 404 resource_missing on the charge lookup → ignored (200 handled) and logged, nothing written", r404.status === "ignored" && warned.slice(w0).some((w) => w.includes("resource_missing") && w.includes(e404.id)) && (await db.select().from(schema.textPackRevocation).where(eq(schema.textPackRevocation.stripeChargeId, `ch_gone_${n}`))).length === 0, { r404, warned: warned.slice(w0) });
+          let threw = false;
+          try {
+            await processStripeEvent(refundEv(`ch_err_${n}`, AT + 317), { fetchSubscription, fetchChargeContext: async () => { throw Object.assign(new Error("api down"), { statusCode: 500 }); }, now: nowD });
+          } catch {
+            threw = true;
+          }
+          check("clawback: other Stripe errors still throw (→ 500, Stripe retries)", threw);
+        }
+
         // Concurrency: a revocation and a send at the same moment never overdraw (both lock the org row).
         await db.delete(schema.textPack).where(eq(schema.textPack.organizationId, AORG));
         await mkRow(`tp_cb8_${n}`, "paid", -1, 20, { stripeInvoiceId: `in_cb8_${n}` });

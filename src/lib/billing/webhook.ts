@@ -5,7 +5,7 @@ import { getDb, schema, type Db } from "@/lib/db";
 import { normalizeStatus } from "./status";
 import { classifyItems } from "./entitlements";
 import { markPackFailed, markPackPaid } from "./text-packs";
-import { applyChargeClawback, chargeIdForEvent, CLAWBACK_EVENTS, type ChargeContext, type ChargeContextFetcher, type ClawbackOutcome } from "./clawback";
+import { applyChargeClawback, chargeIdForEvent, CLAWBACK_EVENTS, isStripeResourceMissing, type ChargeContext, type ChargeContextFetcher, type ClawbackOutcome } from "./clawback";
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
@@ -94,7 +94,15 @@ export async function processStripeEvent(event: Stripe.Event, opts: ProcessOptio
   let charge: ChargeContext | null = null;
   if (chargeId) {
     if (!opts.fetchChargeContext) throw new Error("fetchChargeContext is required for charge.refunded / charge.dispute.* events");
-    charge = await opts.fetchChargeContext(chargeId);
+    try {
+      charge = await opts.fetchChargeContext(chargeId);
+    } catch (err) {
+      // The charge / invoice no longer exists for this key (404 resource_missing): nothing to claw back, and a retry
+      // would 404 again. Log and acknowledge (200) instead of making Stripe retry for days. Other errors still throw.
+      if (!isStripeResourceMissing(err)) throw err;
+      console.warn(`[billing] text pack clawback: ${event.type} ${event.id}: charge ${chargeId} not found in Stripe (resource_missing); ignored`);
+      return result("ignored");
+    }
   }
 
   return db.transaction(async (tx) => {

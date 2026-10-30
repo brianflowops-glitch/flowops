@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { billingConfigured, billingEnabled } from "@/lib/billing/config";
-import { findLiveStripeSubscription, getOrCreateCustomer } from "@/lib/billing/checkout";
+import { findCustomerId, findLiveStripeSubscription } from "@/lib/billing/checkout";
 import { setCancelAtPeriodEnd } from "@/lib/billing/plan-change";
 import { getStripe } from "@/lib/billing/stripe";
 import { withAddonChangeLock } from "@/lib/billing/addon-charges-db";
@@ -28,8 +28,9 @@ export async function POST(req: Request) {
   if (!parsed.success) return badRequest(parsed.error);
   let result: Awaited<ReturnType<typeof setCancelAtPeriodEnd>>;
   try {
-    const customer = await getOrCreateCustomer(ctx);
-    const live = await findLiveStripeSubscription(customer);
+    // Look up only: nothing to cancel without an existing customer, so never create one here.
+    const customer = await findCustomerId(ctx.org.id);
+    const live = customer ? await findLiveStripeSubscription(customer) : null;
     if (!live) return Response.json({ error: "No subscription to cancel." }, { status: 409 });
     result = await withAddonChangeLock(ctx.org.id, () => setCancelAtPeriodEnd(getStripe(), live, parsed.data.cancel));
   } catch (err) {

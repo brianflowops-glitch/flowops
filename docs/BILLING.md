@@ -388,6 +388,7 @@ The pack's revocation is computed **absolutely** from Stripe's current state of 
 - The plan's monthly allowance is never touched; nothing is auto-charged. `consumeTexts` / `activePaidPacks` treat `remaining = total − used − revoked`.
 - Locking: the org row, then the pack row (`FOR UPDATE`), same order as `consumeTexts`, so a send and a refund can't race.
 - A revoked pack still counts toward the per-window pack cap (decision for Brian).
+- A Stripe 404 (`resource_missing`) while looking up the charge or its invoice payments is logged (`console.warn`) and the event is acknowledged as `ignored` (200), so Stripe doesn't retry a lookup that can never succeed. Any other Stripe/network error still returns 500 (Stripe retries).
 
 **Migration `0012_text_pack_clawback` (add-only):** `text_pack` gains `texts_revoked int not null default 0`, `revoked_at`, `revoked_reason`, `stripe_charge_id`, `amount_refunded int not null default 0`, `dispute_status`. New table `text_pack_revocation` (one row per Stripe event that changed a pack; unique on `stripe_event_id`). Nothing is altered or dropped; existing packs read as "nothing revoked".
 
@@ -402,6 +403,7 @@ Owner/Admin only (staff 403), demo orgs (`is_demo`) 403 `demo_org`, 404 unless `
 - **Add-ons switch interval with the plan** (seat/location/branding monthly ↔ annual price). If an add-on has no price for the target interval, the change is refused (409, contact support).
 - **Trials:** never charged; the trial continues (`trial_end` kept, proration none). Upgrades apply immediately (free); downgrades take effect at the trial end.
 - Pending add-on decreases already in the schedule are carried over (mapped to the new plan/interval). Choosing the current plan again cancels a pending plan change and keeps pending add-on changes.
+- **Read paths never create customers:** `GET /api/billing/plan` (loaded by the billing card on every Administration page view) returns `subscription: null` for `is_demo` orgs without any Stripe call or DB write, and otherwise only *looks up* an existing `billing_customer` row (`findCustomerId`); no row → `subscription: null`, no Stripe call. `POST /api/billing/plan` and `/api/billing/cancel` look up the same way (no row → 409). The card shows the portal button ("Card & invoices") only when there is a subscription and the org is not a demo org.
 - **Locking:** the same per-org advisory lock as add-ons (`withAddonChangeLock`); a concurrent billing change → **409 `change_in_progress`**.
 - **Refused → support** (`BILLING_SUPPORT_EMAIL`, the site contact address): schedules with more than one future phase, discounts / extra invoice items in a phase, unmappable items. A pending cancellation → 409 `cancel_pending` (resume first).
 - **Cancel (`POST /api/billing/cancel {cancel}`)** is schedule-safe: without a schedule it sets `cancel_at_period_end`; with one it trims the schedule to the current phase with `end_behavior: "cancel"` and saves the next phase in schedule metadata, so **resume** restores the pending change.

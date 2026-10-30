@@ -45,6 +45,13 @@ export function chargeIdForEvent(event: Stripe.Event): string | null {
   return null;
 }
 
+/** A Stripe 404 (`resource_missing`), e.g. a charge or invoice deleted or from another account/mode. */
+export function isStripeResourceMissing(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { code?: unknown; statusCode?: unknown; raw?: { code?: unknown } };
+  return e.code === "resource_missing" || e.raw?.code === "resource_missing" || e.statusCode === 404;
+}
+
 /** Real fetcher: the charge, the invoice(s) its PaymentIntent paid, and its disputes. */
 export function stripeChargeContextFetcher(stripe: ClawbackStripe): ChargeContextFetcher {
   return async (chargeId) => {

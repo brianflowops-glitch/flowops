@@ -131,8 +131,10 @@ const nextPhaseParam = (items: PhaseItem[], interval: BillingInterval, metadata?
  * Make the subscription's NEXT phase hold `nextItems` (creating a schedule from the subscription if needed); releases
  * the schedule when the next phase would equal the current one. The current phase is rewritten unchanged
  * (`phaseParam` keeps its dates and trial_end). Returns when the next phase starts, or null when cleared.
+ * `nextMetadata`: the next phase's metadata; defaults to the existing next phase's (a schedule created here has none,
+ * so callers re-creating a released schedule pass the original phase's metadata).
  */
-export async function writeNextPhase(stripe: PlanStripe, subId: string, schedule: Stripe.SubscriptionSchedule | null, nextItems: PhaseItem[], interval: BillingInterval): Promise<{ ok: true; effectiveAt: number | null } | { ok: false; error: string }> {
+export async function writeNextPhase(stripe: PlanStripe, subId: string, schedule: Stripe.SubscriptionSchedule | null, nextItems: PhaseItem[], interval: BillingInterval, nextMetadata?: Stripe.Metadata | null): Promise<{ ok: true; effectiveAt: number | null } | { ok: false; error: string }> {
   const base = schedule ?? (await stripe.subscriptionSchedules.create({ from_subscription: subId }));
   const ph = schedulePhases(base);
   if (!ph) return { ok: false, error: "Could not read the subscription schedule" };
@@ -141,7 +143,7 @@ export async function writeNextPhase(stripe: PlanStripe, subId: string, schedule
     await stripe.subscriptionSchedules.release(base.id);
     return { ok: true, effectiveAt: null };
   }
-  await stripe.subscriptionSchedules.update(base.id, { end_behavior: "release", proration_behavior: "none", phases: [phaseParam(ph.current, cur), nextPhaseParam(nextItems, interval, ph.future[0]?.metadata)] });
+  await stripe.subscriptionSchedules.update(base.id, { end_behavior: "release", proration_behavior: "none", phases: [phaseParam(ph.current, cur), nextPhaseParam(nextItems, interval, nextMetadata !== undefined ? nextMetadata : ph.future[0]?.metadata)] });
   return { ok: true, effectiveAt: ph.current.end_date };
 }
 
@@ -238,7 +240,7 @@ export async function changePlanUnderPolicy(policy: UpgradePolicy, { stripe, sub
     ? { items: itemParams, proration_behavior: "none", ...(sub.trial_end ? { trial_end: sub.trial_end } : {}) }
     : { items: itemParams, proration_behavior: "always_invoice", payment_behavior: "pending_if_incomplete" };
   const restore = async () => {
-    if (originalNext) await writeNextPhase(stripe, sub.id, null, originalNext.items, originalNext.interval).catch((e) => console.error("[billing] could not restore the pending schedule after a failed plan change", sub.id, e instanceof Error ? e.message : e));
+    if (originalNext) await writeNextPhase(stripe, sub.id, null, originalNext.items, originalNext.interval, originalNext.metadata).catch((e) => console.error("[billing] could not restore the pending schedule after a failed plan change", sub.id, e instanceof Error ? e.message : e));
   };
   try {
     await stripe.subscriptions.update(sub.id, params);
@@ -258,7 +260,7 @@ export async function changePlanUnderPolicy(policy: UpgradePolicy, { stripe, sub
   }
   // Put the pending next phase back (mapped to the new plan / interval) if it differs from what is now active.
   if (next && !sameItems(nowMapped.items, nextMapped.items)) {
-    const w = await writeNextPhase(stripe, sub.id, null, nextMapped.items, target.interval);
+    const w = await writeNextPhase(stripe, sub.id, null, nextMapped.items, target.interval, next.metadata);
     if (!w.ok) console.error("[billing] plan changed but the pending add-on change could not be re-scheduled", sub.id, w.error);
   }
   return result("applied", kind, null, charge);

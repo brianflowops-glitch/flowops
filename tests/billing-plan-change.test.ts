@@ -12,6 +12,8 @@ import { getDb, schema } from "@/lib/db";
 import { eq } from "drizzle-orm";
 import { changePlanUnderPolicy, classifyPlanChange, itemsForPlan, setCancelAtPeriodEnd, UPGRADE_POLICY, type PlanStripe } from "@/lib/billing/plan-change";
 import { packDisputeState, packRevocation } from "@/lib/billing/text-pack-rules";
+import StripeSdk from "stripe";
+import { isStripeResourceMissing, stripeChargeContextFetcher, type ClawbackStripe } from "@/lib/billing/clawback";
 
 const ENV = {
   STRIPE_PRICE_STARTER: "p_starter_m",
@@ -30,7 +32,7 @@ const PERIOD_END = 1_900_000_000;
 const PERIOD_START = PERIOD_END - 30 * 86400;
 
 /** In-memory Stripe: one subscription, optional schedule. Records every write. */
-function fakeStripe(o: { items: [string, number][]; status?: string; trialEnd?: number; schedule?: { next: [string, number][]; endBehavior?: "release" | "cancel"; metadata?: Record<string, string> } | null; decline?: boolean }) {
+function fakeStripe(o: { items: [string, number][]; status?: string; trialEnd?: number; schedule?: { next: [string, number][]; endBehavior?: "release" | "cancel"; metadata?: Record<string, string>; nextMetadata?: Record<string, string> } | null; decline?: boolean }) {
   const calls: { op: string; id?: string; params?: unknown }[] = [];
   let seq = 0;
   const sub = {
@@ -48,7 +50,7 @@ function fakeStripe(o: { items: [string, number][]; status?: string; trialEnd?: 
     sub.schedule = schedule.id;
   };
   const curItems = () => sub.items.data.map((i) => [i.price.id, i.quantity] as [string, number]);
-  if (o.schedule) mkSchedule([{ items: curItems(), start: PERIOD_START, end: PERIOD_END, trial_end: o.trialEnd ?? null }, { items: o.schedule.next, start: PERIOD_END, end: PERIOD_END + 30 * 86400 }], o.schedule.endBehavior ?? "release", o.schedule.metadata);
+  if (o.schedule) mkSchedule([{ items: curItems(), start: PERIOD_START, end: PERIOD_END, trial_end: o.trialEnd ?? null }, { items: o.schedule.next, start: PERIOD_END, end: PERIOD_END + 30 * 86400, metadata: o.schedule.nextMetadata }], o.schedule.endBehavior ?? "release", o.schedule.metadata);
   const invoices = new Map<string, Stripe.Invoice>();
   const stripe = {
     subscriptions: {
@@ -180,6 +182,19 @@ describe("plan change: prorate_now (default)", () => {
     expect(f.curItems()).toEqual([["p_starter_m", 1], ["p_seat_m", 3]]);
     expect(items(f.schedule, 1)).toEqual([["p_starter_m", 1], ["p_seat_m", 1]]);
   });
+  it("the released schedule's next-phase metadata is kept: restored after a decline, and re-created after success", async () => {
+    const md = { flowops_addon_change: "seat:3->1", flowops_by: "user_1" };
+    const declined = fakeStripe({ items: [["p_starter_m", 1], ["p_seat_m", 3]], schedule: { next: [["p_starter_m", 1], ["p_seat_m", 1]], nextMetadata: md }, decline: true });
+    expect(await run(declined, "pro", "month")).toMatchObject({ ok: false, status: 402 });
+    expect(items(declined.schedule, 1)).toEqual([["p_starter_m", 1], ["p_seat_m", 1]]);
+    expect(declined.schedule!.phases[1].metadata).toEqual(md);
+    const restoreCall = declined.calls.filter((c) => c.op === "schedules.update").at(-1)!.params as Stripe.SubscriptionScheduleUpdateParams;
+    expect(restoreCall.phases![1].metadata).toEqual(md);
+    const ok = fakeStripe({ items: [["p_starter_m", 1], ["p_seat_m", 3]], schedule: { next: [["p_starter_m", 1], ["p_seat_m", 1]], nextMetadata: md } });
+    expect(await run(ok, "pro", "month")).toMatchObject({ ok: true, action: "applied" });
+    expect(items(ok.schedule, 1)).toEqual([["p_pro_m", 1], ["p_seat_m", 1]]);
+    expect(ok.schedule!.phases[1].metadata).toEqual(md);
+  });
   it("downgrade is scheduled for the renewal (next phase), nothing charged; existing pending removal kept", async () => {
     const f = fakeStripe({ items: [["p_biz_m", 1], ["p_seat_m", 3]], schedule: { next: [["p_biz_m", 1], ["p_seat_m", 1]] } });
     const r = await run(f, "starter", "month");
@@ -304,6 +319,24 @@ describe("text-pack clawback rules (pure)", () => {
   });
 });
 
+describe("clawback: Stripe 404 on the charge / invoice lookup", () => {
+  const missing = () => new StripeSdk.errors.StripeInvalidRequestError({ type: "invalid_request_error", code: "resource_missing", message: "No such charge", statusCode: 404 } as never);
+  it("recognises Stripe's resource_missing / 404 errors, and nothing else", () => {
+    expect(isStripeResourceMissing(missing())).toBe(true);
+    expect(isStripeResourceMissing(Object.assign(new Error("x"), { statusCode: 404 }))).toBe(true);
+    expect(isStripeResourceMissing(new StripeSdk.errors.StripeAPIError({ type: "api_error", message: "down", statusCode: 500 } as never))).toBe(false);
+    expect(isStripeResourceMissing(new Error("network"))).toBe(false);
+    expect(isStripeResourceMissing(null)).toBe(false);
+  });
+  it("the real fetcher surfaces a 404 from the charge or the invoice-payments lookup (the webhook then ignores it)", async () => {
+    const charge = { id: "ch_1", amount: 1500, amount_refunded: 0, refunded: false, disputed: false, payment_intent: "pi_1" };
+    const s1 = { charges: { retrieve: async () => { throw missing(); } }, invoicePayments: { list: async () => ({ data: [] }) }, disputes: { list: async () => ({ data: [] }) } } as unknown as ClawbackStripe;
+    await expect(stripeChargeContextFetcher(s1)("ch_1")).rejects.toSatisfy(isStripeResourceMissing);
+    const s2 = { charges: { retrieve: async () => charge }, invoicePayments: { list: async () => { throw missing(); } }, disputes: { list: async () => ({ data: [] }) } } as unknown as ClawbackStripe;
+    await expect(stripeChargeContextFetcher(s2)("ch_1")).rejects.toSatisfy(isStripeResourceMissing);
+  });
+});
+
 // Route guards for /api/billing/plan and /api/billing/cancel (Stripe and the library are mocked).
 describe("POST/GET /api/billing/plan and POST /api/billing/cancel", () => {
   let owner: TestUser, admin: TestUser, staffer: TestUser, demoUser: TestUser;
@@ -327,7 +360,7 @@ describe("POST/GET /api/billing/plan and POST /api/billing/cancel", () => {
   afterAll(() => vi.unstubAllEnvs());
   const post = (u: TestUser | null, body: unknown = { plan: "pro", interval: "month" }) => planRoute.POST(req("/api/billing/plan", { method: "POST", body, cookie: u?.cookie }));
   const cancel = (u: TestUser | null, body: unknown = { cancel: true }) => cancelRoute.POST(req("/api/billing/cancel", { method: "POST", body, cookie: u?.cookie }));
-  const live = (status = "active") => spies.push(vi.spyOn(checkoutLib, "getOrCreateCustomer").mockResolvedValue("cus_x"), vi.spyOn(checkoutLib, "findLiveStripeSubscription").mockResolvedValue({ id: "sub_x", status, items: { data: [] } } as never), vi.spyOn(stripeLib, "getStripe").mockReturnValue({} as never));
+  const live = (status = "active") => spies.push(vi.spyOn(checkoutLib, "findCustomerId").mockResolvedValue("cus_x"), vi.spyOn(checkoutLib, "findLiveStripeSubscription").mockResolvedValue({ id: "sub_x", status, items: { data: [] } } as never), vi.spyOn(stripeLib, "getStripe").mockReturnValue({} as never));
 
   it("404 while BILLING_ENABLED is off", async () => {
     vi.stubEnv("BILLING_ENABLED", "");
@@ -363,9 +396,69 @@ describe("POST/GET /api/billing/plan and POST /api/billing/cancel", () => {
       expect(ch).not.toHaveBeenCalled();
     });
     it("409 without a subscription", async () => {
-      spies.push(vi.spyOn(checkoutLib, "getOrCreateCustomer").mockResolvedValue("cus_x"), vi.spyOn(checkoutLib, "findLiveStripeSubscription").mockResolvedValue(null as never));
+      spies.push(vi.spyOn(checkoutLib, "findCustomerId").mockResolvedValue("cus_x"), vi.spyOn(checkoutLib, "findLiveStripeSubscription").mockResolvedValue(null as never));
       expect((await post(owner)).status).toBe(409);
       expect((await cancel(admin)).status).toBe(409);
+    });
+
+    // Read paths must never create a Stripe customer or a billing_customer row (the demo org is off-limits, and an
+    // admin opening the page must not make a customer for an org that never subscribed).
+    const customerRows = async () => (await getDb().select().from(schema.billingCustomer)).length;
+    const stripeSpies = () => {
+      const create = vi.fn(async () => ({ id: "cus_should_not_exist" }));
+      const gs = vi.spyOn(stripeLib, "getStripe").mockReturnValue({ customers: { create }, subscriptions: { list: vi.fn(async () => ({ data: [] })) }, subscriptionSchedules: { retrieve: vi.fn() } } as never);
+      const occ = vi.spyOn(checkoutLib, "getOrCreateCustomer");
+      const fl = vi.spyOn(checkoutLib, "findLiveStripeSubscription");
+      spies.push(gs, occ, fl);
+      return { create, gs, occ, fl };
+    };
+    it("GET for the demo org: subscription null, no Stripe call, no billing_customer row written", async () => {
+      const before = await customerRows();
+      const sp = stripeSpies();
+      const res = await planRoute.GET(req("/api/billing/plan", { cookie: demoUser.cookie }));
+      expect(res.status).toBe(200);
+      const j = await res.json();
+      expect(j.subscription).toBeNull();
+      expect(j.demo).toBe(true);
+      expect(sp.gs).not.toHaveBeenCalled();
+      expect(sp.create).not.toHaveBeenCalled();
+      expect(sp.occ).not.toHaveBeenCalled();
+      expect(sp.fl).not.toHaveBeenCalled();
+      const demoOrg = (await memberOf(demoUser.id)).organizationId;
+      expect(await getDb().select().from(schema.billingCustomer).where(eq(schema.billingCustomer.organizationId, demoOrg))).toHaveLength(0);
+      expect(await customerRows()).toBe(before);
+    });
+    it("GET / POST / cancel for an org that never subscribed: no customer created, no row, no Stripe call", async () => {
+      const orgId = (await memberOf(owner.id)).organizationId;
+      expect(await getDb().select().from(schema.billingCustomer).where(eq(schema.billingCustomer.organizationId, orgId))).toHaveLength(0);
+      const before = await customerRows();
+      const sp = stripeSpies();
+      const res = await planRoute.GET(req("/api/billing/plan", { cookie: admin.cookie }));
+      expect(res.status).toBe(200);
+      expect((await res.json()).subscription).toBeNull();
+      expect((await post(owner)).status).toBe(409);
+      expect((await cancel(owner)).status).toBe(409);
+      expect(sp.gs).not.toHaveBeenCalled();
+      expect(sp.create).not.toHaveBeenCalled();
+      expect(sp.occ).not.toHaveBeenCalled();
+      expect(sp.fl).not.toHaveBeenCalled();
+      expect(await getDb().select().from(schema.billingCustomer).where(eq(schema.billingCustomer.organizationId, orgId))).toHaveLength(0);
+      expect(await customerRows()).toBe(before);
+    });
+    it("GET with an existing billing_customer row: looks up that customer's subscription (no create)", async () => {
+      const orgId = (await memberOf(owner.id)).organizationId;
+      await getDb().insert(schema.billingCustomer).values({ organizationId: orgId, stripeCustomerId: "cus_existing" });
+      try {
+        const sp = stripeSpies();
+        sp.fl.mockResolvedValue(null as never);
+        const j = await (await planRoute.GET(req("/api/billing/plan", { cookie: owner.cookie }))).json();
+        expect(j.subscription).toBeNull();
+        expect(sp.fl).toHaveBeenCalledWith("cus_existing");
+        expect(sp.occ).not.toHaveBeenCalled();
+        expect(sp.create).not.toHaveBeenCalled();
+      } finally {
+        await getDb().delete(schema.billingCustomer).where(eq(schema.billingCustomer.organizationId, orgId));
+      }
     });
     it("runs inside the org's billing lock; busy → 409 change_in_progress, nothing changed", async () => {
       live();

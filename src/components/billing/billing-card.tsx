@@ -129,7 +129,8 @@ export function BillingCard() {
         )}
 
         <div className="flex flex-wrap gap-2 border-t border-white/[0.06] pt-3">
-          <button className={btn} disabled={busy !== null} onClick={portal}>{busy === "portal" ? "Opening…" : "Card & invoices"}</button>
+          {/* Only with a subscription and never for the demo org: opening the portal creates a Stripe customer otherwise. */}
+          {sub && !state.demo && <button className={btn} disabled={busy !== null} onClick={portal}>{busy === "portal" ? "Opening…" : "Card & invoices"}</button>}
           {sub && (sub.cancelAt ? (
             <button className={btn} disabled={busy !== null || state.demo} onClick={() => post("/api/billing/cancel", { cancel: false }, "resume")}>{busy === "resume" ? "Resuming…" : "Resume subscription"}</button>
           ) : (
