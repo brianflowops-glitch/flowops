@@ -27,5 +27,8 @@ check("other 402 not treated as lock", !isBillingLockedResponse(402, { error: "p
 check("403 not treated as lock", !isBillingLockedResponse(403, { error: "billing_locked" }));
 check("billing off → full access (no lock screen)", resolveBillingAccess({ enabled: false, exempt: false, status: null, canManageBilling: false }).access === "full");
 
+check("is_demo org → full access (no lock screen), even with past_due", ["full"].includes(resolveBillingAccess({ enabled: true, exempt: false, demo: true, status: "past_due", canManageBilling: true }).access) && resolveBillingAccess({ enabled: true, exempt: false, demo: true, status: null, canManageBilling: false }).access === "full");
+check("exempt org → full access (no lock screen)", resolveBillingAccess({ enabled: true, exempt: true, status: null, canManageBilling: false }).access === "full");
+
 console.log(`\n${failed ? `${failed} failed` : "all passed"} (billing lock UI, offline)`);
 process.exit(failed ? 1 : 0);

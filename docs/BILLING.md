@@ -104,7 +104,7 @@ Note: since Stripe API version 2025-03-31, `current_period_end` lives on subscri
 | `past_due` | renewal payment failed, Stripe retrying (Smart Retries) | **locked immediately** (§6) |
 | `canceled` | ended (terminal; never becomes active again) | locked (re-subscribe via Checkout) |
 | also stored: `incomplete_expired`, `unpaid`, `paused` | Stripe edge states | locked |
-| no subscription row | org never subscribed | locked (`no_subscription`), unless in `BILLING_EXEMPT_ORG_IDS` |
+| no subscription row | org never subscribed | locked (`no_subscription`), unless in `BILLING_EXEMPT_ORG_IDS` or `organization.is_demo = true` |
 
 `cancel_at_period_end=true` means the owner cancelled in the portal; access continues until `current_period_end`. Unknown future statuses are stored as `incomplete` (fail closed). Ordering is handled in §7: state is fetched from Stripe, older events can't overwrite newer ones, and a `canceled` row is never overwritten.
 
@@ -122,15 +122,17 @@ Note: since Stripe API version 2025-03-31, `current_period_end` lives on subscri
 
 | Export (`src/lib/billing/access.ts`) | What it does |
 | --- | --- |
-| `getBillingAccess(organizationId, role?)` → `{ access: "full" \| "locked", reason, status, canManageBilling }` | `reason`: `"ok"`, `"billing_disabled"`, `"exempt"`, `"no_subscription"`, or the locked status (`"past_due"`, `"unpaid"`, `"incomplete"`, `"incomplete_expired"`, `"canceled"`, `"paused"`). `status` is the stored subscription status or `null`. `canManageBilling` = Owner or Admin. One indexed read of `subscription`; none when billing is off. |
+| `getBillingAccess(orgIdOrRow, role?)` → `{ access: "full" \| "locked", reason, status, canManageBilling }` | `reason`: `"ok"`, `"billing_disabled"`, `"exempt"`, `"demo"`, `"no_subscription"`, or the locked status (`"past_due"`, `"unpaid"`, `"incomplete"`, `"incomplete_expired"`, `"canceled"`, `"paused"`). `status` is the stored subscription status or `null`. `canManageBilling` = Owner or Admin. One indexed read of `subscription` (plus one of `organization.is_demo` when only an id is passed; pass the org row, as `requireApi` and the dashboard layout do, to skip it); none when billing is off. |
 | `requireBillingAccess(req, ctx)` | Called from the shared API guard `requireApi()` (`src/lib/server/context.ts`), after the auth and role checks, so every route that uses `requireApi` inherits it. Returns `null` (go ahead) or **402** `{ "error": "billing_locked", "reason", "status", "canManageBilling" }`. Paths under `/api/billing/`, `/api/auth/`, `/api/invites/` are exempt. |
 | `canManageBilling(role)`, `isBillingExemptPath(path)`, `resolveBillingAccess(...)`, `billingExemptOrgIds(env)`, `effectiveSubscription(rows)` | Pure helpers (in `access-rules.ts`, unit-tested offline). |
 
-If an org has several subscription rows (e.g. an old canceled one and a new active one), any `active`/`trialing` row wins; otherwise the most recently updated row decides. The dashboard lock screen (Bot) should call `getBillingAccess(ctx.org.id, ctx.role)` in the dashboard layout, or react to the 402 from `/api/state`.
+If an org has several subscription rows (e.g. an old canceled one and a new active one), any `active`/`trialing` row wins; otherwise the most recently updated row decides. The dashboard lock screen (Bot) calls `getBillingAccess(ctx.org, ctx.role)` in the dashboard layout, or react to the 402 from `/api/state`.
 
 ### Orgs without a subscription, and exemptions (founder decision)
 
 When billing is turned on, an org that has never subscribed is **locked** (`no_subscription`) and is sent to Checkout. Existing orgs that predate billing, such as `org_flowops_demo` (Brian's own workspace) and pilot customers, must be listed in `BILLING_EXEMPT_ORG_IDS` (comma-separated org ids) **before** `BILLING_ENABLED=true` goes on, or they get locked too. Exempt orgs always get full access, even with a failed or canceled subscription. **Brian to confirm:** which orgs are exempt, and whether new sign-ups should get a free trial instead of an immediate lock (a Stripe trial gives `trialing` → full).
+
+**Demo orgs (`organization.is_demo = true`) always have access** (`reason: "demo"`), with or without a subscription row and whatever its status, the same orgs the add-on sweep cron skips (§11). `org_flowops_demo` is seeded with `is_demo = true` by `scripts/db-migrate.ts`, so it can't be locked out even if `BILLING_EXEMPT_ORG_IDS` is empty or mistyped. Access is decided from the database only: a demo org is never sent to Stripe Checkout automatically (an Owner/Admin can still choose to subscribe). Every other org (`is_demo = false`) with no subscription row is locked as `no_subscription`, and `past_due` / `unpaid` / `canceled` / … still lock it (§6). Order: billing off → `billing_disabled`; `active`/`trialing` → `ok`; exempt → `exempt`; demo → `demo`; else locked. `getEntitlements` (§11) does not yet treat demo orgs as unlimited; add that when enforcement is wired.
 
 With `BILLING_ENABLED` off (the default), `getBillingAccess` always returns `full` / `billing_disabled` and nothing is locked.
 

@@ -69,6 +69,20 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
   check("access: exempt org with no subscription → full/exempt", on(null, true).access === "full" && on(null, true).reason === "exempt");
   check("access: exempt org with past_due → full/exempt", on("past_due", true).access === "full" && on("past_due", true).reason === "exempt");
   check("access: exempt org with active → full/ok", on("active", true).reason === "ok");
+  // is_demo orgs (org_flowops_demo) always have access, like exempt ones; consistent with the add-on cron's skip.
+  const demo = (status: (typeof SUBSCRIPTION_STATUSES)[number] | null) => resolveBillingAccess({ enabled: true, exempt: false, demo: true, status, canManageBilling: true });
+  check("access: is_demo org with no subscription → full/demo", demo(null).access === "full" && demo(null).reason === "demo" && demo(null).status === null);
+  for (const st of ["past_due", "unpaid", "canceled", "incomplete_expired", "paused"] as const)
+    check(`access: is_demo org with ${st} → full/demo (never locked)`, demo(st).access === "full" && demo(st).reason === "demo" && demo(st).status === st);
+  check("access: is_demo org with active → full/ok", demo("active").reason === "ok");
+  check("access: exempt wins the reason over is_demo", resolveBillingAccess({ enabled: true, exempt: true, demo: true, status: null, canManageBilling: false }).reason === "exempt");
+  check("access: is_demo with BILLING_ENABLED off → billing_disabled", resolveBillingAccess({ enabled: false, exempt: false, demo: true, status: null, canManageBilling: false }).reason === "billing_disabled");
+  check(
+    "access: non-demo org with no subscription → locked/no_subscription (demo omitted or false)",
+    resolveBillingAccess({ enabled: true, exempt: false, demo: false, status: null, canManageBilling: true }).access === "locked" &&
+      resolveBillingAccess({ enabled: true, exempt: false, status: null, canManageBilling: true }).reason === "no_subscription",
+  );
+  check("access: non-demo org with past_due → locked/past_due", resolveBillingAccess({ enabled: true, exempt: false, demo: false, status: "past_due", canManageBilling: true }).reason === "past_due");
   check("access: canManageBilling passed through", resolveBillingAccess({ enabled: true, exempt: false, status: "past_due", canManageBilling: false }).canManageBilling === false);
   check("canManageBilling roles: owner + admin yes, staff no", canManageTeam("owner") && canManageTeam("admin") && !canManageTeam("staff"));
   const ex = billingExemptOrgIds({ BILLING_EXEMPT_ORG_IDS: " org_flowops_demo, org_b ,," });

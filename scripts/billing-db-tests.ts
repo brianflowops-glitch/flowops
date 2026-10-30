@@ -163,6 +163,34 @@ const expectUnique = async (db: ReturnType<typeof getDb>, invoiceId: string) => 
   a = await access("owner", {});
   check("lock: BILLING_ENABLED off → full/billing_disabled", a.access === "full" && a.reason === "billing_disabled", a);
 
+
+  // is_demo orgs always have access (same orgs the add-on cron skips); read from the DB or from the passed org row.
+  const DORG = `org_lockdemo_${n}`;
+  await db.insert(schema.organization).values({ id: DORG, slug: `lockdemo-${n}`, name: "Lock demo test", hours: defaultHours(), isDemo: true });
+  a = await getBillingAccess(DORG, "staff", { env: ON });
+  check("lock: is_demo org (id, looked up), no subscription → full/demo", a.access === "full" && a.reason === "demo" && a.status === null, a);
+  a = await getBillingAccess({ id: DORG, isDemo: true }, "owner", { env: ON });
+  check("lock: is_demo org (row passed) → full/demo", a.access === "full" && a.reason === "demo", a);
+  await db.insert(schema.subscription).values({ id: `subrow_demo_${n}`, organizationId: DORG, stripeSubscriptionId: `sub_demo_${n}`, status: "past_due" });
+  a = await getBillingAccess(DORG, "owner", { env: ON });
+  check("lock: is_demo org with past_due → still full/demo", a.access === "full" && a.reason === "demo" && a.status === "past_due", a);
+  a = await getBillingAccess(DORG, "owner", { env: {} });
+  check("lock: is_demo org, BILLING_ENABLED off → full/billing_disabled", a.access === "full" && a.reason === "billing_disabled", a);
+  a = await getBillingAccess({ id: ORG, isDemo: false }, "owner", { env: ON });
+  check("lock: non-demo org (row passed), no subscription → locked/no_subscription", a.access === "locked" && a.reason === "no_subscription", a);
+  {
+    const prev = process.env.BILLING_ENABLED;
+    process.env.BILLING_ENABLED = "true";
+    const [demoRow] = await db.select().from(schema.organization).where(eq(schema.organization.id, DORG));
+    check("guard: is_demo org passes requireBillingAccess (no 402)", (await requireBillingAccess(new Request("http://localhost/api/state"), { org: demoRow, role: "staff" })) === null);
+    const [plainRow] = await db.select().from(schema.organization).where(eq(schema.organization.id, ORG));
+    const g0 = await requireBillingAccess(new Request("http://localhost/api/state"), { org: plainRow, role: "owner" });
+    check("guard: non-demo org with no subscription → 402 no_subscription", g0?.status === 402 && (await g0.json())?.reason === "no_subscription");
+    if (prev === undefined) delete process.env.BILLING_ENABLED;
+    else process.env.BILLING_ENABLED = prev;
+  }
+  await db.delete(schema.organization).where(eq(schema.organization.id, DORG)); // test org only (cascades its subscription row)
+
   const SL = `sub_lock_${n}`;
   const lockSub = (status: string) => sub(SL, status, { customer: `cus_lock_${n}`, metadata: { organizationId: ORG } });
   stripeState.set(SL, lockSub("active"));
