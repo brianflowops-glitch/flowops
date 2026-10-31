@@ -109,8 +109,8 @@ describe("POST/GET /api/billing/addons guards", () => {
         expect(res.status).toBe(200);
         const j = await res.json();
         expect(j.addons).toEqual([
-          { key: "branding", priceId: "price_x_brand", prices: { month: "price_x_brand" }, known: true, max: 1 },
-          { key: "seat", priceId: "price_x_seat", prices: { month: "price_x_seat", year: "price_x_seat_y" }, known: true, max: 50 },
+          { key: "branding", priceId: "price_x_brand", prices: { month: "price_x_brand" }, known: true, max: 1, available: true },
+          { key: "seat", priceId: "price_x_seat", prices: { month: "price_x_seat", year: "price_x_seat_y" }, known: true, max: 50, available: true },
         ]);
         expect(j.textPacks).toEqual([{ key: "texts_1000", priceId: "price_x_pack", texts: 1000, max: 10 }]);
         expect(j.entitlements).toMatchObject({ enforced: true, reason: "no_subscription", entitlements: { seats: 0 } });

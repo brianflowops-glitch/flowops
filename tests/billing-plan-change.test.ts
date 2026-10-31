@@ -253,6 +253,35 @@ describe("plan change: prorate_now (default)", () => {
   });
 });
 
+describe("plan change: Solo (no branding / seat / location add-ons)", () => {
+  const SOLO_ENV = { ...ENV, STRIPE_PRICE_SOLO: "p_solo_m", STRIPE_PRICE_SOLO_ANNUAL: "p_solo_y" };
+  const toSolo = (f: ReturnType<typeof fakeStripe>, interval: "month" | "year" = "month") =>
+    changePlanUnderPolicy("prorate_now", { stripe: f.stripe, subscription: { id: "sub_1", status: f.sub.status as Stripe.Subscription.Status }, plan: "solo", interval, env: SOLO_ENV });
+  it("Starter → Solo is a downgrade scheduled for the renewal, nothing charged", async () => {
+    const f = fakeStripe({ items: [["p_starter_m", 1]] });
+    expect(await toSolo(f)).toMatchObject({ ok: true, action: "scheduled", kind: "downgrade", effectiveAt: PERIOD_END, charge: null });
+    expect(f.calls.some((c) => c.op === "subscriptions.update")).toBe(false);
+    expect(items(f.schedule, 1)).toEqual([["p_solo_m", 1]]);
+  });
+  it("refused (409, nothing written) while branding, seats or locations would stay on the Solo phase", async () => {
+    const f = fakeStripe({ items: [["p_pro_m", 1], ["p_brand_m", 1], ["p_seat_m", 2]] });
+    const r = await toSolo(f);
+    expect(r).toMatchObject({ ok: false, status: 409 });
+    expect(!r.ok && r.error).toMatch(/Solo plan doesn't include branding removal or extra seats/);
+    expect(f.calls).toEqual([]);
+  });
+  it("allowed once those add-ons are already scheduled for removal at the renewal (the Solo phase has none)", async () => {
+    const f = fakeStripe({ items: [["p_starter_m", 1], ["p_seat_m", 2]], schedule: { next: [["p_starter_m", 1]] } });
+    expect(await toSolo(f)).toMatchObject({ ok: true, action: "scheduled", kind: "downgrade" });
+    expect(items(f.schedule, 1)).toEqual([["p_solo_m", 1]]);
+  });
+  it("Solo → Starter upgrade is applied now as usual", async () => {
+    const f = fakeStripe({ items: [["p_solo_m", 1]] });
+    const r = await changePlanUnderPolicy("prorate_now", { stripe: f.stripe, subscription: { id: "sub_1", status: "active" }, plan: "starter", interval: "month", env: SOLO_ENV });
+    expect(r).toMatchObject({ ok: true, action: "applied", kind: "upgrade" });
+  });
+});
+
 describe("plan change: at_renewal (kept, not the default)", () => {
   it("upgrade is scheduled for the renewal, nothing charged now", async () => {
     const f = fakeStripe({ items: [["p_starter_m", 1], ["p_seat_m", 2]] });

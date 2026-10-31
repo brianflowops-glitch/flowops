@@ -7,6 +7,7 @@ import { resendConfigured } from "@/lib/server/integrations/notify";
 import { getBillingAccess } from "@/lib/billing/access";
 import { plans, trialDays } from "@/lib/billing/config";
 import { lockScreenCopy } from "@/lib/billing/lock-copy";
+import { planPicker } from "@/lib/billing/entitlements";
 import { BillingLocked } from "@/components/billing/billing-locked";
 
 async function Gate({ children }: { children: React.ReactNode }) {
@@ -28,10 +29,9 @@ async function Gate({ children }: { children: React.ReactNode }) {
   if (access.access === "locked") {
     // Plan keys only (never price ids) and only for people who can act on them.
     const all = access.canManageBilling ? plans() : [];
-    const order = ["starter", "pro", "business"];
-    const planKeys = [...new Set(all.filter((p) => p.interval === "month").map((p) => p.key))].sort((a, b) => (order.indexOf(a) + 1 || 99) - (order.indexOf(b) + 1 || 99) || a.localeCompare(b));
-    const annualPlanKeys = planKeys.filter((k) => all.some((p) => p.key === k && p.interval === "year"));
-    return <BillingLocked copy={lockScreenCopy(access, { trialDays: trialDays() })} orgName={ctx.org.name} planKeys={planKeys} annualPlanKeys={annualPlanKeys} />;
+    // Tier order (Solo, Starter, Pro, Business). A plan whose STRIPE_PRICE_* is unset is simply not listed.
+    const { planKeys, annualPlanKeys, planNotes } = planPicker(all);
+    return <BillingLocked copy={lockScreenCopy(access, { trialDays: trialDays() })} orgName={ctx.org.name} planKeys={planKeys} annualPlanKeys={annualPlanKeys} planNotes={planNotes} />;
   }
   return (
     <AppShell

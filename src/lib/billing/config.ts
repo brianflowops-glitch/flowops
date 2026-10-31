@@ -7,6 +7,8 @@
  *   STRIPE_WEBHOOK_SECRET=whsec_… signing secret of the webhook endpoint (or of `stripe listen`)
  *   STRIPE_PRICE_<PLAN>=price_…         monthly price of a plan, e.g. STRIPE_PRICE_STARTER; <PLAN> lowercased is the plan key
  *   STRIPE_PRICE_<PLAN>_ANNUAL=price_…  yearly price of the same plan (key stays <plan>, interval year)
+ *   STRIPE_PRICE_<PLAN>_MONTHLY=price_… accepted as an alias of STRIPE_PRICE_<PLAN> (the unsuffixed name wins if both are set)
+ *   Plans: SOLO, STARTER, PRO, BUSINESS. A plan without its env var is simply not offered (no button, checkout 400).
  *   STRIPE_ADDON_PRICE_<KEY>=price_…         monthly recurring add-on: SEAT / LOCATION / BRANDING.
  *                                            For TEXTS_<n> (a text pack) it is the ONE-TIME price of the pack.
  *   STRIPE_ADDON_PRICE_<KEY>_ANNUAL=price_…  yearly recurring add-on price (used on annual subscriptions)
@@ -53,14 +55,19 @@ export interface PlanConfig {
   interval: BillingInterval;
 }
 
-const PRICE_ENV = /^STRIPE_PRICE_([A-Z0-9]+(?:_[A-Z0-9]+)*?)(_ANNUAL)?$/;
+const PRICE_ENV = /^STRIPE_PRICE_([A-Z0-9]+(?:_[A-Z0-9]+)*?)(_ANNUAL|_MONTHLY)?$/;
 
 /** Plans configured through STRIPE_PRICE_* env vars (one entry per plan and interval). Empty until pricing is configured. */
 export function plans(env: Env = process.env): PlanConfig[] {
   const out: PlanConfig[] = [];
   for (const [name, value] of Object.entries(env)) {
     const m = PRICE_ENV.exec(name);
-    if (m && value) out.push({ key: m[1].toLowerCase(), priceId: value, interval: m[2] ? "year" : "month" });
+    if (!m || !value?.trim()) continue;
+    const key = m[1].toLowerCase();
+    const interval: BillingInterval = m[2] === "_ANNUAL" ? "year" : "month";
+    // STRIPE_PRICE_X_MONTHLY is an alias: skipped when STRIPE_PRICE_X is also set.
+    if (m[2] === "_MONTHLY" && env[`STRIPE_PRICE_${m[1]}`]?.trim()) continue;
+    out.push({ key, priceId: value.trim(), interval });
   }
   return out.sort((a, b) => a.key.localeCompare(b.key) || a.interval.localeCompare(b.interval));
 }

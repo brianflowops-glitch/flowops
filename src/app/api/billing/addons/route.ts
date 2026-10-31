@@ -1,7 +1,7 @@
 import Stripe from "stripe";
 import { z } from "zod";
 import { addonByKey, addons, billingConfigured, billingEnabled, isTextPackKey, textPackSize } from "@/lib/billing/config";
-import { addonMaxQuantity } from "@/lib/billing/entitlements";
+import { addonAllowedOnPlan, addonMaxQuantity } from "@/lib/billing/entitlements";
 import { configuredAddons, setAddonQuantity, validateAddonQuantity } from "@/lib/billing/addons";
 import { findLiveStripeSubscription, getOrCreateCustomer } from "@/lib/billing/checkout";
 import { getEntitlements } from "@/lib/billing/org-entitlements";
@@ -26,8 +26,10 @@ export async function GET(req: Request) {
   const ctx = await requireApi(req, { manager: true });
   if (ctx instanceof Response) return ctx;
   const [entitlements, pending] = await Promise.all([getEntitlements(ctx.org.id), getScheduledChanges(ctx.org.id)]);
+  // `available: false` = the org's plan can't have this add-on (Solo: branding removal, extra seats, extra locations).
+  const planKey = entitlements.enforced ? entitlements.entitlements.planKey : null;
   return Response.json({
-    addons: configuredAddons(),
+    addons: configuredAddons().map((a) => ({ ...a, available: addonAllowedOnPlan(planKey, a.key) })),
     // One-time packs (POST /api/billing/text-packs): `max` is per billing period. What is active now is in entitlements.packs.
     textPacks: addons()
       .filter((a) => a.interval === "one_time")

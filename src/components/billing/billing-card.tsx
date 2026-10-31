@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Card, Pill } from "../ui";
 import { BILLING_SUPPORT_EMAIL } from "@/lib/billing/support";
+import { planLabel, sortPlanKeys } from "@/lib/billing/entitlements";
 
 type Interval = "month" | "year";
 interface PlanState {
@@ -25,7 +26,6 @@ interface PlanState {
 
 const btn = "inline-flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs text-slate-200 hover:bg-white/5 disabled:opacity-40";
 const day = (s: string | null) => (s ? new Date(s).toLocaleDateString() : "");
-const TIERS = ["starter", "pro", "business"];
 
 /**
  * Billing on the Administration page (Owner/Admin): current plan, in-app plan switch (monthly and annual), cancel /
@@ -78,7 +78,7 @@ export function BillingCard() {
   if (!state) return <Card title="Billing"><p className="animate-pulse font-mono text-xs text-slate-500">loading…</p></Card>;
   const sub = state.subscription;
   const support = `mailto:${BILLING_SUPPORT_EMAIL}?subject=${encodeURIComponent("FlowOps billing")}`;
-  const keys = [...new Set(state.plans.map((p) => p.key))].sort((a, b) => (TIERS.indexOf(a) + 99) % 99 - (TIERS.indexOf(b) + 99) % 99);
+  const keys = sortPlanKeys(state.plans.map((p) => p.key));
   const hasAnnual = state.plans.some((p) => p.interval === "year");
   const isCurrent = (k: string) => sub?.plan === k && sub?.interval === interval;
   const disabled = busy !== null || state.demo || !sub || !!sub.cancelAt;
@@ -90,7 +90,7 @@ export function BillingCard() {
           <p>No subscription yet.</p>
         ) : (
           <div className="flex flex-wrap items-center gap-2">
-            <span className="font-medium capitalize text-white">{sub.plan ?? "Custom plan"}</span>
+            <span className="font-medium text-white">{sub.plan ? planLabel(sub.plan) : "Custom plan"}</span>
             <span className="text-slate-500">{sub.interval === "year" ? "yearly" : "monthly"}</span>
             <Pill status={sub.status === "active" || sub.status === "trialing" ? "active" : "pending"}>{sub.status}</Pill>
             {sub.trialEnd && <span className="text-xs text-slate-400">Free trial until {day(sub.trialEnd)}; nothing is charged before then.</span>}
@@ -121,8 +121,8 @@ export function BillingCard() {
             )}
             <div className="flex flex-wrap gap-2">
               {keys.filter((k) => state.plans.some((p) => p.key === k && p.interval === interval)).map((k) => (
-                <button key={k} className={`${btn} capitalize`} disabled={disabled || isCurrent(k)} onClick={() => post("/api/billing/plan", { plan: k, interval }, k)}>
-                  {busy === k ? "Changing…" : isCurrent(k) ? `${k} (current)` : k}
+                <button key={k} className={btn} disabled={disabled || isCurrent(k)} onClick={() => post("/api/billing/plan", { plan: k, interval }, k)}>
+                  {busy === k ? "Changing…" : isCurrent(k) ? `${planLabel(k)} (current)` : planLabel(k)}
                 </button>
               ))}
             </div>
