@@ -89,11 +89,11 @@ export const ROADMAP_SHIPPED: RoadmapItem[] = [
   { item: "Email appointment reminders before each booking", area: "Notifications", when: "Oct 30" },
   { item: "Dedicated toll-free texting number and SMS opt-in page", area: "Messaging", when: "Oct 30" },
   { item: "Support and billing help at support@ and billing@flowopsagent.ai", area: "Support", when: "Oct 30" },
+  { item: "Weekly automation counts on the Analytics page", area: "Analytics", when: "Oct 31" },
 ];
 
 export const ROADMAP_UPCOMING: RoadmapItem[] = [
   { item: "Text message confirmations and reminders (after carrier approval)", area: "Messaging" },
-  { item: "Real automation counts on the Analytics chart", area: "Analytics" },
   { item: "Agent-to-agent messaging over an event bus", area: "Agents" },
   { item: "Durable workflows for the Automation Center", area: "Automation" },
   { item: "FlowNet / FlowSec telemetry connectors (Firewalla, SNMP, syslog, EDR)", area: "Ops" },
