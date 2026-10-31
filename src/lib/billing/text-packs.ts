@@ -206,7 +206,7 @@ export async function purchaseTextPack({ stripe, db, orgId, customerId, subscrip
   if (subscription.status !== "active" && subscription.status !== "trialing")
     return { ok: false, status: 409, error: "Text packs can only be bought on an active subscription. Fix the payment in the billing portal first.", code: "no_subscription", portal: true };
 
-  // The card on file: the subscription's own, else the customer's default. No card → no purchase (a trial still has one, collected at signup).
+  // The card on file: the subscription's own, else the customer's default. No card → no purchase (a trial may have none: it starts without a card).
   const sub = await stripe.subscriptions.retrieve(subscription.id);
   const customer = await stripe.customers.retrieve(customerId);
   const pm = idOf(sub.default_payment_method) ?? (customer.deleted ? null : idOf(customer.invoice_settings?.default_payment_method as string | { id: string } | null | undefined));

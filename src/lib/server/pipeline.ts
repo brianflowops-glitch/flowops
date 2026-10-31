@@ -1,14 +1,16 @@
 import "server-only";
-import { and, desc, eq, gte, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, gte, ne, or, sql } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
 import { BookingEngine, freeSlots, localStamp } from "@/lib/booking/engine";
 import type { Booking, BookingRequest, CalendarAdapter, DayHours, EngineState, NotifierAdapter, PipelineAgent, PipelineResult, RunOptions } from "@/lib/booking/types";
 import type { WeekHours } from "@/lib/db/schema";
 import { googleCalendarAdapter } from "./integrations/google";
 import { notifierAdapter } from "./integrations/notify";
+import { bookingPaymentsEnabled } from "@/lib/payments/rules";
 
 type Org = typeof schema.organization.$inferSelect;
 type Tx = Parameters<Parameters<ReturnType<typeof getDb>["transaction"]>[0]>[0];
+export type PipelineTx = Tx;
 type Source = "dashboard" | "assistant" | "public";
 
 export function hoursFor(hours: WeekHours) {
@@ -48,7 +50,46 @@ function rowToBooking(r: typeof schema.booking.$inferSelect): Booking {
   };
 }
 
-async function loadWorkingSet(tx: Tx, org: Org, bookingId?: string) {
+/**
+ * Payments at booking: unexpired `pending` holds (a customer is in Checkout for that slot) block it like a confirmed
+ * booking. Only queried when BOOKING_PAYMENTS_ENABLED=true, so with the flag off nothing here runs.
+ */
+type DbOrTx = Tx | ReturnType<typeof getDb>;
+async function activeHolds(q: DbOrTx, orgId: string, where: { date?: string; fromDate?: string; excludeHoldId?: string }): Promise<Booking[]> {
+  if (!bookingPaymentsEnabled()) return [];
+  const h = schema.bookingHold;
+  const rows = await q
+    .select()
+    .from(h)
+    .where(
+      and(
+        eq(h.organizationId, orgId),
+        eq(h.status, "pending"),
+        gt(h.expiresAt, new Date()),
+        where.date ? eq(h.date, where.date) : undefined,
+        where.fromDate ? gte(h.date, where.fromDate) : undefined,
+        where.excludeHoldId ? ne(h.id, where.excludeHoldId) : undefined,
+      ),
+    );
+  return rows.map((r) => ({
+    id: r.id,
+    customer: "(payment pending)",
+    email: "",
+    category: "appointment",
+    service: "(held for payment)",
+    resource: r.resource,
+    date: r.date,
+    time: r.time,
+    durationMin: r.durationMin,
+    status: "confirmed",
+    calendarEventId: null,
+    createdAt: r.createdAt.toISOString(),
+    updatedAt: r.updatedAt.toISOString(),
+    history: [],
+  }));
+}
+
+async function loadWorkingSet(tx: Tx, org: Org, bookingId?: string, excludeHoldId?: string) {
   const yesterday = new Date(Date.now() - 36 * 3600_000).toISOString().slice(0, 10);
   const rows = await tx
     .select()
@@ -61,7 +102,8 @@ async function loadWorkingSet(tx: Tx, org: Org, bookingId?: string) {
           : and(eq(schema.booking.status, "confirmed"), gte(schema.booking.date, yesterday)),
       ),
     );
-  return rows.map(rowToBooking);
+  const holds = await activeHolds(tx, org.id, { fromDate: yesterday, excludeHoldId });
+  return [...rows.map(rowToBooking), ...holds];
 }
 
 export type PipelineCommand =
@@ -129,7 +171,17 @@ function deferredNotifier(real: NotifierAdapter, fx: SideEffects): NotifierAdapt
 export async function runPipeline(
   org: Org,
   cmd: PipelineCommand,
-  ctx: { actor: string; source: Source; failAgent?: PipelineAgent },
+  ctx: {
+    actor: string;
+    source: Source;
+    failAgent?: PipelineAgent;
+    /**
+     * Payments at booking: confirming a paid hold. Its own hold is left out of the conflict check; `before` runs under
+     * the org lock before anything else (throw to abort with nothing written); `after` runs in the same transaction
+     * once the booking row is written (so the hold is marked paid atomically with the booking).
+     */
+    hold?: { id: string; before?: (tx: Tx) => Promise<void>; after?: (tx: Tx, booking: Booking) => Promise<void> };
+  },
 ): Promise<PipelineResult> {
   const db = getDb();
   const realCalendar = googleCalendarAdapter(org);
@@ -142,7 +194,8 @@ export async function runPipeline(
 
   const result = await db.transaction(async (tx) => {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${"flowops:org:" + org.id}))`);
-    const bookings = await loadWorkingSet(tx, org, cmd.action === "create" ? undefined : cmd.bookingId);
+    if (ctx.hold?.before) await ctx.hold.before(tx);
+    const bookings = await loadWorkingSet(tx, org, cmd.action === "create" ? undefined : cmd.bookingId, ctx.hold?.id);
     const engine = new BookingEngine({ bookings, audit: [], notifications: [] } satisfies EngineState);
     const opts: RunOptions = {
       hoursFor: hoursFor(org.hours),
@@ -189,6 +242,7 @@ export async function runPipeline(
           .set(values)
           .where(and(eq(schema.booking.id, b.id), eq(schema.booking.organizationId, org.id)));
       }
+      if (ctx.hold?.after) await ctx.hold.after(tx, b);
     }
     if (snap.audit.length) {
       await tx.insert(schema.auditEntry).values(
@@ -324,14 +378,33 @@ async function runSideEffects(
   }
 }
 
-/** Free start times for a resource/date (org hours, conflicts, past). */
+/** Free start times for a resource/date (org hours, conflicts, past; and slots held for payment, when enabled). */
 export async function availability(org: Org, q: { resource: string; date: string; durationMin: number }) {
   const db = getDb();
   const rows = await db
     .select()
     .from(schema.booking)
     .where(and(eq(schema.booking.organizationId, org.id), eq(schema.booking.status, "confirmed"), eq(schema.booking.date, q.date)));
-  return freeSlots(rows.map(rowToBooking), q, new Date(), { hoursFor: hoursFor(org.hours), timeZone: org.timeZone });
+  const holds = await activeHolds(db, org.id, { date: q.date });
+  return freeSlots([...rows.map(rowToBooking), ...holds], q, new Date(), { hoursFor: hoursFor(org.hours), timeZone: org.timeZone });
+}
+
+/**
+ * Payments at booking: check a new booking against the same rules as `runPipeline` create (validation, hours,
+ * conflicts with bookings and other holds) under the org lock, WITHOUT saving a booking or sending anything; if it
+ * would succeed, `insertHold` runs in the same transaction so no one else can take the slot in between.
+ * Returns the dry-run result (ok, or invalid/conflict with a suggestion), with the booking it WOULD create.
+ */
+export async function holdSlot(org: Org, req: BookingRequest, insertHold: (tx: Tx) => Promise<void>): Promise<PipelineResult> {
+  return getDb().transaction(async (tx) => {
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${"flowops:org:" + org.id}))`);
+    const bookings = await loadWorkingSet(tx, org);
+    const engine = new BookingEngine({ bookings, audit: [], notifications: [] } satisfies EngineState);
+    // No calendar/notifier: the engine only simulates those steps in memory. Nothing from this run is persisted.
+    const result = await engine.create(req, { hoursFor: hoursFor(org.hours), timeZone: org.timeZone, actor: "payment-hold" });
+    if (result.ok) await insertHold(tx);
+    return result;
+  });
 }
 
 export async function loadState(orgId: string, limit = 200): Promise<EngineState & { sources: Record<string, Source> }> {

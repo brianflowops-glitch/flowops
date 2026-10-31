@@ -18,7 +18,7 @@
  */
 import type Stripe from "stripe";
 import { addonByKey, addonPrice, isTextPackKey, plans, recurringAddons, type BillingInterval } from "./config";
-import { addonEffect, addonMaxQuantity, classifyItems, entitlementsFromItems, planLimits, type Entitlements } from "./entitlements";
+import { addonAllowedOnPlan, planLabel, addonEffect, addonMaxQuantity, classifyItems, entitlementsFromItems, planLimits, type Entitlements } from "./entitlements";
 import { abandonInvoice, chargeOneOff, inspectProrationOutcome, refundAddonCharge, trialProrationAmount, type AddonChargeLedger, type AddonChargeRecord, type ChargeStripe, type RefundStripe } from "./addon-charge";
 
 type Env = Record<string, string | undefined>;
@@ -255,6 +255,8 @@ const hasUnsupportedPhaseSettings = (p: Stripe.SubscriptionSchedule.Phase) => Bo
  *                             identical to the current phase); otherwise nothing to do.
  * Other add-ons' pending changes, and a portal-scheduled plan downgrade, are kept.
  */
+const BLOCKED_ADDON_TEXT: Record<string, string> = { branding: "Branding removal is", seat: "Extra seats are", location: "Extra locations are" };
+
 export async function setAddonQuantity(input: ChangeAddonInput): Promise<AddonChangeResult> {
   return setAddonQuantityUnderPolicy(TRIAL_ADDON_POLICY, input);
 }
@@ -286,6 +288,10 @@ export async function setAddonQuantityUnderPolicy(policy: TrialAddonPolicy, { st
   if (interval !== "month" && interval !== "year") return { ok: false, status: 409, error: "This subscription's billing interval doesn't support add-ons" };
   const cfg = addonPrice(known.key, interval as BillingInterval, env);
   if (!cfg) return { ok: false, status: 409, error: `The "${known.key}" add-on has no ${interval === "year" ? "annual" : "monthly"} price configured, so it can't be added to this ${interval === "year" ? "annual" : "monthly"} subscription` };
+  // Plans without this add-on (Solo: no branding removal / extra seats / extra locations). Setting 0 (removing one
+  // that was added in Stripe directly, or before switching to Solo) is always allowed.
+  if (quantity > 0 && !addonAllowedOnPlan(classified.plan.planKey, cfg.key))
+    return { ok: false, status: 409, error: `${BLOCKED_ADDON_TEXT[cfg.key] ?? `The "${cfg.key}" add-on is`} not available on the ${planLabel(classified.plan.planKey)} plan. Upgrade to Starter for ${cfg.key === "branding" ? "branding removal" : "more seats and locations"}.` };
   if (cfg.key === "branding" && planLimits(classified.plan.planKey, env).brandingRemoved) return { ok: false, status: 409, error: "Branding removal is already included in this plan" };
 
   const c = cfg; // narrowed (used by applyChange below)

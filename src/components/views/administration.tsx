@@ -7,6 +7,7 @@ import type { DayHours, WeekHoursClient } from "@/lib/booking/types";
 import { Card, LiveBadge, PageHeader, Pill, Table, Td } from "../ui";
 import { AdminPlans } from "./static-pages";
 import { BillingCard } from "../billing/billing-card";
+import { PaymentsCard } from "../payments/payments-card";
 
 const inputCls =
   "w-full rounded-lg border border-white/10 bg-black/30 px-3 py-1.5 text-sm text-white placeholder:text-slate-600 focus:border-cyan-400/50 focus:outline-none disabled:opacity-50";
@@ -61,6 +62,7 @@ export function Administration() {
         <OrgCard owner={owner} onSaved={refresh} />
         <HoursCard owner={owner} onSaved={refresh} />
         <ServicesCard owner={owner} services={me.services} onSaved={refresh} />
+        {me.role !== "staff" && <PaymentsCard owner={owner} services={me.services} onSaved={refresh} />}
         <TeamCard />
         <IntegrationsCard owner={owner} onSaved={refresh} />
       </div>

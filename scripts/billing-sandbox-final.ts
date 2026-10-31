@@ -129,7 +129,7 @@ async function world(label: string, pm = "pm_card_visa") {
     customersToDelete.push(plain.id);
     const mk = (priceId: string, trialDays: number) => stripe.checkout.sessions.create(checkoutSessionParams({ orgId: `org_fin_checkout_${n}`, customer: plain.id, priceId, origin: "https://example.test", trialDays }));
     const sTrial = await mk(P.starter_month, 14);
-    check("trial Checkout Session created by Stripe: subscription mode, card always collected", sTrial.mode === "subscription" && sTrial.payment_method_collection === "always" && !!sTrial.url && !sTrial.livemode, { m: sTrial.mode, p: sTrial.payment_method_collection });
+    check("trial Checkout Session created by Stripe: subscription mode, no card required (if_required)", sTrial.mode === "subscription" && sTrial.payment_method_collection === "if_required" && !!sTrial.url && !sTrial.livemode, { m: sTrial.mode, p: sTrial.payment_method_collection });
     const sd = (sTrial as unknown as { subscription_data?: { trial_period_days?: number; trial_settings?: { end_behavior?: { missing_payment_method?: string } } } }).subscription_data;
     console.log("  checkout subscription_data echoed by Stripe:", JSON.stringify(sd ?? null));
     check("trial Checkout Session: Stripe reports trial_period_days = 14 (when echoed) and the cancel-if-no-card setting", sd === undefined || (sd.trial_period_days === 14 && sd.trial_settings?.end_behavior?.missing_payment_method === "cancel"), sd);

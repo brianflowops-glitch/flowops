@@ -19,6 +19,7 @@
 import type Stripe from "stripe";
 import { addonByPriceId, addonPrice, planByKey, planByPriceId, type BillingInterval } from "./config";
 import { inspectProrationOutcome } from "./addon-charge";
+import { addonAllowedOnPlan, planLabel, PLAN_TIERS } from "./entitlements";
 import { phaseItems, phaseParam, retrieveSubscriptionComplete, sameItems, schedulePhases, type AddonStripe, type PhaseItem } from "./addons";
 
 type Env = Record<string, string | undefined>;
@@ -35,8 +36,8 @@ type Env = Record<string, string | undefined>;
 export type UpgradePolicy = "at_renewal" | "prorate_now";
 export const UPGRADE_POLICY: UpgradePolicy = "prorate_now";
 
-/** Tier order of the configured plans (lowest first). Unknown keys fall back to comparing monthly-equivalent prices. */
-export const PLAN_TIERS = ["starter", "pro", "business"] as const;
+/** Tier order of the configured plans (lowest first, entitlements.ts). Unknown keys fall back to comparing monthly-equivalent prices. */
+export { PLAN_TIERS };
 
 export const PLAN_CHANGE_STATUSES = ["active", "trialing"] as const;
 
@@ -117,6 +118,18 @@ export function classifyPlanChange(from: { key: string; interval: BillingInterva
   if (from.interval === "year" && to.interval === "month") return "downgrade";
   if (tier > 0) return "upgrade";
   return to.interval === "year" ? "upgrade" : "downgrade";
+}
+
+const addonNoun = (k: string) => (k === "branding" ? "branding removal" : k === "seat" ? "extra seats" : k === "location" ? "extra locations" : `the "${k}" add-on`);
+
+/** Add-on keys (quantity > 0) in `items` that the plan can't have, e.g. branding on Solo. */
+export function blockedAddonsFor(planKey: string, items: readonly PhaseItem[], env: Env = process.env): string[] {
+  const out = new Set<string>();
+  for (const it of items) {
+    const a = addonByPriceId(it.price, env);
+    if (a && it.quantity > 0 && !addonAllowedOnPlan(planKey, a.key)) out.add(a.key);
+  }
+  return [...out].sort();
 }
 
 /** The next phase as a schedule phase param, on `interval` (its own billing period). */
@@ -212,6 +225,12 @@ export async function changePlanUnderPolicy(policy: UpgradePolicy, { stripe, sub
   if (!nextMapped.ok) return { ok: false, status: 409, code: "unsupported", support: true, error: nextMapped.error };
 
   const applyNow = kind === "upgrade" && (trialing || policy === "prorate_now");
+
+  // Plans that can't carry some add-ons (Solo: no branding removal, extra seats or locations): the items the new plan
+  // will actually have (now, or from the renewal) must not include one. Nothing is written.
+  const blocked = blockedAddonsFor(target.key, applyNow ? nowMapped.items : nextMapped.items, env);
+  if (blocked.length)
+    return { ok: false, status: 409, error: `The ${planLabel(target.key)} plan doesn't include ${blocked.map(addonNoun).join(" or ")}. Remove ${blocked.length > 1 ? "them" : "it"} first (set the quantity to 0), then switch plan.` };
 
   // ── At renewal (downgrade, annual → monthly, or an upgrade under "at_renewal"): the next phase holds the new plan. ──
   if (!applyNow) {

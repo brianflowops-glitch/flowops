@@ -4,9 +4,10 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { authClient } from "@/lib/auth-client";
 import type { LockCopy } from "@/lib/billing/lock-copy";
+import { planLabel } from "@/lib/billing/entitlements";
 
 /** Full-screen billing lock. Shown by the dashboard layout instead of the app when billing is locked. */
-export function BillingLocked({ copy, orgName, planKeys, annualPlanKeys = [] }: { copy: LockCopy; orgName: string; planKeys: string[]; annualPlanKeys?: string[] }) {
+export function BillingLocked({ copy, orgName, planKeys, annualPlanKeys = [], planNotes = {} }: { copy: LockCopy; orgName: string; planKeys: string[]; annualPlanKeys?: string[]; planNotes?: Record<string, string> }) {
   const router = useRouter();
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -52,8 +53,9 @@ export function BillingLocked({ copy, orgName, planKeys, annualPlanKeys = [] }: 
           {copy.action === "choose_plan" &&
             (planKeys.length ? (
               planKeys.filter((k) => billingInterval === "month" || annualPlanKeys.includes(k)).map((k) => (
-                <button key={k} disabled={busy !== null} onClick={() => go("/api/billing/checkout", { plan: k, interval: billingInterval }, k)} className="rounded-md bg-cyan-500 px-4 py-2 text-sm font-medium capitalize text-slate-950 hover:bg-cyan-400 disabled:opacity-50">
-                  {busy === k ? "Opening checkout…" : `Choose ${k}`}
+                <button key={k} disabled={busy !== null} onClick={() => go("/api/billing/checkout", { plan: k, interval: billingInterval }, k)} className="rounded-md bg-cyan-500 px-4 py-2 text-sm font-medium text-slate-950 hover:bg-cyan-400 disabled:opacity-50">
+                  {busy === k ? "Opening checkout…" : `Choose ${planLabel(k)}`}
+                  {planNotes[k] && busy !== k && <span className="block text-[11px] font-normal text-slate-800">{planNotes[k]}</span>}
                 </button>
               ))
             ) : (
