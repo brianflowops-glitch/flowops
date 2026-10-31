@@ -19,15 +19,57 @@ export interface PlanLimits {
   brandingRemoved: boolean;
 }
 
-/** Brian's final pricing (2026-10-27). Override per plan with PLAN_LIMITS_<PLAN>. */
+/**
+ * Brian's final pricing (2026-10-27; Solo added 2026-10-31). Override per plan with PLAN_LIMITS_<PLAN>.
+ * Solo ($19/mo, $190/yr): one person, one location, FlowOps branding always shown. Texts: 200/month, i.e. Starter's
+ * per-seat share (500 / 3 seats ≈ 167) rounded up; more via one-time text packs.
+ */
 export const DEFAULT_PLAN_LIMITS: Readonly<Record<string, PlanLimits>> = {
+  solo: { seats: 1, locations: 1, monthlyTexts: 200, brandingRemoved: false },
   starter: { seats: 3, locations: 1, monthlyTexts: 500, brandingRemoved: false },
   pro: { seats: 10, locations: 1, monthlyTexts: 2000, brandingRemoved: true },
   business: { seats: 25, locations: 3, monthlyTexts: 5000, brandingRemoved: true },
 };
 
-/** What a plan item with no limits configured (new plan, unknown price) falls back to: the smallest known tier. */
+/** Plan tiers, lowest first (pricing order, plan pickers, upgrade vs downgrade). Unknown keys sort after these. */
+export const PLAN_TIERS = ["solo", "starter", "pro", "business"] as const;
+
+/** Sort plan keys by tier (unknown keys last, alphabetically). */
+export function sortPlanKeys(keys: Iterable<string>): string[] {
+  const rank = (k: string) => (PLAN_TIERS as readonly string[]).indexOf(k) + 1 || 99;
+  return [...new Set(keys)].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+}
+
+/**
+ * What a plan item with no limits configured (new plan, unknown price) falls back to. Kept at Starter (as before
+ * Solo existed) so adding Solo changes nothing for existing subscriptions on an unrecognised price.
+ */
 export const FALLBACK_PLAN_LIMITS: PlanLimits = DEFAULT_PLAN_LIMITS.starter;
+
+/**
+ * Recurring add-ons a plan can't have. Solo is one seat and one location with FlowOps branding always shown, so it
+ * gets no branding removal and no extra seats or locations (upgrade to Starter instead). Text packs stay available.
+ * Enforced when buying (addons.ts), when switching plan (plan-change.ts) and in entitlements (an item added
+ * directly in Stripe grants nothing).
+ */
+export const PLAN_BLOCKED_ADDONS: Readonly<Record<string, readonly string[]>> = {
+  solo: ["branding", "seat", "location"],
+};
+
+export function addonAllowedOnPlan(planKey: string | null | undefined, addonKey: string): boolean {
+  if (!planKey) return true;
+  return !(PLAN_BLOCKED_ADDONS[planKey.toLowerCase()] ?? []).includes(addonKey.toLowerCase());
+}
+
+const PLAN_LABELS: Record<string, string> = { solo: "Solo" };
+/** Display name of a plan key ("solo" → "Solo"). */
+export const planLabel = (key: string) => PLAN_LABELS[key] ?? key.charAt(0).toUpperCase() + key.slice(1);
+
+/** One-line summary of a plan's limits for plan pickers, e.g. "1 seat · 1 location · 200 texts/mo · FlowOps branding". */
+export function planSummary(l: PlanLimits): string {
+  const n = (v: number, one: string, many: string) => `${v.toLocaleString("en-US")} ${v === 1 ? one : many}`;
+  return [n(l.seats, "seat", "seats"), n(l.locations, "location", "locations"), `${l.monthlyTexts.toLocaleString("en-US")} texts/mo`, l.brandingRemoved ? "your branding" : "FlowOps branding"].join(" · ");
+}
 
 /** Nothing: used for orgs with no live subscription (they are locked anyway when billing is on). */
 export const NO_LIMITS: PlanLimits = { seats: 0, locations: 0, monthlyTexts: 0, brandingRemoved: false };
@@ -101,7 +143,7 @@ export interface ResolvedPlanLimits extends PlanLimits {
   source: "configured" | "fallback";
 }
 
-/** Limits for a plan key: built-in default (starter, pro) overlaid with PLAN_LIMITS_<PLAN>. Unknown plans → fallback tier. */
+/** Limits for a plan key: built-in default (solo, starter, pro, business) overlaid with PLAN_LIMITS_<PLAN>. Unknown plans → fallback tier. */
 export function planLimits(planKey: string | null | undefined, env: Env = process.env): ResolvedPlanLimits {
   const key = planKey?.toLowerCase() ?? "";
   const override = key ? env[`PLAN_LIMITS_${key.toUpperCase()}`] : undefined;
@@ -210,6 +252,7 @@ function applyAddons(limits: PlanLimits, planKey: string | null, source: Entitle
   for (const [key, raw] of merged) {
     const fx = addonEffect(key);
     if (!fx) continue;
+    if (!addonAllowedOnPlan(planKey, key)) continue; // e.g. branding on Solo (only possible if added in Stripe directly)
     const q = Math.min(raw, addonMaxQuantity(key, env));
     total.seats += (fx.seats ?? 0) * q;
     total.locations += (fx.locations ?? 0) * q;
@@ -288,4 +331,16 @@ export function entitlementsFromItems(items: readonly MirroredItem[], env: Env =
   // A plan item whose price is not configured as a plan still has a (fallback) tier: it is a live subscription.
   if (c.plan.planKey === null) return applyAddons(FALLBACK_PLAN_LIMITS, null, "fallback", c.addons, env, packQuantities);
   return computeEntitlements(c.plan.planKey, c.addons, env, packQuantities);
+}
+
+/**
+ * What a plan picker offers (lock screen "choose a plan"): configured plans in tier order, which of them have a
+ * yearly price, and a one-line limits summary each. A plan whose monthly STRIPE_PRICE_<PLAN> is unset is not offered
+ * at all, e.g. Solo before STRIPE_PRICE_SOLO exists; one without STRIPE_PRICE_<PLAN>_ANNUAL is monthly only.
+ */
+export function planPicker(configured: readonly { key: string; interval: string }[], env: Env = process.env) {
+  const planKeys = sortPlanKeys(configured.filter((p) => p.interval === "month").map((p) => p.key));
+  const annualPlanKeys = planKeys.filter((k) => configured.some((p) => p.key === k && p.interval === "year"));
+  const planNotes = Object.fromEntries(planKeys.map((k) => [k, planSummary(planLimits(k, env))]));
+  return { planKeys, annualPlanKeys, planNotes };
 }

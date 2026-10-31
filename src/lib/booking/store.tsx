@@ -15,6 +15,11 @@ export interface ServiceRow {
   description: string | null;
   active: boolean;
   sortOrder: number;
+  /** Payments at booking (0014). */
+  priceCents?: number | null;
+  paymentMode?: "none" | "fixed" | "percent" | "full";
+  depositCents?: number | null;
+  depositPercent?: number | null;
 }
 
 export interface Me {

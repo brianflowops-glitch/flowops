@@ -165,6 +165,9 @@ export const teamInvite = pgTable(
 
 // ───────────────────────────── Booking data ─────────────────────────────
 
+export const PAYMENT_MODES = ["none", "fixed", "percent", "full"] as const;
+export type PaymentMode = (typeof PAYMENT_MODES)[number];
+
 export const service = pgTable(
   "service",
   {
@@ -180,6 +183,12 @@ export const service = pgTable(
     active: boolean("active").notNull().default(true),
     sortOrder: integer("sort_order").notNull().default(0),
     createdAt: timestamp("created_at").notNull().defaultNow(),
+    /** Payments at booking (0014, behind BOOKING_PAYMENTS_ENABLED). Service price in cents (USD); null = not set. */
+    priceCents: integer("price_cents"),
+    /** What the customer pays when booking: none (default, booking flow unchanged), fixed deposit, percent deposit, full price. */
+    paymentMode: text("payment_mode", { enum: PAYMENT_MODES }).notNull().default("none"),
+    depositCents: integer("deposit_cents"),
+    depositPercent: integer("deposit_percent"),
   },
   (t) => [index("service_org_idx").on(t.organizationId)],
 );
@@ -539,4 +548,61 @@ export const addonCharge = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [uniqueIndex("addon_charge_stripe_invoice_unique").on(t.stripeInvoiceId), index("addon_charge_org_status_idx").on(t.organizationId, t.status)],
+);
+
+/**
+ * Payments at booking (0014, behind BOOKING_PAYMENTS_ENABLED). One Stripe Connect account per business: customers'
+ * deposits/payments are direct charges on it, so the money goes to the business (FlowOps takes no fee).
+ * `chargesEnabled` is a cache of the account's card_payments capability, refreshed from Stripe by the settings page.
+ */
+export const stripeConnectAccount = pgTable("stripe_connect_account", {
+  organizationId: text("organization_id")
+    .primaryKey()
+    .references(() => organization.id, { onDelete: "cascade" }),
+  stripeAccountId: text("stripe_account_id").notNull().unique(),
+  chargesEnabled: boolean("charges_enabled").notNull().default(false),
+  detailsSubmitted: boolean("details_submitted").notNull().default(false),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const BOOKING_HOLD_STATUSES = ["pending", "paid", "expired", "conflict"] as const;
+export type BookingHoldStatus = (typeof BOOKING_HOLD_STATUSES)[number];
+
+/**
+ * A slot held while the customer pays (Checkout on the business's connected account). `pending` holds that haven't
+ * expired block the slot like a confirmed booking. The Connect webhook turns a paid hold into the booking (`paid`,
+ * `bookingId`), or `conflict` + refund if the slot could no longer be booked. Expired/cancelled checkouts → `expired`.
+ * `request` is the booking request to run through the pipeline once paid (customer name/email/phone/notes).
+ */
+export const bookingHold = pgTable(
+  "booking_hold",
+  {
+    id: text("id").primaryKey(),
+    organizationId: text("organization_id")
+      .notNull()
+      .references(() => organization.id, { onDelete: "cascade" }),
+    serviceId: text("service_id"),
+    request: jsonb("request").$type<Record<string, unknown>>().notNull(),
+    resource: text("resource").notNull(),
+    date: text("date").notNull(),
+    time: text("time").notNull(),
+    durationMin: integer("duration_min").notNull(),
+    amountCents: integer("amount_cents").notNull(),
+    currency: text("currency").notNull().default("usd"),
+    paymentMode: text("payment_mode").notNull(),
+    stripeAccountId: text("stripe_account_id").notNull(),
+    checkoutSessionId: text("checkout_session_id"),
+    paymentIntentId: text("payment_intent_id"),
+    status: text("status", { enum: BOOKING_HOLD_STATUSES }).notNull().default("pending"),
+    bookingId: text("booking_id"),
+    note: text("note"),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("booking_hold_org_date_idx").on(t.organizationId, t.date, t.status),
+    uniqueIndex("booking_hold_checkout_session_unique").on(t.checkoutSessionId),
+  ],
 );

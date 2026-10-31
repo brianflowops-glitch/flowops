@@ -16,6 +16,9 @@ export const HANDLED_EVENTS = [
   "customer.subscription.deleted",
   "invoice.paid",
   "invoice.payment_failed",
+  // No-card trial: 3 days before the end. Recorded (dedupe) here; the route then emails a reminder if there's no card.
+  // Must also be added to the webhook endpoint's events in the Stripe Dashboard.
+  "customer.subscription.trial_will_end",
   // Text-pack clawback (0012). Must also be added to the LIVE webhook endpoint at go-live (docs/BILLING.md §11).
   ...CLAWBACK_EVENTS,
 ] as const;

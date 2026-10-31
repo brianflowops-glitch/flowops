@@ -387,7 +387,7 @@ const check = (label: string, ok: boolean, detail?: unknown) => {
 
   // checkout session parameters
   const cp = checkoutSessionParams({ orgId: "org_1", customer: "cus_1", priceId: "p_p_y", origin: "https://x.test", trialDays: 14 });
-  check("checkout: trial → subscription_data.trial_period_days=14 and payment_method_collection=always, cancel if no card at trial end", cp.subscription_data?.trial_period_days === 14 && cp.payment_method_collection === "always" && cp.subscription_data?.trial_settings?.end_behavior?.missing_payment_method === "cancel" && cp.line_items?.[0].price === "p_p_y" && cp.subscription_data?.metadata?.organizationId === "org_1", cp);
+  check("checkout: trial → subscription_data.trial_period_days=14 and payment_method_collection=if_required (no card), cancel if no card at trial end", cp.subscription_data?.trial_period_days === 14 && cp.payment_method_collection === "if_required" && cp.subscription_data?.trial_settings?.end_behavior?.missing_payment_method === "cancel" && cp.line_items?.[0].price === "p_p_y" && cp.subscription_data?.metadata?.organizationId === "org_1", cp);
   const cn = checkoutSessionParams({ orgId: "org_1", customer: "cus_1", priceId: "p_p_m", origin: "https://x.test", trialDays: 0 });
   check("checkout: no trial → no trial fields, card still collected", cn.subscription_data?.trial_period_days === undefined && cn.subscription_data?.trial_settings === undefined && cn.payment_method_collection === "always");
 

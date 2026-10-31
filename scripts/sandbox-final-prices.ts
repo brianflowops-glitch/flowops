@@ -16,7 +16,7 @@ export const OLD_RECURRING_TEXTS = "price_1UVB9i5iQFiJ57yplkbyM4ky";
 
 const FINAL = { flowops_final: "true", placeholder: "false" };
 // cents. Annual = 10 × monthly (2 months free).
-const PLAN = { starter: 4900, pro: 9900, business: 19900 } as const;
+const PLAN = { solo: 1900, starter: 4900, pro: 9900, business: 19900 } as const;
 const ADDON = { seat: 1000, location: 2900, branding: 1500 } as const;
 
 export type FinalPrices = Record<string, string>;
@@ -63,6 +63,9 @@ export async function ensureFinalPrices(stripe: Stripe, log: (m: string) => void
   // Plans
   const starterProd = await adopt(EXISTING.starter_month, "FlowOps Starter", "starter_month");
   const proProd = await adopt(EXISTING.pro_month, "FlowOps Pro", "pro_month");
+  // Solo (2026-10-31): $19/mo, $190/yr → STRIPE_PRICE_SOLO / STRIPE_PRICE_SOLO_ANNUAL.
+  const soloProd = await make("flowops_solo_monthly", PLAN.solo, "month", null, "FlowOps Solo", { flowops_plan: "solo" });
+  await make("flowops_solo_annual", PLAN.solo * 10, "year", soloProd, "FlowOps Solo (annual)", { flowops_plan: "solo" });
   const bizProd = await make("flowops_business_monthly", PLAN.business, "month", null, "FlowOps Business", { flowops_plan: "business" });
   out.business_month = out.flowops_business_monthly;
   await make("flowops_starter_annual", PLAN.starter * 10, "year", starterProd, "FlowOps Starter (annual)", { flowops_plan: "starter" });

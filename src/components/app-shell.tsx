@@ -24,6 +24,7 @@ import { NAV } from "@/lib/data/platform";
 import { BookingProvider } from "@/lib/booking/store";
 import { authClient } from "@/lib/auth-client";
 import { AssistantPanel } from "./assistant-panel";
+import { TrialBanner } from "./billing/trial-banner";
 import { clsx } from "./clsx";
 
 const ICONS = { LayoutDashboard, Grid3x3, CalendarCheck, Workflow, Network, ShieldCheck, FlaskConical, BarChart3, Plug, Settings };
@@ -204,6 +205,7 @@ export function AppShell({ children, session }: { children: React.ReactNode; ses
             </div>
           </header>
           <VerifyBanner session={session} />
+          {session.role !== "staff" && <TrialBanner />}
           <main className="relative mx-auto w-full max-w-[1400px] flex-1 px-4 py-6 lg:px-8">{children}</main>
         </div>
 

@@ -10,7 +10,7 @@ const body = z.object({ plan: z.string().min(1).max(64), interval: z.enum(["mont
 
 /**
  * Owner or Admin starts Stripe Checkout for a configured plan, monthly (default) or yearly. The first subscription
- * of an org gets the free trial (TRIAL_DAYS, default 14; card collected up front); an org that ever had a
+ * of an org gets the free trial (TRIAL_DAYS, default 14; no card required, see checkout-params.ts); an org that ever had a
  * subscription never gets another. 404 unless BILLING_ENABLED=true.
  */
 export async function POST(req: Request) {

@@ -63,6 +63,11 @@ const serviceFields = {
   description: z.string().trim().max(500).optional().nullable(),
   active: z.boolean(),
   sortOrder: z.coerce.number().int(),
+  // Payments at booking (0014; only used with BOOKING_PAYMENTS_ENABLED). Cross-field rules: servicePaymentError().
+  priceCents: z.number().int().min(0).max(1_000_000).nullable(),
+  paymentMode: z.enum(["none", "fixed", "percent", "full"]),
+  depositCents: z.number().int().min(0).max(1_000_000).nullable(),
+  depositPercent: z.number().int().min(1).max(100).nullable(),
 };
 
 export const serviceInput = z.object({
@@ -70,6 +75,10 @@ export const serviceInput = z.object({
   category: serviceFields.category.default("appointment"),
   active: serviceFields.active.default(true),
   sortOrder: serviceFields.sortOrder.default(0),
+  priceCents: serviceFields.priceCents.optional(),
+  paymentMode: serviceFields.paymentMode.default("none"),
+  depositCents: serviceFields.depositCents.optional(),
+  depositPercent: serviceFields.depositPercent.optional(),
 });
 
 export const serviceUpdate = z.object(serviceFields).partial();

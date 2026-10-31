@@ -9,10 +9,11 @@ import { BookingPhoneField, SmsConsentCheckbox, bookingFieldClass } from "@/comp
 
 type Info = {
   org: { slug: string; name: string; timeZone: string; hours: Record<string, { open: string; close: string } | null> };
-  services: { id: string; name: string; durationMin: number; description: string | null }[];
+  services: { id: string; name: string; durationMin: number; description: string | null; payment?: { amountCents: number; kind: "deposit" | "full"; label: string } }[];
   today: { date: string; time: string };
 };
-type Done = { id: string; service: string; date: string; time: string; durationMin: number; notifications: string };
+type Done = { id: string; service: string; date: string; time: string; durationMin: number; notifications: string; paid?: string };
+type HoldView = { id: string; status: "pending" | "paid" | "expired" | "conflict"; amount: string; booking: Omit<Done, "notifications"> | null };
 
 const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
@@ -40,6 +41,55 @@ export function PublicBooking() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<Done | null>(null);
+  const [paying, setPaying] = useState<string | null>(null);
+
+  // Back from Stripe Checkout (payments at booking): ?payment=success|cancelled&hold=…
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search);
+    const holdId = q.get("hold");
+    const outcome = q.get("payment");
+    if (!holdId || !outcome) return;
+    window.history.replaceState(null, "", window.location.pathname);
+    const base = `/api/public/${encodeURIComponent(orgSlug)}/holds/${encodeURIComponent(holdId)}`;
+    let live = true;
+    if (outcome === "cancelled") {
+      fetch(`${base}/release`, { method: "POST" })
+        .catch(() => null)
+        .then(() => live && setError("Payment cancelled — nothing was charged and the time was released. Pick a time to try again."));
+      return () => {
+        live = false;
+      };
+    }
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- show progress while the payment is confirmed
+    setPaying("Confirming your payment…");
+    let tries = 0;
+    const tick = async () => {
+      const r = await fetch(base, { cache: "no-store" }).catch(() => null);
+      const h: HoldView | undefined = r?.ok ? (await r.json()).hold : undefined;
+      if (!live) return;
+      if (h?.status === "paid" && h.booking) {
+        setPaying(null);
+        return setDone({ ...h.booking, notifications: "sent", paid: h.amount });
+      }
+      if (h?.status === "conflict") {
+        setPaying(null);
+        return setError(`Sorry — that time was taken before your payment finished. Your ${h.amount} payment is being refunded. Please pick another time.`);
+      }
+      if (h?.status === "expired") {
+        setPaying(null);
+        return setError("The payment window expired and nothing was charged. Please pick a time again.");
+      }
+      if (++tries >= 30) {
+        setPaying(null);
+        return setError("Your payment is still being confirmed. You'll get a confirmation email once it's done — no need to book again.");
+      }
+      setTimeout(tick, 2000);
+    };
+    tick();
+    return () => {
+      live = false;
+    };
+  }, [orgSlug]);
 
   useEffect(() => {
     fetch(`/api/public/${encodeURIComponent(orgSlug)}`)
@@ -111,6 +161,11 @@ export function PublicBooking() {
     });
     const d = await res.json().catch(() => ({}));
     setBusy(false);
+    if (d.ok && d.outcome === "payment_required" && d.checkoutUrl) {
+      setBusy(true);
+      window.location.assign(d.checkoutUrl);
+      return;
+    }
     if (d.ok && d.booking) setDone({ ...d.booking, notifications: d.notifications });
     else {
       setError(d.error ?? "Booking failed — please try again.");
@@ -135,6 +190,13 @@ export function PublicBooking() {
       </Shell>
     );
 
+  if (paying)
+    return (
+      <Shell title={info.org.name}>
+        <p className="animate-pulse text-center text-sm text-slate-300">{paying}</p>
+      </Shell>
+    );
+
   if (done)
     return (
       <Shell title={info.org.name}>
@@ -145,6 +207,7 @@ export function PublicBooking() {
             {done.service} · {fmtDay(done.date)} at {fmtTime(done.time)} ({done.durationMin} min)
           </p>
           <p className="mt-1 font-mono text-xs text-slate-500">Reference {done.id}</p>
+          {done.paid && <p className="mt-1 text-xs text-slate-400">Paid {done.paid} · your receipt comes from Stripe.</p>}
           <p className="mt-3 text-xs text-slate-500">
             {done.notifications === "simulated"
               ? "Confirmation email is simulated in this beta — no email was sent. Keep your reference number."
@@ -178,6 +241,7 @@ export function PublicBooking() {
                 >
                   <span className="font-medium">{s.name}</span>
                   <span className="block text-xs text-slate-500">{s.durationMin} min{s.description ? ` · ${s.description}` : ""}</span>
+                  {s.payment && <span className="mt-0.5 block text-xs text-cyan-300/80">{s.payment.label}</span>}
                 </button>
               ))}
             </div>
@@ -245,8 +309,14 @@ export function PublicBooking() {
             disabled={busy || !time}
             className="flex w-full items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-cyan-500 to-cyan-400 px-4 py-2.5 text-sm font-semibold text-[#04121a] hover:brightness-110 disabled:opacity-40"
           >
-            <CalendarCheck className="h-4 w-4" /> {busy ? "Booking…" : time ? `Book ${fmtDay(date)} at ${fmtTime(time)}` : "Pick a time"}
+            <CalendarCheck className="h-4 w-4" />{" "}
+            {busy ? "Booking…" : !time ? "Pick a time" : service?.payment ? `Continue to payment · ${fmtDay(date)} at ${fmtTime(time)}` : `Book ${fmtDay(date)} at ${fmtTime(time)}`}
           </button>
+          {service?.payment && time && (
+            <p className="text-center text-[11px] text-slate-500">
+              {service.payment.label}. Your time is held for 30 minutes while you pay securely with Stripe; the booking is confirmed once payment goes through.
+            </p>
+          )}
           <p className="text-center text-[11px] text-slate-600">
             Hours: {DAYS.map((d, i) => (info.org.hours[String(i)] ? `${d} ${info.org.hours[String(i)]!.open}–${info.org.hours[String(i)]!.close}` : null)).filter(Boolean).join(" · ")}
           </p>
