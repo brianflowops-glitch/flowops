@@ -63,6 +63,7 @@ const PILL: Record<string, string> = {
   up: "bg-emerald-400/10 text-emerald-300 border-emerald-400/30",
   enforced: "bg-emerald-400/10 text-emerald-300 border-emerald-400/30",
   pass: "bg-emerald-400/10 text-emerald-300 border-emerald-400/30",
+  live: "bg-emerald-400/10 text-emerald-300 border-emerald-400/30",
   verified: "bg-emerald-400/10 text-emerald-300 border-emerald-400/30",
   resolved: "bg-emerald-400/10 text-emerald-300 border-emerald-400/30",
   running: "bg-cyan-400/10 text-cyan-300 border-cyan-400/30",

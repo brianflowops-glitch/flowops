@@ -1,8 +1,10 @@
-export type IntegrationStatus = "planned" | "next" | "simulated" | "deploy-target";
+export type IntegrationStatus = "live" | "planned" | "next" | "simulated" | "deploy-target";
 
 export const INTEGRATIONS: { name: string; category: string; module: string; status: IntegrationStatus; note: string }[] = [
-  { name: "Google Calendar", category: "Calendar", module: "FlowConnect", status: "next", note: "Phase 2 (Oct 26–27): test calendar for Calendar Agent" },
-  { name: "Gmail", category: "Email", module: "FlowConnect", status: "planned", note: "Real Notification Agent delivery" },
+  { name: "Google Calendar", category: "Calendar", module: "FlowConnect", status: "live", note: "Bookings create, update and delete events on your connected calendar" },
+  { name: "Resend email", category: "Email", module: "FlowConnect", status: "live", note: "Booking confirmations and appointment reminders" },
+  { name: "Twilio SMS", category: "Messaging", module: "FlowConnect", status: "next", note: "Text confirmations and reminders after carrier approval" },
+  { name: "Gmail", category: "Email", module: "FlowConnect", status: "planned", note: "Send from your own Gmail address" },
   { name: "Google Drive", category: "Storage", module: "FlowConnect", status: "planned", note: "Docs, playbooks, exports" },
   { name: "Microsoft 365", category: "Workspace", module: "FlowConnect", status: "planned", note: "Outlook calendar, Teams" },
   { name: "Slack", category: "Chat", module: "FlowConnect", status: "planned", note: "Alerts and digests" },
@@ -13,6 +15,6 @@ export const INTEGRATIONS: { name: string; category: string; module: string; sta
   { name: "CrowdStrike / SentinelOne", category: "EDR", module: "FlowSec", status: "planned", note: "Endpoint threat feeds" },
   { name: "Datadog / Grafana / Zabbix", category: "Observability", module: "FlowPulse", status: "planned", note: "Metrics & alert ingestion" },
   { name: "Vercel AI Gateway", category: "LLM", module: "FlowAI", status: "deploy-target", note: "Powers the FlowAI Assistant (OIDC, no stored key)" },
-  { name: "Postgres", category: "Database", module: "FLOWOPS Core", status: "planned", note: "Replace in-browser booking store" },
+  { name: "Postgres", category: "Database", module: "FLOWOPS Core", status: "live", note: "Bookings and history saved per business" },
   { name: "Vercel", category: "Hosting", module: "Platform", status: "deploy-target", note: "Team Flowops (flowopsagent)" },
 ];

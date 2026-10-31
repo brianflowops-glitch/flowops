@@ -14,7 +14,7 @@ import { OnboardingChecklist } from "./onboarding-checklist";
 const MODULE_STATUS: Record<ModuleKey, { status: string; label: string }> = {
   core: { status: "active", label: "prototype" },
   biz: { status: "active", label: "booking live" },
-  connect: { status: "simulated", label: "simulated" },
+  connect: { status: "active", label: "calendar + email live" },
   // FlowAI runs through Vercel AI Gateway (OIDC on Vercel); downgraded below if GET /api/assistant says it isn't configured.
   ai: { status: "active", label: "live" },
   net: { status: "planned", label: "planned" },

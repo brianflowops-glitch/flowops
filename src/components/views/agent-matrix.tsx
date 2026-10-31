@@ -28,10 +28,10 @@ export function AgentMatrix() {
       <PageHeader
         kicker="FLOWOPS Agent Matrix"
         title="Agent Matrix"
-        description={`${AGENTS.length} proposed agents across the seven modules. ${counts.active} run today inside the Booking Engine, ${counts.simulated} are simulated, ${counts.planned} are planned.`}
+        description={`${AGENTS.length} proposed agents across the seven modules. ${counts.active} run today inside the Booking Engine${counts.simulated ? `, ${counts.simulated} are simulated` : ""}, ${counts.planned} are planned.`}
       >
         <Pill status="active">{counts.active} active</Pill>
-        <Pill status="simulated">{counts.simulated} simulated</Pill>
+        {counts.simulated > 0 && <Pill status="simulated">{counts.simulated} simulated</Pill>}
         <Pill status="planned">{counts.planned} planned</Pill>
       </PageHeader>
 

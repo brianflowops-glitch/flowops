@@ -1,7 +1,7 @@
 "use client";
 
 import { CheckCircle2, CircleDashed, Loader2, MinusCircle, XCircle, Cpu, BadgeCheck } from "lucide-react";
-import { AGENT_ROLE, PIPELINE, SIMULATED_AGENTS } from "@/lib/booking/engine";
+import { AGENT_ROLE, PIPELINE } from "@/lib/booking/engine";
 import type { AgentStep } from "@/lib/booking/types";
 import { clsx } from "./clsx";
 
@@ -22,8 +22,9 @@ function StepIcon({ status }: { status: AgentStep["status"] }) {
   return <CircleDashed className="h-4 w-4 text-slate-600" />;
 }
 
+/** Idle placeholder. Calendar and email are live; each real run reports per step whether it was simulated (e.g. no calendar connected). */
 export function idleSteps(): AgentStep[] {
-  return PIPELINE.map((agent) => ({ agent, status: "pending", message: AGENT_ROLE[agent], simulated: SIMULATED_AGENTS.includes(agent), durationMs: 0 }));
+  return PIPELINE.map((agent) => ({ agent, status: "pending", message: AGENT_ROLE[agent], simulated: false, durationMs: 0 }));
 }
 
 /** Visual FLOWOPS CORE → … → BOOKING VERIFIED chain. */
