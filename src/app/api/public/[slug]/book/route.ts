@@ -6,6 +6,10 @@ import { runPipeline } from "@/lib/server/pipeline";
 import { toE164 } from "@/lib/phone";
 import { badRequest, publicBook, readJson } from "@/lib/server/validation";
 import { clientIp, rateLimit, tooManyRequests } from "@/lib/server/rate-limit";
+import { bookingPaymentsEnabled } from "@/lib/payments/rules";
+import { paymentForService, startPaidBooking } from "@/lib/payments/booking-payments";
+import { getStripe } from "@/lib/billing/stripe";
+import type { BookingRequest } from "@/lib/booking/types";
 
 export async function POST(req: Request, { params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
@@ -67,26 +71,49 @@ export async function POST(req: Request, { params }: { params: Promise<{ slug: s
       );
   }
 
-  const result = await runPipeline(
-    org,
-    {
-      action: "create",
-      req: {
-        customer: p.name,
-        email: p.email,
-        ...(p.phone ? { phone: p.phone } : {}),
-        ...(p.smsConsent && p.phone ? { smsConsent: true } : {}),
-        category: svc.category,
-        service: svc.name,
-        resource: svc.resource,
-        date: p.date,
-        time: p.time,
-        durationMin: svc.durationMin,
-        ...(p.notes ? { notes: p.notes } : {}),
-      },
-    },
-    { actor: `public:${p.email.toLowerCase()}`, source: "public" },
-  );
+  const bookingReq: BookingRequest = {
+    customer: p.name,
+    email: p.email,
+    ...(p.phone ? { phone: p.phone } : {}),
+    ...(p.smsConsent && p.phone ? { smsConsent: true } : {}),
+    category: svc.category,
+    service: svc.name,
+    resource: svc.resource,
+    date: p.date,
+    time: p.time,
+    durationMin: svc.durationMin,
+    ...(p.notes ? { notes: p.notes } : {}),
+  };
+
+  // Payments at booking (ships dark: BOOKING_PAYMENTS_ENABLED). With the flag off, or a service set to "none", or no
+  // ready Stripe account, this block does nothing and the booking below runs exactly as before.
+  if (bookingPaymentsEnabled()) {
+    const due = await paymentForService(org.id, svc);
+    if (due) {
+      const started = await startPaidBooking(org, svc, bookingReq, due, { origin: new URL(req.url).origin, stripe: getStripe() });
+      if (started.kind === "error") return Response.json({ ok: false, outcome: "failed", error: started.error }, { status: started.status });
+      if (started.kind === "rejected") {
+        const r = started.result;
+        return Response.json({
+          ok: false,
+          outcome: r.outcome,
+          error: r.outcome === "conflict" ? "That time was just taken — please pick another slot." : r.error,
+          suggestion: r.suggestion,
+          booking: null,
+        });
+      }
+      return Response.json({
+        ok: true,
+        outcome: "payment_required",
+        checkoutUrl: started.checkoutUrl,
+        hold: { id: started.hold.id, expiresAt: started.hold.expiresAt.toISOString() },
+        payment: { amountCents: due.due.amountCents, currency: due.due.currency, kind: due.due.kind },
+        booking: null,
+      });
+    }
+  }
+
+  const result = await runPipeline(org, { action: "create", req: bookingReq }, { actor: `public:${p.email.toLowerCase()}`, source: "public" });
   // Don't leak other customers' booking details to the public.
   return Response.json({
     ok: result.ok,
