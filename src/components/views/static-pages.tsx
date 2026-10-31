@@ -1,6 +1,6 @@
-import { Cpu, GitBranch, Lock, Plug, Server, ShieldAlert, Workflow } from "lucide-react";
+import { CheckCircle2, Cpu, GitBranch, Lock, Plug, Server, ShieldAlert, Workflow } from "lucide-react";
 import { INTEGRATIONS } from "@/lib/data/integrations";
-import { MODULES, ROADMAP } from "@/lib/data/platform";
+import { MODULES, ROADMAP_SHIPPED, ROADMAP_UPCOMING } from "@/lib/data/platform";
 import {
   SAMPLE_ALERTS,
   SAMPLE_DEVICES,
@@ -228,14 +228,30 @@ export function IntegrationsPage() {
   );
 }
 
-/** Roadmap (planning content) shown under the real Administration settings. The stale "Plans" placeholder card was removed; real plans live in the Billing card. */
+/** Roadmap (shipped vs up next) shown under the real Administration settings. The stale "Plans" placeholder card was removed; real plans live in the Billing card. */
 export function AdminPlans() {
   return (
     <div className="mt-5">
       <div className="grid gap-5 xl:grid-cols-3">
-        <Card className="xl:col-span-3" title="Roadmap" subtitle="Next steps after v1">
+        <Card className="xl:col-span-3" title="Roadmap" subtitle="What's shipped and what's coming next">
+          <p className="mb-2 text-[11px] font-medium uppercase tracking-wide text-emerald-300">Shipped</p>
           <div className="grid gap-2 md:grid-cols-3">
-            {ROADMAP.map((r) => (
+            {ROADMAP_SHIPPED.map((r) => (
+              <div key={r.item} className="flex items-start gap-2 rounded-lg border border-white/[0.05] px-3 py-2 text-xs text-slate-300">
+                <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-300" aria-label="Shipped" />
+                <span>
+                  {r.item}
+                  <span className="ml-1 text-slate-600">
+                    · {r.area}
+                    {r.when ? ` · ${r.when}` : ""}
+                  </span>
+                </span>
+              </div>
+            ))}
+          </div>
+          <p className="mb-2 mt-4 text-[11px] font-medium uppercase tracking-wide text-cyan-300">Up next</p>
+          <div className="grid gap-2 md:grid-cols-3">
+            {ROADMAP_UPCOMING.map((r) => (
               <div key={r.item} className="flex items-start gap-2 rounded-lg border border-white/[0.05] px-3 py-2 text-xs text-slate-300">
                 <Cpu className="mt-0.5 h-3.5 w-3.5 shrink-0 text-cyan-300" />
                 <span>
