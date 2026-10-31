@@ -10,7 +10,7 @@ export const metadata: Metadata = {
   alternates: { canonical: "https://flowopsagent.ai/sms-consent" },
 };
 
-const SMS_NUMBER = "+1 (610) 426-1559";
+const SMS_NUMBER = "+1 (833) 589-8939";
 
 /** Illustrative confirmation. {Business} stands in for the business name on the booking. */
 const SAMPLE_CONFIRMATION =

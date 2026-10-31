@@ -41,13 +41,16 @@ describe("site-wide contact email", () => {
     expect(src).not.toMatch(/mailto:[a-z0-9._%+-]+@/i);
   });
 
-  it("/sms-consent is byte-identical to its 0c8ea7b render with only the address swapped", () => {
+  it("/sms-consent is byte-identical to its 0c8ea7b render with only the address and toll-free number swapped", () => {
     // Fixture = renderToStaticMarkup of 0c8ea7b's /sms-consent with the old contact address
-    // replaced by support@flowopsagent.ai and nothing else. A2P reviewers read this page:
+    // replaced by support@flowopsagent.ai and the 610 number replaced by the toll-free
+    // +1 (833) 589-8939, and nothing else. A2P / toll-free reviewers read this page:
     // any other change to wording, punctuation or structure must fail here.
     const expected = readFileSync("tests/fixtures/sms-consent-0c8ea7b.html", "utf8");
     const html = render(SmsConsentPage);
     expect(html).toBe(expected);
     expect(html.split(SUPPORT).length - 1).toBe(5);
+    expect(html).toContain("+1 (833) 589-8939");
+    expect(html).not.toContain("426-1559");
   });
 });
