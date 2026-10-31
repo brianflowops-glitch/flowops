@@ -5,7 +5,8 @@ import { runEmailReminders } from "@/lib/server/reminders/run";
 /**
  * Recovery cron for notification rows stuck in "queued". Vercel Cron calls this with
  * `Authorization: Bearer ${CRON_SECRET}`. Fails closed: 503 when CRON_SECRET is unset, 401 on mismatch.
- * Schedule (needs deploy approval): vercel.json → { "crons": [{ "path": "/api/cron/notifications", "schedule": "*\/5 * * * *" }] }
+ * Schedule: vercel.json → daily at 14:00 UTC (`0 14 * * *`), which the Hobby plan allows.
+ * Email reminders run after the sweeper and are a no-op unless EMAIL_REMINDERS_ENABLED is "true".
  */
 export const maxDuration = 60;
 

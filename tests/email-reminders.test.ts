@@ -3,6 +3,7 @@
  * and the cron route. Runs against in-process PGlite with the real ./drizzle migrations (incl. 0013). Resend and Twilio
  * are mocks; nothing leaves the process. SMS must never be touched: `sendSms` is asserted to have zero calls.
  */
+import { readFileSync } from "node:fs";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import { runTest } from "@/lib/booking/tests";
@@ -276,6 +277,12 @@ describe("cron route /api/cron/notifications", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { reminders?: { enabled: boolean } };
     expect(body.reminders?.enabled).toBe(true);
+  });
+
+  it("vercel.json runs this route once a day at 14:00 UTC and keeps the add-on cron", () => {
+    const cfg = JSON.parse(readFileSync("vercel.json", "utf8")) as { crons?: { path: string; schedule: string }[] };
+    expect(cfg.crons?.find((c) => c.path === "/api/cron/notifications")?.schedule).toBe("0 14 * * *");
+    expect(cfg.crons?.find((c) => c.path === "/api/cron/addon-charges")?.schedule).toBe("0 9 * * *");
   });
 
   it("still fails closed without / with a wrong secret", async () => {
