@@ -1,5 +1,5 @@
 import "server-only";
-import { and, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import { getDb, schema } from "@/lib/db";
 import { maskPhone } from "@/lib/phone";
 import { recordNotificationFailure } from "@/lib/server/integrations/notification-failures";
@@ -133,6 +133,8 @@ async function resend(row: Row): Promise<{ status: "sent" | "failed"; kind: "sen
         eq(schema.notification.organizationId, row.organizationId),
         eq(schema.notification.channel, row.channel),
         ne(schema.notification.id, row.id),
+        // Reminder rows (dedupe_key set) are separate messages, never newer versions of a confirmation.
+        isNull(schema.notification.dedupeKey),
         // Compare in SQL: JS Dates are ms-precision, Postgres timestamps are µs-precision.
         sql`${schema.notification.at} > (select at from notification where id = ${row.id})`,
       ),
