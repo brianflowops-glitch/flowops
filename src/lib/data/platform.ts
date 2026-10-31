@@ -75,14 +75,28 @@ export const PHASES = [
   { id: "P6", dates: "Nov 3", title: "Results review & UI planning" },
 ];
 
-export const ROADMAP = [
-  { item: "Persistent database (Postgres) for bookings, audit, agent history", area: "Data" },
-  { item: "Backend API service (REST/GraphQL) behind FLOWOPS Core", area: "Platform" },
-  { item: "Authentication, permissions and multi-tenant admin", area: "Security" },
-  { item: "Google Calendar test calendar → live Calendar Agent", area: "Integrations" },
-  { item: "Real Notification Agent (Gmail / email provider)", area: "Integrations" },
-  { item: "Agent-to-agent messaging over an event bus (NATS/Kafka)", area: "Agents" },
-  { item: "Durable workflows (Temporal / Prefect) for Automation Center", area: "Automation" },
+/** Administration > Roadmap card. Customer-facing: no internal IDs, costs or secrets. */
+export type RoadmapItem = { item: string; area: string; when?: string };
+
+export const ROADMAP_SHIPPED: RoadmapItem[] = [
+  { item: "Saved bookings and history in a real database", area: "Data" },
+  { item: "Sign-in, roles (Owner, Admin, Staff) and separate workspaces per business", area: "Security" },
+  { item: "Public booking page for your customers", area: "Booking" },
+  { item: "Booking confirmation, change and cancellation emails", area: "Notifications" },
+  { item: "Google Calendar sync for bookings", area: "Integrations" },
+  { item: "FlowAI assistant live in the Command Center", area: "AI", when: "Oct 30" },
+  { item: "Plans and billing: Starter, Pro and Business, add-ons, 14-day trial, in-app plan changes", area: "Billing", when: "Oct 30" },
+  { item: "Email appointment reminders before each booking", area: "Notifications", when: "Oct 30" },
+  { item: "Dedicated toll-free texting number and SMS opt-in page", area: "Messaging", when: "Oct 30" },
+  { item: "Support and billing help at support@ and billing@flowopsagent.ai", area: "Support", when: "Oct 30" },
+  { item: "Weekly automation counts on the Analytics page", area: "Analytics", when: "Oct 31" },
+];
+
+export const ROADMAP_UPCOMING: RoadmapItem[] = [
+  { item: "Text message confirmations and reminders (after carrier approval)", area: "Messaging" },
+  { item: "Agent-to-agent messaging over an event bus", area: "Agents" },
+  { item: "Durable workflows for the Automation Center", area: "Automation" },
   { item: "FlowNet / FlowSec telemetry connectors (Firewalla, SNMP, syslog, EDR)", area: "Ops" },
   { item: "Vector memory (RAG) and policy context for FlowAI", area: "AI" },
+  { item: "Public API and webhooks", area: "Platform" },
 ];

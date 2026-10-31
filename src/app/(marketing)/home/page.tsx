@@ -31,7 +31,7 @@ const FEATURES = [
   {
     icon: Mail,
     title: "Automatic email confirmations",
-    body: "Customers get an email when they book and whenever an appointment is moved or cancelled. Email reminders before the appointment are next on the roadmap.",
+    body: "Customers get an email when they book, whenever an appointment is moved or cancelled, and a reminder before the appointment.",
   },
   {
     icon: Bot,
