@@ -189,11 +189,11 @@ export function SecurityCenter() {
 }
 
 export function IntegrationsPage() {
-  const groups = ["next", "deploy-target", "planned"] as const;
-  const label = { next: "Up next", "deploy-target": "Deployment", planned: "Planned" };
+  const groups = ["live", "next", "deploy-target", "planned"] as const;
+  const label = { live: "Live", next: "Up next", "deploy-target": "Deployment", planned: "Planned" };
   return (
     <div>
-      <PageHeader kicker="FlowConnect · LinkAgent" title="Integrations" description="Nothing is connected yet. In v1 the Calendar and Notification agents are simulated inside the Booking Engine; the AI Assistant runs on Vercel AI Gateway." />
+      <PageHeader kicker="FlowConnect · LinkAgent" title="Integrations" description="Live today: Google Calendar sync (connect yours in Administration), email confirmations and reminders, and the FlowAI Assistant on Vercel AI Gateway. SMS texts start after carrier approval." />
       {groups.map((g) => (
         <div key={g} className="mb-6">
           <h2 className="mb-3 text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">{label[g]}</h2>

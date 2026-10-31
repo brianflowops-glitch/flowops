@@ -79,7 +79,7 @@ function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
       })}
       <div className="mt-auto rounded-lg border border-white/[0.06] bg-white/[0.02] p-3 text-[11px] leading-relaxed text-slate-500">
         <p className="font-mono text-slate-400">v2.0 · beta</p>
-        <p>Bookings are saved in Postgres per organization. Calendar, email &amp; SMS stay simulated until connected in Administration.</p>
+        <p>Bookings are saved in Postgres per organization. Google Calendar sync (connect it in Administration) and email confirmations &amp; reminders are live; SMS texts start after carrier approval.</p>
       </div>
     </nav>
   );

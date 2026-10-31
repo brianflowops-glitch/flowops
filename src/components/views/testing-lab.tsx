@@ -142,7 +142,7 @@ export function TestingLab() {
             <div className="flex gap-3 text-xs leading-relaxed text-slate-400">
               <FlaskConical className="h-4 w-4 shrink-0 text-violet-300" />
               <p>
-                Results reflect simulation logic only. Calendar and Notification agents are simulated, so a pass here does not prove Google Calendar or email delivery works — that is Phase 2 and Phase 5. Run the same suite from a terminal with <code className="font-mono text-slate-300">npm test</code>.
+                Results reflect simulation logic only. This sandbox swaps in simulated Calendar and Notification agents, so a pass here checks pipeline logic, not live Google Calendar or email delivery (both are live in the Booking Center). Run the same suite from a terminal with <code className="font-mono text-slate-300">npm test</code>.
               </p>
             </div>
           </Card>
