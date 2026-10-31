@@ -3,6 +3,7 @@ import { billingEnabled, webhookSecret } from "@/lib/billing/config";
 import { retrieveSubscriptionComplete } from "@/lib/billing/addons";
 import { getStripe } from "@/lib/billing/stripe";
 import { processStripeEvent } from "@/lib/billing/webhook";
+import { sendTrialEndingReminder } from "@/lib/billing/trial-reminder";
 import { stripeChargeContextFetcher } from "@/lib/billing/clawback";
 import { hasDatabase } from "@/lib/db";
 
@@ -25,6 +26,10 @@ export async function POST(req: Request) {
   try {
     const stripe = getStripe();
     const result = await processStripeEvent(event, { fetchSubscription: (id) => retrieveSubscriptionComplete(stripe, id), fetchChargeContext: stripeChargeContextFetcher(stripe) });
+    // First delivery only (a duplicate is "duplicate"): remind Owner/Admin to add a card. Never fails the webhook.
+    if (result.status === "processed" && event.type === "customer.subscription.trial_will_end") {
+      await sendTrialEndingReminder(event.data.object.id, { stripe }).catch((err: unknown) => console.error("[billing] trial reminder failed", event.id, err instanceof Error ? err.message : "unknown"));
+    }
     return Response.json({ received: true, ...result });
   } catch (err) {
     console.error("[billing] webhook processing failed", event.id, event.type, err);

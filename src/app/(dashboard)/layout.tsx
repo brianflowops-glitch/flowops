@@ -5,7 +5,7 @@ import { getContext } from "@/lib/server/context";
 import { hasDatabase } from "@/lib/db";
 import { resendConfigured } from "@/lib/server/integrations/notify";
 import { getBillingAccess } from "@/lib/billing/access";
-import { plans } from "@/lib/billing/config";
+import { plans, trialDays } from "@/lib/billing/config";
 import { lockScreenCopy } from "@/lib/billing/lock-copy";
 import { BillingLocked } from "@/components/billing/billing-locked";
 
@@ -31,7 +31,7 @@ async function Gate({ children }: { children: React.ReactNode }) {
     const order = ["starter", "pro", "business"];
     const planKeys = [...new Set(all.filter((p) => p.interval === "month").map((p) => p.key))].sort((a, b) => (order.indexOf(a) + 1 || 99) - (order.indexOf(b) + 1 || 99) || a.localeCompare(b));
     const annualPlanKeys = planKeys.filter((k) => all.some((p) => p.key === k && p.interval === "year"));
-    return <BillingLocked copy={lockScreenCopy(access)} orgName={ctx.org.name} planKeys={planKeys} annualPlanKeys={annualPlanKeys} />;
+    return <BillingLocked copy={lockScreenCopy(access, { trialDays: trialDays() })} orgName={ctx.org.name} planKeys={planKeys} annualPlanKeys={annualPlanKeys} />;
   }
   return (
     <AppShell

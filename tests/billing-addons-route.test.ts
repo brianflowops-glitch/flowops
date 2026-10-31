@@ -306,7 +306,7 @@ describe("POST/GET /api/billing/addons guards", () => {
       return create;
     };
 
-    it("monthly by default; first subscription → 14-day trial with the card collected up front", async () => {
+    it("monthly by default; first subscription → 14-day trial, no card required (if_required)", async () => {
       const create = mock(true);
       const res = await post(owner, { plan: "starter" });
       expect(res.status).toBe(200);
@@ -314,7 +314,7 @@ describe("POST/GET /api/billing/addons guards", () => {
       const p = create.mock.calls[0][0];
       expect(p.line_items[0].price).toBe("price_x_starter");
       expect(p.subscription_data.trial_period_days).toBe(14);
-      expect(p.payment_method_collection).toBe("always");
+      expect(p.payment_method_collection).toBe("if_required");
     });
 
     it("yearly → the annual price; an org that already had a subscription gets NO trial", async () => {
